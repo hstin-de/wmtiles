@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Cancel in-progress runs on the same branch when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: build, test, bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun install dir
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-
+
+      # ────── Library-friendly default build (no bun involved) ──────
+      # Proves the repo is usable as a Go library: a fresh clone can run
+      # go vet / go test / go build without first building the JS viewer.
+
+      - name: Default build without -tags embed (library-friendly check)
+        run: go build -o /tmp/wmtiles-noembed ./cmd/wmtiles/
+
+      - name: Generate format/testdata fixtures
+        run: |
+          mkdir -p format/testdata
+          go run ./cmd/gen-testdata
+
+      - name: go vet (default build, no embed)
+        run: go vet ./...
+
+      - name: go test (default build, no embed, with -race)
+        run: go test -race ./...
+
+      # ────── Build the JS viewer bundle for the full CLI ──────
+
+      - name: Bun install
+        run: bun install --frozen-lockfile
+
+      - name: Build viewer bundle (for go:embed in cmd/wmtiles/web)
+        run: bun -F wmtiles-viewer build
+
+      # ────── TypeScript ──────
+
+      - name: Typecheck (library + viewer)
+        run: bun run typecheck
+
+      - name: Library tests
+        run: bun -F wmtiles test
+
+      - name: Build library (ESM + CJS + .d.ts)
+        run: bun -F wmtiles build
+
+      # ────── Final integration ──────
+
+      - name: Build CLI binary with -tags embed (full viewer)
+        run: go build -tags embed -o /tmp/wmtiles ./cmd/wmtiles/
+
+      - name: End-to-end smoke (serve + viewer + tile endpoint)
+        run: |
+          /tmp/wmtiles serve --addr :18080 format/testdata/minimal.wmt &
+          SERVER_PID=$!
+          for _ in 1 2 3 4 5; do
+            if curl -fsS -o /dev/null http://localhost:18080/ 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          set -e
+          curl -fsS -o /dev/null http://localhost:18080/
+          curl -fsS http://localhost:18080/viewer.js | head -c 4 | grep -q '(()' || (
+            echo "::error::/viewer.js did not start with an IIFE"
+            kill $SERVER_PID
+            exit 1
+          )
+          curl -fsS -o /dev/null -H "Range: bytes=0-1023" http://localhost:18080/wmt
+          kill $SERVER_PID

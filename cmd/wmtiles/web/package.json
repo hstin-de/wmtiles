@@ -1,0 +1,22 @@
+{
+  "name": "wmtiles-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bundled HTML viewer that ships with `wmtiles serve`. Consumes the wmtiles library + Leaflet for rendering.",
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/main.ts --outfile dist/viewer.js --target browser --format iife --minify",
+    "build:dev": "bun build src/main.ts --outfile dist/viewer.js --target browser --format iife --sourcemap=inline",
+    "watch": "bun build src/main.ts --outfile dist/viewer.js --target browser --format iife --sourcemap=inline --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "true"
+  },
+  "dependencies": {
+    "wmtiles": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.12",
+    "typescript": "^5.5.0",
+    "bun-types": "latest"
+  }
+}

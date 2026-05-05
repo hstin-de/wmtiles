@@ -1,0 +1,152 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/hstin-de/wmtiles/encoder"
+	"github.com/hstin-de/wmtiles/format"
+)
+
+func main() {
+	outDir := "format/testdata"
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		die(err)
+	}
+
+	const pixSize = 128
+	refTime := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	fixedNow := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+
+	minimalPath := filepath.Join(outDir, "minimal.wmt")
+	makeMinimal(minimalPath, pixSize, refTime, fixedNow)
+	fmt.Printf("wrote %s\n", minimalPath)
+
+	extendedPath := filepath.Join(outDir, "extended.wmt")
+	makeExtended(extendedPath, pixSize, refTime, fixedNow)
+	fmt.Printf("wrote %s\n", extendedPath)
+
+	compactedPath := filepath.Join(outDir, "compacted.wmt")
+	makeCompacted(extendedPath, compactedPath, pixSize, refTime, fixedNow)
+	fmt.Printf("wrote %s\n", compactedPath)
+
+	crcPath := filepath.Join(outDir, "crc_corrupted.wmt")
+	makeCRCCorrupted(extendedPath, crcPath)
+	fmt.Printf("wrote %s\n", crcPath)
+}
+
+func makeMinimal(path string, pixSize int, refTime time.Time, now time.Time) {
+	px := make([]float32, pixSize*pixSize)
+	for i := range px {
+		px[i] = float32(i % 100)
+	}
+	tile := encoder.Tile{Variable: "temp", TimeStep: 0, Z: 0, X: 0, Y: 0, Pixels: px}
+
+	opts := encoder.Options{
+		TilePixelSizeLog2:     7,
+		MinZoom:               0,
+		MaxZoom:               0,
+		ReferenceForecastTime: refTime,
+		TimeCatalog: format.TimeCatalog{
+			Regular: true, StartMs: refTime.UnixMilli(), IntervalMs: 0, Count: 1,
+		},
+		BBox:         [4]float64{-180, -85, 180, 85},
+		Variables:    []encoder.VariableSpec{{Name: "temp", Unit: "K"}},
+		CreationTime: now,
+	}
+	if err := encoder.Encode([]encoder.Tile{tile}, opts, path); err != nil {
+		die(err)
+	}
+}
+
+func makeExtended(path string, pixSize int, refTime time.Time, now time.Time) {
+	makeMinimal(path, pixSize, refTime, now)
+
+	for _, name := range []string{"wind", "precip"} {
+		ctx, err := encoder.OpenForAppend(path, encoder.AppendOptions{
+			CreationTime: now,
+		})
+		if err != nil {
+			die(err)
+		}
+		if _, err := ctx.RegisterVariable(encoder.VariableSpec{Name: name, Unit: "u"}); err != nil {
+			die(err)
+		}
+		if err := ctx.DeclareBlock(encoder.BlockSpec{
+			Variable: name, TimeStep: 0, ValueMin: 0, ValueMax: 50,
+		}); err != nil {
+			die(err)
+		}
+		px := make([]float32, pixSize*pixSize)
+		for i := range px {
+			px[i] = float32(i % 50)
+		}
+		if err := ctx.Submit(encoder.Tile{
+			Variable: name, TimeStep: 0, Z: 0, X: 0, Y: 0, Pixels: px,
+		}); err != nil {
+			die(err)
+		}
+		if err := ctx.Finish(); err != nil {
+			die(err)
+		}
+	}
+}
+
+func makeCompacted(_ string, output string, pixSize int, refTime time.Time, now time.Time) {
+	tiles := make([]encoder.Tile, 0, 3)
+	for _, name := range []string{"temp", "wind", "precip"} {
+		px := make([]float32, pixSize*pixSize)
+		mod := 100
+		if name != "temp" {
+			mod = 50
+		}
+		for i := range px {
+			px[i] = float32(i % mod)
+		}
+		tiles = append(tiles, encoder.Tile{
+			Variable: name, TimeStep: 0, Z: 0, X: 0, Y: 0, Pixels: px,
+		})
+	}
+	opts := encoder.Options{
+		TilePixelSizeLog2:     7,
+		MinZoom:               0,
+		MaxZoom:               0,
+		ReferenceForecastTime: refTime,
+		TimeCatalog: format.TimeCatalog{
+			Regular: true, StartMs: refTime.UnixMilli(), IntervalMs: 0, Count: 1,
+		},
+		BBox: [4]float64{-180, -85, 180, 85},
+		Variables: []encoder.VariableSpec{
+			{Name: "temp", Unit: "K"},
+			{Name: "wind", Unit: "u"},
+			{Name: "precip", Unit: "u"},
+		},
+		CreationTime: now,
+	}
+	if err := encoder.Encode(tiles, opts, output); err != nil {
+		die(err)
+	}
+}
+
+func makeCRCCorrupted(input, output string) {
+	data, err := os.ReadFile(input)
+	if err != nil {
+		die(err)
+	}
+	h, err := format.UnmarshalHeader(data[:format.HeaderSize])
+	if err != nil {
+		die(err)
+	}
+	corrupt := h.ActiveSnapshotOffset + h.ActiveSnapshotLength/2
+	data[corrupt] ^= 0xFF
+	if err := os.WriteFile(output, data, 0o644); err != nil {
+		die(err)
+	}
+}
+
+func die(err error) {
+	fmt.Fprintln(os.Stderr, "gen-testdata:", err)
+	os.Exit(1)
+}

@@ -1,0 +1,47 @@
+{
+  "name": "wmtiles",
+  "version": "0.1.0",
+  "description": "Pure-TypeScript reader for the WMTiles single-file format. Parses headers, snapshots, block tables; decodes per-tile codecs; dequantizes per-block. No DOM dependency: works in browsers, Node, Bun, Cloudflare Workers.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hstin-de/wmtiles.git",
+    "directory": "wmtiles-js"
+  },
+  "bugs": {
+    "url": "https://github.com/hstin-de/wmtiles/issues"
+  },
+  "homepage": "https://github.com/hstin-de/wmtiles/tree/main/wmtiles-js#readme",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prepublishOnly": "bun run typecheck && bun run test && bun run build",
+    "build": "bun run build:esm && bun run build:cjs && bun run build:dts",
+    "build:esm": "bun build src/index.ts --outfile dist/index.js --target browser --format esm",
+    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs",
+    "build:dts": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "bun-types": "latest"
+  }
+}

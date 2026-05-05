@@ -1,0 +1,287 @@
+package main
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"time"
+
+	"github.com/hstin-de/wmtiles/format"
+	"github.com/hstin-de/wmtiles/reader"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "encode":
+		if err := runEncodeGRIB("encode", os.Args[2:]); err != nil {
+			fatal("encode", err)
+		}
+	case "encode-grib":
+		if err := runEncodeGRIB("encode-grib", os.Args[2:]); err != nil {
+			fatal("encode-grib", err)
+		}
+	case "extend":
+		if err := runExtend(os.Args[2:]); err != nil {
+			fatal("extend", err)
+		}
+	case "compact":
+		if err := runCompact(os.Args[2:]); err != nil {
+			fatal("compact", err)
+		}
+	case "snapshot-history":
+		if err := runSnapshotHistory(os.Args[2:]); err != nil {
+			fatal("snapshot-history", err)
+		}
+	case "inspect":
+		if err := runInspect(os.Args[2:]); err != nil {
+			fatal("inspect", err)
+		}
+	case "verify":
+		if err := runVerify(os.Args[2:]); err != nil {
+			fatal("verify", err)
+		}
+	case "compare":
+		if err := runCompare(os.Args[2:]); err != nil {
+			fatal("compare", err)
+		}
+	case "serve":
+		if err := runServe(os.Args[2:]); err != nil {
+			fatal("serve", err)
+		}
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown subcommand %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func fatal(command string, err error) {
+	fmt.Fprintf(os.Stderr, "error: %s failed\n", command)
+	fmt.Fprintf(os.Stderr, "  reason: %v\n", err)
+	os.Exit(1)
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `wmtiles: cloud optimised tiled weather data format
+
+usage:
+  wmtiles encode           <input.grib2> -o out.wmt ... convert a GRIB2 file into a fresh .wmt
+  wmtiles extend           <file.wmt> <input.grib2>    append blocks for new (variable, time) pairs
+  wmtiles compact          <input.wmt> <output.wmt>    rewrite a file with the snapshot in the cold start window
+  wmtiles snapshot-history <file.wmt>                  list active + previous snapshots
+  wmtiles inspect          <file.wmt>                  dump header + catalog + stats
+  wmtiles verify           <file.wmt>                  structural sanity check (incl. CRC validation)
+  wmtiles compare          <input.grib2> <file.wmt> ... pixel by pixel fidelity report vs. source GRIB
+  wmtiles serve            <file.wmt> [--addr :8080]   launch a web viewer
+
+encode flags:
+  -o PATH                  output .wmt path (required)
+  --min-zoom N             minimum zoom (default 0)
+  --max-zoom N             maximum zoom (default 5)
+  --tile-size-log2 N       tile size log2 (default 8 = 256 px; allowed 7..10)
+  --filter SHORTNAMES      comma-separated GRIB shortNames to keep (default: all)
+  --precision NAME=K,...   per variable quantisation precision overrides`)
+}
+
+func runInspect(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: wmtiles inspect <file.wmt>")
+	}
+	r, err := reader.Open(args[0])
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	h := r.Header
+	snap := r.Snapshot
+
+	cliSection("WMTiles inspect")
+	cliKV("file", args[0])
+	if st, _ := os.Stat(args[0]); st != nil {
+		cliKV("file size", humanBytes(st.Size()))
+		cliKV("logical end", humanBytes(int64(h.FileLogicalEnd)))
+	}
+	cliKVf("format version", "%d", h.FormatVersion)
+	cliKVf("generation", "%d", h.SnapshotGeneration)
+	cliKVf("zoom range", "%d..%d", h.MinZoom, h.MaxZoom)
+	cliKVf("tile size", "%d px", 1<<h.TilePixelSizeLog2)
+	cliKVf("compression", "%d", h.InternalCompression)
+	cliKV("cold start", boolWord(h.Flags&format.FlagColdStartInWindow != 0))
+	cliKV("previous snap", boolWord(h.Flags&format.FlagHasPreviousSnapshot != 0))
+
+	cliSection("Snapshot")
+	cliKV("reference time", time.UnixMilli(snap.Header.ReferenceTimeMs).UTC().Format(time.RFC3339))
+	cliKV("time axis", describeTimeCatalog(snap.TimeCat))
+	cliKVf("variables", "%d", len(snap.Variables))
+	cliKVf("blocks", "%d", snap.Header.NumBlocks)
+
+	rows := make([][]string, 0, len(snap.Variables))
+	for _, v := range snap.Variables {
+		minS := fmt.Sprintf("%g", v.ValueMinObservedGlobal)
+		maxS := fmt.Sprintf("%g", v.ValueMaxObservedGlobal)
+		if math.IsNaN(v.ValueMinObservedGlobal) {
+			minS = "n/a"
+		}
+		if math.IsNaN(v.ValueMaxObservedGlobal) {
+			maxS = "n/a"
+		}
+		rows = append(rows, []string{
+			fmt.Sprintf("%d", v.VariableID),
+			v.Name,
+			emptyAsNA(v.Unit),
+			dtypeCodeName(v.DefaultDType),
+			formatFloat(v.DefaultPrecisionHint),
+			"[" + minS + ", " + maxS + "]",
+			emptyAsNA(v.ColormapHint),
+		})
+	}
+	cliSection("Variables")
+	cliTable([]string{"id", "name", "unit", "dtype", "precision", "range", "colormap"}, rows)
+
+	totalBlocks := 0
+	totalAddressed := uint64(0)
+	totalContents := uint64(0)
+	totalBytes := uint64(0)
+	if err := r.EachBlock(func(e format.BlockTableEntry) error {
+		totalBlocks++
+		totalAddressed += e.NumAddressedTiles
+		totalContents += e.NumTileContents
+		totalBytes += e.BlockLength
+		return nil
+	}); err != nil {
+		return fmt.Errorf("iterate blocks: %w", err)
+	}
+	cliSection("Storage")
+	cliKVf("blocks", "%d", totalBlocks)
+	cliKV("addressed tiles", commaUint(totalAddressed))
+	cliKV("unique blobs", commaUint(totalContents))
+	cliKV("dedup ratio", formatDedupRatio(totalContents, totalAddressed))
+	cliKV("variable catalog", humanBytes(int64(snap.Header.VariableCatalogLen)))
+	cliKV("time catalog", humanBytes(int64(snap.Header.TimeCatalogLen)))
+	cliKV("block table root", humanBytes(int64(snap.Header.BlockTableRootLen)))
+	cliKV("block table leaves", humanBytes(int64(snap.Header.BlockTableLeavesLen)))
+	cliKV("metadata", humanBytes(int64(snap.Header.MetadataLen)))
+	cliKV("blocks total", humanBytes(int64(totalBytes)))
+
+	st, _ := os.Stat(args[0])
+	if st != nil {
+		slack := int64(st.Size()) - int64(h.FileLogicalEnd)
+		if slack > 0 {
+			cliKV("orphaned bytes", humanBytes(slack))
+		}
+	}
+	return nil
+}
+
+func runVerify(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: wmtiles verify <file.wmt>")
+	}
+	r, err := reader.Open(args[0])
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	if err := r.SanityCheck(); err != nil {
+		return err
+	}
+
+	totalAddressed := uint64(0)
+	totalContents := uint64(0)
+	if err := r.EachBlock(func(e format.BlockTableEntry) error {
+		totalAddressed += e.NumAddressedTiles
+		totalContents += e.NumTileContents
+		out := make([]float32, r.PixelCount())
+		if err := r.ReadTile(r.Snapshot.Variables[e.VariableID].Name, e.TimeID,
+			r.Header.MinZoom, 0, 0, out); err != nil {
+			_ = err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	cliSection("WMTiles verify")
+	cliKV("file", args[0])
+	cliKV("status", "ok")
+	cliKV("checks", "header, snapshot, block table, sample tile decode")
+	cliKV("addressed tiles", commaUint(totalAddressed))
+	cliKV("unique blobs", commaUint(totalContents))
+	cliKV("dedup ratio", formatDedupRatio(totalContents, totalAddressed))
+	return nil
+}
+
+func runSnapshotHistory(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: wmtiles snapshot-history <file.wmt>")
+	}
+	r, err := reader.Open(args[0])
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	h := r.Header
+	cliSection("WMTiles snapshots")
+	cliKV("file", args[0])
+	cliSection("Active snapshot")
+	cliKVf("generation", "%d", h.SnapshotGeneration)
+	cliKVf("offset", "%d", h.ActiveSnapshotOffset)
+	cliKV("length", humanBytes(int64(h.ActiveSnapshotLength)))
+	cliKVf("variables", "%d", r.Snapshot.Header.NumVariables)
+	cliKVf("time steps", "%d", r.Snapshot.Header.NumTimeSteps)
+	cliKVf("blocks", "%d", r.Snapshot.Header.NumBlocks)
+	if h.Flags&format.FlagHasPreviousSnapshot != 0 {
+		cliSection("Previous snapshot")
+		cliKVf("offset", "%d", h.PreviousSnapshotOffset)
+		cliKV("length", humanBytes(int64(h.PreviousSnapshotLength)))
+	} else {
+		cliSection("Previous snapshot")
+		cliKV("status", "none")
+	}
+	return nil
+}
+
+func humanBytes(n int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+		TB = GB * 1024
+	)
+	switch {
+	case n >= TB:
+		return fmt.Sprintf("%.2f TB", float64(n)/TB)
+	case n >= GB:
+		return fmt.Sprintf("%.2f GB", float64(n)/GB)
+	case n >= MB:
+		return fmt.Sprintf("%.2f MB", float64(n)/MB)
+	case n >= KB:
+		return fmt.Sprintf("%.2f KB", float64(n)/KB)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+func describeTimeCatalog(t format.TimeCatalog) string {
+	if t.Regular {
+		start := time.UnixMilli(t.StartMs).UTC().Format(time.RFC3339)
+		return fmt.Sprintf("regular, start %s, interval %s, count %d",
+			start, time.Duration(t.IntervalMs)*time.Millisecond, t.Count)
+	}
+	return fmt.Sprintf("irregular, count %d", t.Count)
+}
+
+func emptyAsNA(s string) string {
+	if s == "" {
+		return "n/a"
+	}
+	return s
+}

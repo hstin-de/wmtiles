@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>wmtiles viewer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #1a1a1a; color: #ddd; }
+  #top { padding: 8px 12px; background: #222; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #333; min-height: 32px; }
+  #top label { font-size: 12px; color: #aaa; display: inline-flex; align-items: center; gap: 6px; }
+  #top select, #top input[type=number] { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; font-size: 12px; }
+  #top input[type=range] { width: 240px; vertical-align: middle; }
+  #map { position: absolute; left: 0; right: 0; bottom: 0; top: 50px; background: #111; }
+  #status { font-size: 11px; color: #888; margin-left: auto; font-family: monospace; }
+  .legend { background: rgba(34,34,34,.92); color: #ddd; padding: 6px 10px; border-radius: 4px; font: 11px/1.3 monospace; }
+  .legend .bar { width: 160px; height: 12px; margin: 4px 0; background: linear-gradient(to right,
+    rgb(68,1,84), rgb(72,35,116), rgb(64,67,135), rgb(52,94,141), rgb(41,121,142),
+    rgb(32,144,140), rgb(34,167,132), rgb(68,190,112), rgb(253,231,37)); }
+  .legend .row { display: flex; justify-content: space-between; }
+  .leaflet-popup-content-wrapper { background: #2a2a2a; color: #ddd; border-radius: 4px; }
+  .leaflet-popup-content-wrapper .leaflet-popup-content { font-family: monospace; font-size: 12px; }
+  .leaflet-popup-tip { background: #2a2a2a; }
+</style>
+</head>
+<body>
+<div id="top">
+  <label>parameter <select id="param" disabled><option>loading…</option></select></label>
+  <label>height <select id="height" disabled><option>n/a</option></select></label>
+  <label>time <input id="time" type="range" min="0" max="0" value="0" step="1" disabled> <span id="timeLabel"></span></label>
+  <label>vmin <input id="vmin" type="number" step="any" style="width:90px" disabled></label>
+  <label>vmax <input id="vmax" type="number" step="any" style="width:90px" disabled></label>
+  <span id="status">opening…</span>
+</div>
+<div id="map"></div>
+<script src="/viewer.js"></script>
+</body>
+</html>

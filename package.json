@@ -1,0 +1,19 @@
+{
+  "name": "wmtiles-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Bun workspace root. Hosts the publishable wmtiles-js library and the bundled HTML viewer that ships with the Go CLI.",
+  "workspaces": [
+    "wmtiles-js",
+    "cmd/wmtiles/web"
+  ],
+  "scripts": {
+    "build": "bun -F wmtiles build && bun -F wmtiles-viewer build",
+    "test": "bun -F wmtiles test",
+    "typecheck": "bun -F wmtiles typecheck && bun -F wmtiles-viewer typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "bun-types": "latest"
+  }
+}
