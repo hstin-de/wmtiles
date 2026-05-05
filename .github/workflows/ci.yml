@@ -66,24 +66,27 @@ jobs:
       - name: go test (default build, no embed, with -race)
         run: go test -race ./...
 
-      # ────── Build the JS viewer bundle for the full CLI ──────
-
       - name: Bun install
         run: bun install --frozen-lockfile
 
-      - name: Build viewer bundle (for go:embed in cmd/wmtiles/web)
-        run: bun -F wmtiles-viewer build
-
       # ────── TypeScript ──────
 
-      - name: Typecheck (library + viewer)
-        run: bun run typecheck
+      - name: Typecheck library
+        run: bun -F wmtiles typecheck
 
       - name: Library tests
         run: bun -F wmtiles test
 
       - name: Build library (ESM + CJS + .d.ts)
         run: bun -F wmtiles build
+
+      - name: Typecheck viewer
+        run: bun -F wmtiles-viewer typecheck
+
+      # ────── Build the JS viewer bundle for the full CLI ──────
+
+      - name: Build viewer bundle (for go:embed in cmd/wmtiles/web)
+        run: bun -F wmtiles-viewer build
 
       # ────── Final integration ──────
 

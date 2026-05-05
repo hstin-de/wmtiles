@@ -28,6 +28,7 @@ typecheck:
 
 clean:
 	rm -rf wmtiles-js/dist
+	rm -f wmtiles-js/.dist.stamp
 	rm -rf cmd/wmtiles/web/dist
 	rm -rf format/testdata
 	rm -f $(BIN)
@@ -53,27 +54,31 @@ $(TESTDATA_FILES): cmd/gen-testdata/main.go
 .PHONY: testdata
 testdata: $(TESTDATA_FILES)
 
-# Viewer bundle. Triggered when any TS source changes.
+# Library bundle (ESM + CJS + .d.ts). The viewer imports the package entry
+# point, which resolves to dist just like published consumers do.
+LIB_DIST := wmtiles-js/dist/index.js wmtiles-js/dist/index.cjs wmtiles-js/dist/index.d.ts
+LIB_STAMP := wmtiles-js/.dist.stamp
+LIB_SRC  := $(wildcard wmtiles-js/src/*.ts)
+
+$(LIB_STAMP): node_modules/.stamp $(LIB_SRC)
+	bun -F wmtiles build
+	touch $@
+
+$(LIB_DIST): $(LIB_STAMP)
+
+.PHONY: lib
+lib: $(LIB_STAMP)
+
+# Viewer bundle. Triggered when viewer or library source changes.
 VIEWER_DIST := cmd/wmtiles/web/dist/viewer.js
 VIEWER_SRC  := $(wildcard cmd/wmtiles/web/src/*.ts cmd/wmtiles/web/index.html) \
                $(wildcard wmtiles-js/src/*.ts)
 
-$(VIEWER_DIST): node_modules/.stamp $(VIEWER_SRC)
+$(VIEWER_DIST): node_modules/.stamp $(LIB_STAMP) $(VIEWER_SRC)
 	bun -F wmtiles-viewer build
 
 .PHONY: viewer
 viewer: $(VIEWER_DIST)
-
-# Library bundle (ESM + CJS + .d.ts). Not strictly needed to build the CLI;
-# only consumers of the library care about it.
-LIB_DIST := wmtiles-js/dist/index.js wmtiles-js/dist/index.cjs wmtiles-js/dist/index.d.ts
-LIB_SRC  := $(wildcard wmtiles-js/src/*.ts)
-
-$(LIB_DIST): node_modules/.stamp $(LIB_SRC)
-	bun -F wmtiles build
-
-.PHONY: lib
-lib: $(LIB_DIST)
 
 # CLI binary embeds VIEWER_DIST. The `embed` build tag activates
 # cmd/wmtiles/web/embed.go (the no-tag default uses embed_stub.go and
