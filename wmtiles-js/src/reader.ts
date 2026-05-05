@@ -24,9 +24,9 @@ import {
   type SnapshotHeader,
   type TimeCatalog,
   type VariableEntry,
-} from "./format";
-import { decodeCodec, dequantize } from "./decoder";
-import { encode3D } from "./tileid";
+} from "./format.js";
+import { decodeCodec, dequantize } from "./decoder.js";
+import { encode3D } from "./tileid.js";
 
 export interface RangeFetcher {
   fetchRange(offset: number, length: number): Promise<Uint8Array>;

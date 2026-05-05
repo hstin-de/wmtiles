@@ -6,7 +6,7 @@ import {
   SENTINEL_U16,
   SENTINEL_U8,
   type BlockTableEntry,
-} from "./format";
+} from "./format.js";
 
 export const CODEC_CONSTANT = 0x01;
 export const CODEC_RAW_ZSTD = 0x02;

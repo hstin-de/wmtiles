@@ -5,7 +5,7 @@ export {
   type RangeFetcher,
   type TileCoord,
   type CoalesceOptions,
-} from "./reader";
+} from "./reader.js";
 
 export {
   HEADER_SIZE,
@@ -52,7 +52,7 @@ export {
   decompressInternal,
   readVarint,
   readVarintNum,
-} from "./format";
+} from "./format.js";
 
 export {
   CODEC_CONSTANT,
@@ -62,6 +62,6 @@ export {
   decodeCodec,
   dequantize,
   dtypeBytes,
-} from "./decoder";
+} from "./decoder.js";
 
-export { encode3D, hilbertXY2D, zoomOffset } from "./tileid";
+export { encode3D, hilbertXY2D, zoomOffset } from "./tileid.js";
