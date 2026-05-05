@@ -1,0 +1,29 @@
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Generated artifacts (rebuilt inside the image)
+node_modules
+**/node_modules
+wmtiles-js/dist
+wmtiles-js/.dist.stamp
+cmd/wmtiles/web/dist
+format/testdata
+wmtiles
+/wmtiles
+
+# Local test fixtures (large GRIB2 + .wmt blobs that don't belong in the image)
+*.grib2
+*.wmt
+
+# Editor / OS noise
+.idea
+.vscode
+.DS_Store
+*.swp
+
+# Docker / docs (not needed for the build context)
+Dockerfile
+.dockerignore
+README.md
