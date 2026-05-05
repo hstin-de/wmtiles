@@ -64,6 +64,7 @@ jobs:
             org.opencontainers.image.licenses=MIT
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -83,5 +84,5 @@ jobs:
       - name: Smoke-test the built image (native arch only)
         if: github.event_name != 'pull_request'
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.meta.outputs.digest }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
           docker run --rm "$IMAGE" --help | head -n 20
