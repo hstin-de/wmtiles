@@ -463,15 +463,16 @@ func (a *AppendCtx) Finish() error {
 		}
 		for _, k := range a.declarations {
 			bb := a.blocks[k]
-			payload := bb.blockBytes()
 			off := a.cursor
-			if _, e := a.out.Write(payload); e != nil {
+			n, e := bb.writeBlockTo(a.out)
+			if e != nil {
 				err = fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, e)
 				a.cleanupOnErr()
 				return
 			}
-			a.cursor += uint64(len(payload))
+			a.cursor += uint64(n)
 			newEntries = append(newEntries, bb.blockTableEntry(off))
+			bb.release()
 		}
 
 		merged := a.mergeBlockTable(newEntries)

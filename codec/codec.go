@@ -22,25 +22,41 @@ const (
 var ErrUnknownCodec = errors.New("codec: unknown tag")
 
 type Encoder struct {
-	zw       *zstd.Encoder
-	scratch  []byte
-	scratch2 []byte
-	samplers map[string]*samplerState
+	zw         *zstd.Encoder
+	scratch    []byte
+	scratch2   []byte
+	samplers   map[string]*samplerState
+	allowDelta bool
 }
 
 func NewEncoder(level zstd.EncoderLevel) (*Encoder, error) {
+	return NewEncoderWithOpts(level, false)
+}
+
+// NewEncoderWithOpts builds a per-worker encoder. allowDelta enables the
+// bitshuffle-vs-delta sampler; when false (the recommended default for speed),
+// EncodeBestSampled commits unconditionally to bitshuffle+zstd. delta tends to
+// compress smooth fields slightly better but is ~3× more CPU at this scale,
+// since zstd handles delta-preprocessed bytes worse than bit-plane-shuffled ones
+func NewEncoderWithOpts(level zstd.EncoderLevel, allowDelta bool) (*Encoder, error) {
 	// concurrency=1: each Encoder is owned by a single goroutine so EncodeAll reuses scratch state
 	zw, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level), zstd.WithEncoderConcurrency(1))
 	if err != nil {
 		return nil, err
 	}
-	return &Encoder{zw: zw}, nil
+	return &Encoder{zw: zw, allowDelta: allowDelta}, nil
 }
 
 // per-block bandit: try both bitshuffle and delta for the first samplerSampleSize tiles,
-// then commit to the cheaper one for the next samplerExploitSize, then re-sample
+// then commit to the cheaper one for the next samplerExploitSize, then re-sample.
+//
+// the sampler is per-(Encoder, variable). at scale (e.g. full GFS, 696 vars × 24
+// workers = 16k samplers), a sample size of 100 means ~1.6M sample slots, which
+// often exceeds the total tile count — every tile ends up in sample mode, paying
+// for both encoders. small sample is enough to pick a winner; exploit dominates
+// total work for any non-trivial encode
 const (
-	samplerSampleSize  = 100
+	samplerSampleSize  = 4
 	samplerExploitSize = 1000
 )
 
@@ -162,7 +178,7 @@ func (e *Encoder) EncodeBestSampled(quantized []byte, p quantize.Params, nPixels
 	if isConstant(quantized, p.DType.Bytes()) {
 		return encodeConstant(quantized[:p.DType.Bytes()])
 	}
-	if p.DType == quantize.DTypeF32 {
+	if p.DType == quantize.DTypeF32 || !e.allowDelta {
 		return e.encodeBitshuffleZstd(quantized, p, nPixels)
 	}
 

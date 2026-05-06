@@ -3,6 +3,7 @@ package encoder
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 
@@ -137,14 +138,45 @@ func (b *blockBuilder) header() *format.BlockHeader {
 	}
 }
 
-func (b *blockBuilder) blockBytes() []byte {
+// writeBlockTo streams the block layout (header + root dir + leaves + tile data)
+// directly to w, avoiding the need to materialize one giant []byte. for large
+// encodes (e.g. full GFS, 18 GB output) the merged-slice approach doubled peak
+// memory and OOM'd; streaming keeps peak resident at the largest single part
+func (b *blockBuilder) writeBlockTo(w io.Writer) (int64, error) {
+	var total int64
 	hdr := b.header()
-	out := make([]byte, 0, format.BlockHeaderSize+len(b.rootBytes)+len(b.leavesBlob)+len(b.tileData))
-	out = append(out, format.MarshalBlockHeader(hdr)...)
-	out = append(out, b.rootBytes...)
-	out = append(out, b.leavesBlob...)
-	out = append(out, b.tileData...)
-	return out
+	if n, err := w.Write(format.MarshalBlockHeader(hdr)); err != nil {
+		return total + int64(n), err
+	} else {
+		total += int64(n)
+	}
+	if n, err := w.Write(b.rootBytes); err != nil {
+		return total + int64(n), err
+	} else {
+		total += int64(n)
+	}
+	if n, err := w.Write(b.leavesBlob); err != nil {
+		return total + int64(n), err
+	} else {
+		total += int64(n)
+	}
+	if n, err := w.Write(b.tileData); err != nil {
+		return total + int64(n), err
+	} else {
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// release frees the large per-block buffers so a multi-block Finish doesn't
+// hold every block's tileData resident at once. call after the block has been
+// written to disk and its block-table entry recorded
+func (b *blockBuilder) release() {
+	b.tileData = nil
+	b.rootBytes = nil
+	b.leavesBlob = nil
+	b.dedup = nil
+	b.records = nil
 }
 
 func (b *blockBuilder) blockTableEntry(fileOffset uint64) format.BlockTableEntry {

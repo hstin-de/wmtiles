@@ -478,34 +478,41 @@ func printCompareResults(stats map[string]*accum) bool {
 
 func buildSamplersForVariables(path string, want map[string]bool, timeToIdx map[int64]uint32) (map[string]map[uint32]*tiler.Sampler, error) {
 	out := map[string]map[uint32]*tiler.Sampler{}
-	err := parser.ForEachMessage(path, func(g parser.GRIBFile) error {
-		base := g.Header.ShortName
+	headerName := func(h *parser.GribHeader) string {
+		base := h.ShortName
 		if base == "" || base == "unknown" {
-			base = fmt.Sprintf("param_%d_%d_%d",
-				g.Header.Discipline, g.Header.ParameterCategory, g.Header.ParameterNumber)
+			base = fmt.Sprintf("param_%d_%d_%d", h.Discipline, h.ParameterCategory, h.ParameterNumber)
 		}
-		name := base + levelSuffix(g.Header.TypeOfLevel, g.Header.Level, g.Header.BottomLevel)
-		if !want[name] {
+		return base + levelSuffix(h.TypeOfLevel, h.Level, h.BottomLevel)
+	}
+	err := parser.ForEachMessageFiltered(path,
+		func(h *parser.GribHeader) bool {
+			if !want[headerName(h)] {
+				return false
+			}
+			_, ok := timeToIdx[h.ReferenceTime.UnixMilli()]
+			return ok
+		},
+		func(g parser.GRIBFile) error {
+			name := headerName(&g.Header)
+			tIdx, ok := timeToIdx[g.Header.ReferenceTime.UnixMilli()]
+			if !ok {
+				return nil
+			}
+			if out[name] == nil {
+				out[name] = map[uint32]*tiler.Sampler{}
+			}
+			if _, exists := out[name][tIdx]; exists {
+				return nil
+			}
+			gc := g
+			s := tiler.NewSampler(&gc)
+			if s == nil {
+				return fmt.Errorf("variable %q: malformed grid in GRIB", name)
+			}
+			out[name][tIdx] = s
 			return nil
-		}
-		tIdx, ok := timeToIdx[g.Header.ReferenceTime.UnixMilli()]
-		if !ok {
-			return nil
-		}
-		if out[name] == nil {
-			out[name] = map[uint32]*tiler.Sampler{}
-		}
-		if _, exists := out[name][tIdx]; exists {
-			return nil
-		}
-		gc := g
-		s := tiler.NewSampler(&gc)
-		if s == nil {
-			return fmt.Errorf("variable %q: malformed grid in GRIB", name)
-		}
-		out[name][tIdx] = s
-		return nil
-	})
+		})
 	if err != nil {
 		return nil, fmt.Errorf("scan grib: %w", err)
 	}

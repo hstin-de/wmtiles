@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -288,8 +289,47 @@ func ForEachMessage(path string, fn func(GRIBFile) error) error {
 	})
 }
 
+// ForEachMessageFiltered visits GRIB messages but only decodes the value array
+// (a multi-megabyte cgo round-trip per message) when want returns true. callers
+// that filter by header — every encode/extend/compare call site does — should
+// prefer this over ForEachMessage to avoid paying for messages they discard.
+func ForEachMessageFiltered(path string, want func(*GribHeader) bool, fn func(GRIBFile) error) error {
+	return forEachHandle(path, func(gid *C.codes_handle) error {
+		h, err := extractHeaderScalars(gid)
+		if err != nil {
+			return err
+		}
+		if want != nil && !want(&h) {
+			return nil
+		}
+		g, err := finishProcessHandle(gid, h)
+		if err != nil {
+			return err
+		}
+		return fn(g)
+	})
+}
+
 func ForEachMessageMeta(path string, fn func(HeaderInfo) error) error {
 	return forEachHandle(path, func(gid *C.codes_handle) error {
+		m, err := processHandleMeta(gid)
+		if err != nil {
+			return err
+		}
+		return fn(m)
+	})
+}
+
+// ForEachMessageMetaFiltered visits message metadata but only extracts the full
+// header scalar set when want(shortName) returns true. lets a --filter pass
+// reject messages with a single cgo call (getString shortName) instead of the
+// ~25 scalar getters processHandleMeta would otherwise issue per message.
+func ForEachMessageMetaFiltered(path string, want func(shortName string) bool, fn func(HeaderInfo) error) error {
+	return forEachHandle(path, func(gid *C.codes_handle) error {
+		shortName := getString(gid, "shortName")
+		if want != nil && !want(shortName) {
+			return nil
+		}
 		m, err := processHandleMeta(gid)
 		if err != nil {
 			return err
@@ -427,22 +467,63 @@ func extractHeaderScalars(gid *C.codes_handle) (GribHeader, error) {
 	}, nil
 }
 
+// gridSig identifies a regular_ll-style coordinate grid: messages with identical
+// (Nx,Ny,La1,La2,Lo1,Lo2) produce identical distinctLatitudes/distinctLongitudes,
+// so we read them from eccodes once per grid and reuse across messages
+type gridSig struct {
+	nx, ny             int
+	la1, la2, lo1, lo2 float64
+}
+
+type distinctCoords struct {
+	lats, lons []float64
+}
+
+var (
+	distinctCacheMu sync.RWMutex
+	distinctCache   = map[gridSig]*distinctCoords{}
+)
+
 func processHandle(gid *C.codes_handle) (GRIBFile, error) {
 	h, err := extractHeaderScalars(gid)
 	if err != nil {
 		return GRIBFile{}, err
 	}
+	return finishProcessHandle(gid, h)
+}
 
-	h.DistinctLatitudes = make([]float64, h.Ny)
-	getDoubleArray(gid, "distinctLatitudes", h.DistinctLatitudes)
+// finishProcessHandle does the expensive part of decoding a message: distinct
+// lat/lon arrays (cached by grid sig) and the values array (~8 MB per GFS msg).
+// split out so ForEachMessageFiltered can skip it for unwanted messages
+func finishProcessHandle(gid *C.codes_handle, h GribHeader) (GRIBFile, error) {
+	sig := gridSig{nx: h.Nx, ny: h.Ny, la1: h.La1, la2: h.La2, lo1: h.Lo1, lo2: h.Lo2}
+	distinctCacheMu.RLock()
+	dc, ok := distinctCache[sig]
+	distinctCacheMu.RUnlock()
+	if ok {
+		h.DistinctLatitudes = dc.lats
+		h.DistinctLongitudes = dc.lons
+	} else {
+		lats := make([]float64, h.Ny)
+		getDoubleArray(gid, "distinctLatitudes", lats)
+		lons := make([]float64, h.Nx)
+		getDoubleArray(gid, "distinctLongitudes", lons)
 
-	h.DistinctLongitudes = make([]float64, h.Nx)
-	getDoubleArray(gid, "distinctLongitudes", h.DistinctLongitudes)
-
-	if h.Ny > 1 && h.La2 < h.La1 && h.DistinctLatitudes[len(h.DistinctLatitudes)-1] > h.DistinctLatitudes[0] {
-		for i, j := 0, len(h.DistinctLatitudes)-1; i < j; i, j = i+1, j-1 {
-			h.DistinctLatitudes[i], h.DistinctLatitudes[j] = h.DistinctLatitudes[j], h.DistinctLatitudes[i]
+		if h.Ny > 1 && h.La2 < h.La1 && lats[len(lats)-1] > lats[0] {
+			for i, j := 0, len(lats)-1; i < j; i, j = i+1, j-1 {
+				lats[i], lats[j] = lats[j], lats[i]
+			}
 		}
+
+		distinctCacheMu.Lock()
+		if existing, dup := distinctCache[sig]; dup {
+			lats, lons = existing.lats, existing.lons
+		} else {
+			distinctCache[sig] = &distinctCoords{lats: lats, lons: lons}
+		}
+		distinctCacheMu.Unlock()
+		h.DistinctLatitudes = lats
+		h.DistinctLongitudes = lons
 	}
 
 	numValues, rc := getSize(gid, "values")

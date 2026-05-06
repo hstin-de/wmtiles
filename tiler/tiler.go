@@ -2,9 +2,35 @@ package tiler
 
 import (
 	"math"
+	"sync"
 
 	"github.com/hstin-de/wmtiles/parser"
 )
+
+// pool of [pixSize*pixSize]float32 tile buffers; the encoder is the last reader
+// (quantize copies the values out), so it can return the slice via PutTileBuf
+// once it's done with it. *[]float32 (not []float32) avoids the per-Put boxing
+// alloc that bare slices in sync.Pool incur.
+var tileBufPool = sync.Pool{
+	New: func() any { return (*[]float32)(nil) },
+}
+
+func getTileBuf(n int) []float32 {
+	if v := tileBufPool.Get(); v != nil {
+		if p, ok := v.(*[]float32); ok && p != nil && cap(*p) >= n {
+			return (*p)[:n]
+		}
+	}
+	return make([]float32, n)
+}
+
+func PutTileBuf(b []float32) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:cap(b)]
+	tileBufPool.Put(&b)
+}
 
 func PixelToLatLon(z uint8, x, y uint32, pixSize, col, row int) (lat, lon float64) {
 	n := float64(uint32(1) << z)
@@ -328,20 +354,115 @@ func Tile(s *Sampler, z uint8, x, y uint32, pixSize int) []float32 {
 		return nil
 	}
 
-	out := make([]float32, pixSize*pixSize)
+	out := getTileBuf(pixSize * pixSize)
+	if s.uniform {
+		fillTileUniform(s, lats, lons, out, pixSize)
+	} else {
+		fillTileGeneric(s, lats, lons, out, pixSize)
+	}
+	return out
+}
+
+func fillTileGeneric(s *Sampler, lats, lons []float64, out []float32, pixSize int) {
+	nan := float32(math.NaN())
 	for r := range pixSize {
 		lat := lats[r]
 		row := r * pixSize
 		for c := range pixSize {
 			v := s.At(lat, lons[c])
 			if math.IsNaN(v) {
-				out[row+c] = float32(math.NaN())
+				out[row+c] = nan
 			} else {
 				out[row+c] = float32(v)
 			}
 		}
 	}
-	return out
+}
+
+// fillTileUniform is the hot path: ~99% of real-world GRIB grids are uniform
+// regular_ll. precomputes per-column indices once per tile, then hoists per-row
+// invariants (yFrac, y0, v, row offsets) out of the inner pixel loop. previously
+// Sampler.At recomputed all of that per-pixel — 65k redundant evaluations per
+// tile and 36% of total CPU at scale.
+func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize int) {
+	nan := float32(math.NaN())
+	lon0 := s.lon0
+	lat0 := s.lat0
+	invDLat := s.invDLat
+	invDLon := s.invDLon
+	nLatM1 := s.nLatM1
+	nLonM1 := s.nLonM1
+	nLatM1F := float64(nLatM1)
+	nLonM1F := float64(nLonM1)
+	w := s.g.Header.Nx
+	missing := s.missing
+	data := s.g.DataValues
+	lonGrid0 := s.lonGrid0
+
+	// pre-resolve per-column state once; reused across all pixSize rows.
+	// invalid columns are flagged via x0 = -1 so the row loop can branch once
+	colX0 := make([]int32, pixSize)
+	colU := make([]float64, pixSize)
+	for c, lon := range lons {
+		if lonGrid0 {
+			if lon < 0 {
+				lon += 360
+			}
+		} else if lon > 180 {
+			lon -= 360
+		}
+		xFrac := (lon - lon0) * invDLon
+		if xFrac < 0 || xFrac > nLonM1F {
+			colX0[c] = -1
+			continue
+		}
+		x0 := int(xFrac)
+		if x0 >= nLonM1 {
+			x0 = nLonM1 - 1
+		}
+		colX0[c] = int32(x0)
+		colU[c] = xFrac - float64(x0)
+	}
+
+	for r, lat := range lats {
+		rowBase := r * pixSize
+		rowOut := out[rowBase : rowBase+pixSize]
+
+		yFrac := (lat - lat0) * invDLat
+		if yFrac < 0 || yFrac > nLatM1F {
+			for c := range pixSize {
+				rowOut[c] = nan
+			}
+			continue
+		}
+		y0 := int(yFrac)
+		if y0 >= nLatM1 {
+			y0 = nLatM1 - 1
+		}
+		v := yFrac - float64(y0)
+		oneV := 1.0 - v
+		row0 := y0 * w
+		row1 := row0 + w
+
+		for c := range pixSize {
+			x0 := int(colX0[c])
+			if x0 < 0 {
+				rowOut[c] = nan
+				continue
+			}
+			v00 := data[row0+x0]
+			v10 := data[row0+x0+1]
+			v01 := data[row1+x0]
+			v11 := data[row1+x0+1]
+			if v00 == missing || v10 == missing || v01 == missing || v11 == missing {
+				rowOut[c] = nan
+				continue
+			}
+			u := colU[c]
+			oneU := 1.0 - u
+			rowOut[c] = float32(oneU*oneV*v00 + u*oneV*v10 + oneU*v*v01 + u*v*v11)
+		}
+	}
 }
 
 func isqrt(n int) int {

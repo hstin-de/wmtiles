@@ -6,6 +6,8 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/pprof"
+	"runtime/trace"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +28,10 @@ type gribEncodeFlags struct {
 	tileSizeLog2       uint
 	filterShortNames   string
 	precisionOverrides map[string]float64
+	cpuProfile         string
+	memProfile         string
+	traceProfile       string
+	disableDelta       bool
 }
 
 func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, string, error) {
@@ -36,6 +42,10 @@ func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, strin
 	tileSizeLog2 := fs.Uint("tile-size-log2", 8, "tile size as log2 of pixel count (7..10 -> 128..1024)")
 	filterShortNames := fs.String("filter", "", "comma-separated list of GRIB shortNames to keep (e.g. 't,u,v'); empty = keep all")
 	precisionOverride := fs.String("precision", "", "per variable quantization precision overrides, e.g. '2t=0.25,sp=50' (default: lookup table by shortName/unit; 0 = u16)")
+	cpuProfile := fs.String("cpuprofile", "", "write CPU profile to file")
+	memProfile := fs.String("memprofile", "", "write heap profile to file")
+	traceProfile := fs.String("trace", "", "write execution trace to file")
+	disableDelta := fs.Bool("disable-delta-codec", false, "force bitshuffle-only encoding; faster but produces larger files (smooth GFS vars can grow ~2×)")
 	normalizedArgs := normalizeGribEncodeArgs(args)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return gribEncodeFlags{}, "", err
@@ -63,6 +73,10 @@ func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, strin
 		tileSizeLog2:       *tileSizeLog2,
 		filterShortNames:   *filterShortNames,
 		precisionOverrides: overrides,
+		cpuProfile:         *cpuProfile,
+		memProfile:         *memProfile,
+		traceProfile:       *traceProfile,
+		disableDelta:       *disableDelta,
 	}, fs.Arg(0), nil
 }
 
@@ -158,64 +172,65 @@ func scanGribMetadata(path, filterShortNames string) (
 	bbox = [4]float64{180, 90, -180, -90}
 	bboxInit := false
 
-	err = parser.ForEachMessageMeta(path, func(m parser.HeaderInfo) error {
-		totalSeen++
-		if keep != nil && !keep[m.Header.ShortName] {
+	err = parser.ForEachMessageMetaFiltered(path,
+		func(sn string) bool {
+			totalSeen++
+			return keep == nil || keep[sn]
+		},
+		func(m parser.HeaderInfo) error {
+			keptSeen++
+
+			k := varKeyOf(&m.Header)
+			v, ok := bySig[k]
+			if !ok {
+				base := m.Header.ShortName
+				if base == "" || base == "unknown" {
+					base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
+				}
+				v = &varInfo{
+					name:      base + levelSuffix(k.levelType, k.level, k.bottomLevel),
+					shortName: m.Header.ShortName,
+					unit:      m.Header.Units,
+					vmin:      math.Inf(+1),
+					vmax:      math.Inf(-1),
+				}
+				bySig[k] = v
+			}
+			v.messageCount++
+
+			if m.HasFinite {
+				if m.Min < v.vmin {
+					v.vmin = m.Min
+				}
+				if m.Max > v.vmax {
+					v.vmax = m.Max
+				}
+				v.hasFinite = true
+			}
+
+			shell := parser.GRIBFile{Header: m.Header}
+			gw, gs, ge, gn := tiler.GridBBox(&shell)
+			if !bboxInit {
+				bbox = [4]float64{gw, gs, ge, gn}
+				bboxInit = true
+			} else {
+				if gw < bbox[0] {
+					bbox[0] = gw
+				}
+				if gs < bbox[1] {
+					bbox[1] = gs
+				}
+				if ge > bbox[2] {
+					bbox[2] = ge
+				}
+				if gn > bbox[3] {
+					bbox[3] = gn
+				}
+			}
+
+			timesSeen[m.Header.ReferenceTime] = struct{}{}
 			return nil
-		}
-		keptSeen++
-
-		k := varKeyOf(&m.Header)
-		v, ok := bySig[k]
-		if !ok {
-			base := m.Header.ShortName
-			if base == "" || base == "unknown" {
-				base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
-			}
-			v = &varInfo{
-				name:      base + levelSuffix(k.levelType, k.level, k.bottomLevel),
-				shortName: m.Header.ShortName,
-				unit:      m.Header.Units,
-				vmin:      math.Inf(+1),
-				vmax:      math.Inf(-1),
-			}
-			bySig[k] = v
-		}
-		v.messageCount++
-
-		if m.HasFinite {
-			if m.Min < v.vmin {
-				v.vmin = m.Min
-			}
-			if m.Max > v.vmax {
-				v.vmax = m.Max
-			}
-			v.hasFinite = true
-		}
-
-		shell := parser.GRIBFile{Header: m.Header}
-		gw, gs, ge, gn := tiler.GridBBox(&shell)
-		if !bboxInit {
-			bbox = [4]float64{gw, gs, ge, gn}
-			bboxInit = true
-		} else {
-			if gw < bbox[0] {
-				bbox[0] = gw
-			}
-			if gs < bbox[1] {
-				bbox[1] = gs
-			}
-			if ge > bbox[2] {
-				bbox[2] = ge
-			}
-			if gn > bbox[3] {
-				bbox[3] = gn
-			}
-		}
-
-		timesSeen[m.Header.ReferenceTime] = struct{}{}
-		return nil
-	})
+		})
 	if err != nil {
 		return
 	}
@@ -342,36 +357,41 @@ func streamTilesIntoEncoder(
 	}
 
 	seen := map[vtKey]struct{}{}
-	err := parser.ForEachMessage(path, func(g parser.GRIBFile) error {
-		k := varKeyOf(&g.Header)
-		v, ok := bySig[k]
-		if !ok {
-			return nil
-		}
-		tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
-		if !ok {
-			return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
-		}
-		vt := vtKey{k, tIdx}
-		if _, dup := seen[vt]; dup {
-			return nil
-		}
-		seen[vt] = struct{}{}
-		gc := g
-		s := tiler.NewSampler(&gc)
-		if s == nil {
-			return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
-		}
-		for z := minZoom; z <= maxZoom; z++ {
-			for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
-				workCh <- tileWork{
-					name: v.name, tIdx: tIdx,
-					z: z, x: c.X, y: c.Y, s: s,
+	err := parser.ForEachMessageFiltered(path,
+		func(h *parser.GribHeader) bool {
+			_, ok := bySig[varKeyOf(h)]
+			return ok
+		},
+		func(g parser.GRIBFile) error {
+			k := varKeyOf(&g.Header)
+			v, ok := bySig[k]
+			if !ok {
+				return nil
+			}
+			tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
+			if !ok {
+				return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
+			}
+			vt := vtKey{k, tIdx}
+			if _, dup := seen[vt]; dup {
+				return nil
+			}
+			seen[vt] = struct{}{}
+			gc := g
+			s := tiler.NewSampler(&gc)
+			if s == nil {
+				return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
+			}
+			for z := minZoom; z <= maxZoom; z++ {
+				for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
+					workCh <- tileWork{
+						name: v.name, tIdx: tIdx,
+						z: z, x: c.X, y: c.Y, s: s,
+					}
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
 
 	close(workCh)
 	wg.Wait()
@@ -385,6 +405,43 @@ func runEncodeGRIB(command string, args []string) error {
 	}
 	if _, err := os.Stat(in); err != nil {
 		return err
+	}
+
+	if flags.cpuProfile != "" {
+		f, err := os.Create(flags.cpuProfile)
+		if err != nil {
+			return fmt.Errorf("cpuprofile: %w", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("start cpu profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+	if flags.traceProfile != "" {
+		f, err := os.Create(flags.traceProfile)
+		if err != nil {
+			return fmt.Errorf("trace: %w", err)
+		}
+		defer f.Close()
+		if err := trace.Start(f); err != nil {
+			return fmt.Errorf("start trace: %w", err)
+		}
+		defer trace.Stop()
+	}
+	if flags.memProfile != "" {
+		defer func() {
+			f, err := os.Create(flags.memProfile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+				return
+			}
+			defer f.Close()
+			runtime.GC()
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "write heap profile: %v\n", err)
+			}
+		}()
 	}
 
 	cliSection("WMTiles encode")
@@ -442,6 +499,8 @@ func runEncodeGRIB(command string, args []string) error {
 			"sourceGrib":   in,
 			"messageCount": keptSeen,
 		},
+		OnPixelsConsumed: tiler.PutTileBuf,
+		DisableDeltaCodec: flags.disableDelta,
 	}
 
 	enc, err := encoder.NewStreamingEncoder(opts, flags.output)

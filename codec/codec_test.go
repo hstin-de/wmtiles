@@ -19,6 +19,16 @@ func makeEncoder(t *testing.T) *Encoder {
 	return enc
 }
 
+func makeEncoderWithDelta(t *testing.T) *Encoder {
+	t.Helper()
+	enc, err := NewEncoderWithOpts(zstd.SpeedDefault, true)
+	if err != nil {
+		t.Fatalf("NewEncoderWithOpts: %v", err)
+	}
+	t.Cleanup(func() { enc.Close() })
+	return enc
+}
+
 func TestConstantTile(t *testing.T) {
 	enc := makeEncoder(t)
 	const n = 256
@@ -199,7 +209,7 @@ func TestEncodeBestSampledRoundtripAcrossPhases(t *testing.T) {
 }
 
 func TestEncodeBestSampledConvergesOnSmoothFields(t *testing.T) {
-	enc := makeEncoder(t)
+	enc := makeEncoderWithDelta(t)
 	const w = 16
 	const n = w * w
 	p := quantize.Params{DType: quantize.DTypeU16, Scale: 1, Offset: 0}
@@ -228,7 +238,7 @@ func TestEncodeBestSampledConvergesOnSmoothFields(t *testing.T) {
 }
 
 func TestEncodeBestSampledResamples(t *testing.T) {
-	enc := makeEncoder(t)
+	enc := makeEncoderWithDelta(t)
 	const w = 16
 	const n = w * w
 	p := quantize.Params{DType: quantize.DTypeU16, Scale: 1, Offset: 0}

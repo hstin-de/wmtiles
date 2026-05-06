@@ -191,7 +191,7 @@ func (s *StreamingEncoder) DeclareBlock(spec BlockSpec) error {
 
 func (s *StreamingEncoder) worker() {
 	defer s.workerWg.Done()
-	tcEnc, err := codec.NewEncoder(s.opts.ZstdLevel)
+	tcEnc, err := codec.NewEncoderWithOpts(s.opts.ZstdLevel, !s.opts.DisableDeltaCodec)
 	if err != nil {
 		s.setErr(err)
 		for range s.jobCh {
@@ -211,6 +211,9 @@ func (s *StreamingEncoder) worker() {
 		}
 		quant := scratch[:quantBytes]
 		quantize.Encode(msg.pixels, bb.params, quant)
+		if s.opts.OnPixelsConsumed != nil {
+			s.opts.OnPixelsConsumed(msg.pixels)
+		}
 
 		hasher.Reset()
 		hasher.Write(quant)
@@ -291,15 +294,16 @@ func (s *StreamingEncoder) Finish() error {
 		}
 		for _, k := range s.declarations {
 			bb := s.blocks[k]
-			payload := bb.blockBytes()
 			off := s.cursor
-			if _, e := s.out.Write(payload); e != nil {
+			n, e := bb.writeBlockTo(s.out)
+			if e != nil {
 				err = fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, e)
 				s.cleanupOnErr()
 				return
 			}
-			s.cursor += uint64(len(payload))
+			s.cursor += uint64(n)
 			s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
+			bb.release()
 		}
 
 		for i := range s.variables {

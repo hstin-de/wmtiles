@@ -217,36 +217,41 @@ func streamGribTilesIntoAppend(
 	}
 
 	seen := map[vtKey]struct{}{}
-	err := parser.ForEachMessage(path, func(g parser.GRIBFile) error {
-		k := varKeyOf(&g.Header)
-		v, ok := bySig[k]
-		if !ok {
-			return nil
-		}
-		tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
-		if !ok {
-			return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
-		}
-		vt := vtKey{k, tIdx}
-		if _, dup := seen[vt]; dup {
-			return nil
-		}
-		seen[vt] = struct{}{}
-		gc := g
-		s := tiler.NewSampler(&gc)
-		if s == nil {
-			return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
-		}
-		for z := minZoom; z <= maxZoom; z++ {
-			for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
-				workCh <- tileWork{
-					name: v.name, tIdx: tIdx,
-					z: z, x: c.X, y: c.Y, s: s,
+	err := parser.ForEachMessageFiltered(path,
+		func(h *parser.GribHeader) bool {
+			_, ok := bySig[varKeyOf(h)]
+			return ok
+		},
+		func(g parser.GRIBFile) error {
+			k := varKeyOf(&g.Header)
+			v, ok := bySig[k]
+			if !ok {
+				return nil
+			}
+			tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
+			if !ok {
+				return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
+			}
+			vt := vtKey{k, tIdx}
+			if _, dup := seen[vt]; dup {
+				return nil
+			}
+			seen[vt] = struct{}{}
+			gc := g
+			s := tiler.NewSampler(&gc)
+			if s == nil {
+				return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
+			}
+			for z := minZoom; z <= maxZoom; z++ {
+				for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
+					workCh <- tileWork{
+						name: v.name, tIdx: tIdx,
+						z: z, x: c.X, y: c.Y, s: s,
+					}
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
 	close(workCh)
 	wg.Wait()
 	return submitted.Load(), skipped.Load(), err

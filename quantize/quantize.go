@@ -88,13 +88,17 @@ func QuantizeU8(values []float32, p Params, out []byte) {
 			out[i] = SentinelU8
 			continue
 		}
-		q := math.Round((float64(v) - p.Offset) * inv)
-		if q < 0 {
-			q = 0
-		} else if q > 254 {
-			q = 254
+		// math.Round is banker's-rounding via a function call; for quantization
+		// the half-to-even vs half-up distinction is well below 1 LSB and dwarfed
+		// by the precision budget, so use the cheap +0.5 trick after clamping
+		r := (float64(v) - p.Offset) * inv
+		if r <= 0 {
+			out[i] = 0
+		} else if r >= 254 {
+			out[i] = 254
+		} else {
+			out[i] = uint8(r + 0.5)
 		}
-		out[i] = uint8(q)
 	}
 }
 
@@ -126,13 +130,15 @@ func QuantizeU16(values []float32, p Params, out []byte) {
 		if isNaN32(v) {
 			q = SentinelU16
 		} else {
-			r := math.Round((float64(v) - p.Offset) * inv)
-			if r < 0 {
-				r = 0
-			} else if r > 65534 {
-				r = 65534
+			r := (float64(v) - p.Offset) * inv
+			switch {
+			case r <= 0:
+				q = 0
+			case r >= 65534:
+				q = 65534
+			default:
+				q = uint16(r + 0.5)
 			}
-			q = uint16(r)
 		}
 		out[2*i] = byte(q)
 		out[2*i+1] = byte(q >> 8)
