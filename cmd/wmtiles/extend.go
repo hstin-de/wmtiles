@@ -172,13 +172,8 @@ func runExtend(args []string) error {
 }
 
 func pickPrecision(v *varInfo, overrides map[string]float64) float64 {
-	if p, ok := overrides[v.name]; ok {
-		return p
-	}
-	if p, ok := overrides[v.shortName]; ok {
-		return p
-	}
-	return defaultPrecisionFor(v.shortName, v.unit)
+	p, _ := resolvePrecision(v, overrides)
+	return p
 }
 
 func streamGribTilesIntoAppend(

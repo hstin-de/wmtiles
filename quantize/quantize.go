@@ -58,13 +58,19 @@ func FitParams(vmin, vmax, precision float64) Params {
 	}
 	rng := vmax - vmin
 	if precision > 0 {
+		// honour precision as the actual quantisation step. previous behaviour
+		// always picked Scale = rng/MaxQ, giving finer resolution than the
+		// caller asked for and forcing every bit-plane to carry signal.
+		// using precision as Scale leaves high bit-planes empty whenever the
+		// requested resolution is coarser than the dtype's full grid; bitshuffle
+		// then collapses those planes and zstd compresses them to almost nothing
 		needU8 := math.Ceil(rng/precision) + 1
 		if needU8 <= 255 {
-			return Params{DType: DTypeU8, Scale: rng / 254.0, Offset: vmin} // 254 not 255: top slot is the NaN sentinel
+			return Params{DType: DTypeU8, Scale: precision, Offset: vmin}
 		}
 		needU16 := math.Ceil(rng/precision) + 1
 		if needU16 <= 65535 {
-			return Params{DType: DTypeU16, Scale: rng / 65534.0, Offset: vmin} // 65534 not 65535, sentinel reserved
+			return Params{DType: DTypeU16, Scale: precision, Offset: vmin}
 		}
 		return Params{DType: DTypeF32, Scale: 1, Offset: 0}
 	}

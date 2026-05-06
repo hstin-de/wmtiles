@@ -41,7 +41,7 @@ func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, strin
 	maxZoom := fs.Uint("max-zoom", 5, "maximum zoom level")
 	tileSizeLog2 := fs.Uint("tile-size-log2", 8, "tile size as log2 of pixel count (7..10 -> 128..1024)")
 	filterShortNames := fs.String("filter", "", "comma-separated list of GRIB shortNames to keep (e.g. 't,u,v'); empty = keep all")
-	precisionOverride := fs.String("precision", "", "per variable quantization precision overrides, e.g. '2t=0.25,sp=50' (default: lookup table by shortName/unit; 0 = u16)")
+	precisionOverride := fs.String("precision", "", "per variable quantization precision overrides, e.g. '2t=0.25,sp=50' (default: lookup table by shortName/unit, then a 12-bit auto-cap from the observed range; explicit 0 forces full u16)")
 	cpuProfile := fs.String("cpuprofile", "", "write CPU profile to file")
 	memProfile := fs.String("memprofile", "", "write heap profile to file")
 	traceProfile := fs.String("trace", "", "write execution trace to file")
@@ -273,27 +273,39 @@ func buildVariableSpecs(bySig map[varKey]*varInfo, overrides map[string]float64)
 	return specs, plans, nil
 }
 
+// autoPrecisionSteps caps the quantisation grid for variables we have no entry
+// for. 4096 (12-bit) is well below the noise floor of any operational NWP field,
+// and lets bitshuffle skip 4 high bit-planes that would otherwise be all-zero
+// padding. Variables explicitly set to precision=0 by the user keep full u16.
+const autoPrecisionSteps = 4096
+
+// resolvePrecision picks the quantisation precision for a variable in one of
+// three ways, in priority order: user override, hardcoded shortName/unit
+// lookup, or an auto-cap derived from the observed range. The auto-cap fires
+// only when nothing else applies; an explicit override of 0 still means "use
+// full u16 for whatever range you observe".
+func resolvePrecision(v *varInfo, overrides map[string]float64) (float64, string) {
+	if p, ok := overrides[v.name]; ok {
+		return p, "override"
+	}
+	if p, ok := overrides[v.shortName]; ok {
+		return p, "override"
+	}
+	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+		return p, "auto"
+	}
+	if v.vmax > v.vmin {
+		return (v.vmax - v.vmin) / autoPrecisionSteps, "cap"
+	}
+	return 0, "default"
+}
+
 func variablePlanFor(v *varInfo, overrides map[string]float64) (variablePlan, error) {
 	if !v.hasFinite {
 		return variablePlan{}, fmt.Errorf("variable %q has no finite values; refuse to encode", v.name)
 	}
 
-	var precision float64
-	var precSrc string
-	if p, ok := overrides[v.name]; ok {
-		precision = p
-		precSrc = "override"
-	} else if p, ok := overrides[v.shortName]; ok {
-		precision = p
-		precSrc = "override"
-	} else {
-		precision = defaultPrecisionFor(v.shortName, v.unit)
-		if precision > 0 {
-			precSrc = "auto"
-		} else {
-			precSrc = "default"
-		}
-	}
+	precision, precSrc := resolvePrecision(v, overrides)
 	params := quantize.FitParams(v.vmin, v.vmax, precision)
 	return variablePlan{
 		name:      v.name,
@@ -512,14 +524,7 @@ func runEncodeGRIB(command string, args []string) error {
 		if !v.hasFinite {
 			continue
 		}
-		var precision float64
-		if p, ok := flags.precisionOverrides[v.name]; ok {
-			precision = p
-		} else if p, ok := flags.precisionOverrides[v.shortName]; ok {
-			precision = p
-		} else {
-			precision = defaultPrecisionFor(v.shortName, v.unit)
-		}
+		precision, _ := resolvePrecision(v, flags.precisionOverrides)
 		for _, idx := range timeIdxByTime {
 			if err := enc.DeclareBlock(encoder.BlockSpec{
 				Variable: v.name, TimeStep: idx,
