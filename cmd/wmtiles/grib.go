@@ -136,6 +136,7 @@ type varInfo struct {
 	vmax         float64
 	hasFinite    bool
 	messageCount int
+	times        map[time.Time]struct{}
 }
 
 type variablePlan struct {
@@ -193,10 +194,12 @@ func scanGribMetadata(path, filterShortNames string) (
 					unit:      m.Header.Units,
 					vmin:      math.Inf(+1),
 					vmax:      math.Inf(-1),
+					times:     map[time.Time]struct{}{},
 				}
 				bySig[k] = v
 			}
 			v.messageCount++
+			v.times[m.Header.ReferenceTime] = struct{}{}
 
 			if m.HasFinite {
 				if m.Min < v.vmin {
@@ -235,17 +238,27 @@ func scanGribMetadata(path, filterShortNames string) (
 		return
 	}
 
-	// disambiguate when shortName + level happen to collide across distinct WMO triplets :
-	// rare, but happens with overlapping centre-specific tables
-	nameCounts := map[string]int{}
-	for _, v := range bySig {
-		nameCounts[v.name]++
-	}
-	for k, v := range bySig {
-		if nameCounts[v.name] > 1 {
-			v.name = fmt.Sprintf("%s_%d_%d_%d", v.name, k.d, k.c, k.p)
+	// disambiguate when shortName + level happen to collide across distinct varKeys.
+	// first pass: add _d_c_p (overlapping centre-specific tables). second pass: add
+	// the raw typeOfLevel + level when several typeOfLevel values share a friendly
+	// suffix (e.g. lowCloudLayer/lowCloudBottom/lowCloudTop all map to _lowcld).
+	disambiguate := func(suffix func(varKey) string) {
+		counts := map[string]int{}
+		for _, v := range bySig {
+			counts[v.name]++
+		}
+		for k, v := range bySig {
+			if counts[v.name] > 1 {
+				v.name += suffix(k)
+			}
 		}
 	}
+	disambiguate(func(k varKey) string {
+		return fmt.Sprintf("_%d_%d_%d", k.d, k.c, k.p)
+	})
+	disambiguate(func(k varKey) string {
+		return fmt.Sprintf("_%s_%d_%d", k.levelType, k.level, k.bottomLevel)
+	})
 
 	allTimes = make([]time.Time, 0, len(timesSeen))
 	for t := range timesSeen {
@@ -523,7 +536,11 @@ func runEncodeGRIB(command string, args []string) error {
 			continue
 		}
 		precision, _ := resolvePrecision(v, flags.precisionOverrides)
-		for _, idx := range timeIdxByTime {
+		for t := range v.times {
+			idx, ok := timeIdxByTime[t]
+			if !ok {
+				continue
+			}
 			if err := enc.DeclareBlock(encoder.BlockSpec{
 				Variable: v.name, TimeStep: idx,
 				ValueMin: v.vmin, ValueMax: v.vmax,

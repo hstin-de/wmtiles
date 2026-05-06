@@ -122,7 +122,11 @@ func runExtend(args []string) error {
 			plans = append(plans, plan)
 		}
 		precision := pickPrecision(v, overrides)
-		for _, idx := range timeIdxByTime {
+		for t := range v.times {
+			idx, ok := timeIdxByTime[t]
+			if !ok {
+				continue
+			}
 			err := ctx.DeclareBlock(encoder.BlockSpec{
 				Variable: v.name, TimeStep: idx,
 				ValueMin: v.vmin, ValueMax: v.vmax,
