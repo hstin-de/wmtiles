@@ -44,10 +44,12 @@ WMTiles is the in-between point:
   fixup script, no `fsck`.
 - **Lossless or near-lossless.** Quantisation parameters live per **block**
   (one block per (variable, time)), so a heat wave next month doesn't
-  invalidate January's encoding. Pick `precision=0.01 K` for a fixed error
-  budget; if a positive precision cannot fit in u16, the encoder uses f32.
-  `precision=0` currently means full-range u16 quantisation for the observed
-  block range.
+  invalidate January's encoding. Pick `precision=0.1 K` for a fixed error
+  budget; the encoder uses precision as the actual quantisation step, so any
+  high bit-planes left over by a coarse precision stay empty and bitshuffle
+  + zstd collapses them to almost nothing. If a positive precision cannot
+  fit in u16, the encoder falls back to f32. `precision=0` forces full-range
+  u16 quantisation across the observed block range.
 
 ---
 
@@ -71,7 +73,7 @@ npm install wmtiles fzstd
 wmtiles encode forecast.grib2 -o forecast.wmt \
     --min-zoom 0 --max-zoom 6 \
     --filter 2t,10u,10v \
-    --precision 2t=0.01,10u=0.05,10v=0.05
+    --precision 2t=0.05,10u=0.1,10v=0.1
 ```
 
 ### Append a follow-up run
@@ -140,6 +142,9 @@ err = r.ReadTile("2t", /*timeStep*/ 12, /*z*/ 5, 16, 11, pixels)
 
 ## File anatomy
 
+The byte-level wire format (every offset, magic, CRC, codec tag) is
+specified in [FORMAT.md](FORMAT.md). What follows is the high-level shape.
+
 ```
 +-----------+-------------------+---------------------+----------------+
 |           | Initial snapshot  | Initial blocks      | Append zone …  |
@@ -187,9 +192,16 @@ Each block picks `(scale, offset, dtype)` from its observed value range:
 - `dtype = u16` if the same fits in 65 535 steps
 - `dtype = f32` for the lossless path
 
-The top sentinel value (`0xFF` / `0xFFFF` / quiet-NaN) is reserved for
-**NoData**. Worst-case relative error for u16 is `1 / (2 * (N minus 1)) ≈ 7 ppm`;
-below the noise floor of every NWP model in production use.
+`scale` is the requested precision exactly, not `range/MaxQ`. When the
+precision is coarser than the dtype's full grid (e.g. 0.125 K of swing in a
+u16), the high bit-planes are zero on every sample. Bitshuffle transposes
+those into all-zero rows that zstd encodes in a handful of bytes. Most of
+the recent file-size win lives in this interaction. The top sentinel value
+(`0xFF` / `0xFFFF` / quiet-NaN) is reserved for **NoData**.
+
+Variables without an explicit precision (neither `--precision` nor a
+shortName/unit lookup) get a 10-bit auto-cap on the observed range
+(`range / 1024`), well above NWP-grade SNR.
 
 ### Per-tile codecs
 
@@ -199,10 +211,12 @@ below the noise floor of every NWP model in production use.
 | `0x02` | raw + zstd | row-major dump, zstd compressed |
 | `0x03` | bitshuffle + zstd | transpose then zstd, typically 25 to 40 % of source for Float32 fields |
 | `0x04` | spatial 2D-delta + zstd | smooth fields (geopotential, temperature gradients) |
+| `0x05` | Lorenzo predictor + zstd | 2D Lorenzo predictor in quantised space, then zstd; wins on smooth fields at ~3× the CPU of bitshuffle alone |
 
-Codec is chosen per tile from a sampled heuristic. Constant tiles are
-detected and dedup'd before encoding; identical tile contents share one
-blob within a block.
+Codec is chosen per block by a small bandit: sample bitshuffle vs. delta
+vs. lorenzo on the first few tiles, commit to the cheapest output for the
+next ~1000 tiles, then re-sample. Constant tiles are detected and dedup'd
+before encoding; identical tile contents share one blob within a block.
 
 ### Atomic append
 
@@ -245,7 +259,7 @@ wmtiles serve            <file.wmt> [--addr :8080]     bundled web viewer
 | `--max-zoom N` | `5` | maximum zoom level |
 | `--tile-size-log2 N` | `8` (256 px) | tile pixel size, allowed `7..10` (128..1024) |
 | `--filter SHORTNAMES` | (none = all) | comma-separated GRIB shortNames to keep |
-| `--precision NAME=K,…` | per-variable lookup table | quantisation precision overrides |
+| `--precision NAME=K,…` | shortName/unit lookup, then 10-bit auto-cap | quantisation precision overrides; `=0` forces full-range u16 |
 
 ---
 
@@ -264,13 +278,23 @@ These are design-target numbers, not benchmark guarantees.
 GFS forecast (5 vars × 168 h × 5461 tiles per block, `z ≤ 6`) takes
 ~96 minutes to encode, ~14 minutes to extend by another 6-hour run.
 
-**File sizes** (compressed, GFS 0.25°, `z ≤ 6`):
+**File sizes.** The bit-plane fix to quantisation, the Lorenzo predictor,
+and the precision-table tightening (e.g. 0.5 K → 0.125 K for temperature)
+have together cut typical block sizes by ~30 to 40 % vs. the first
+release. Two ground-truth points from the current encoder:
+
+| Source | Variables × times | Zoom | Source GRIB | `.wmt` | Per-block |
+|---|---|---|---|---|---|
+| ICON-D2 (regional, 2 km) | 1 × 49 h | `z ≤ 10` | 76 MB | 1.79 GB | ~37 MB |
+| GFS 0.25° (one full run) | ~700 × 1 h | `z ≤ 4` | 486 MB | 2.20 GB | ~3.2 MB |
+
+Extrapolated to typical archive scenarios at GFS 0.25°, `z ≤ 6`:
 
 | Scenario | Blocks | Snapshot | Total |
 |---|---|---|---|
-| 1 run, 5 variables, 168 h | 840 | ~45 KB | ~49 GB |
-| Daily archive, 30 days | ~25 000 | ~1.2 MB | ~1.5 TB |
-| 5-year archive | ~1.5 M | ~75 MB | ~90 TB |
+| 1 run, 5 variables, 168 h | 840 | ~45 KB | ~30 GB |
+| Daily archive, 30 days | ~25 000 | ~1.2 MB | ~900 GB |
+| 5-year archive | ~1.5 M | ~75 MB | ~55 TB |
 
 The snapshot stays under 16 MB up to ~3 M blocks. Beyond that, block-table
 hierarchisation (root + leaves, like the per-block tile directory) keeps
