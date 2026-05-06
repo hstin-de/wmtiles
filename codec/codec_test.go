@@ -225,15 +225,15 @@ func TestEncodeBestSampledConvergesOnSmoothFields(t *testing.T) {
 	if s.mode != samplerModeExploit {
 		t.Fatalf("expected exploit mode after %d samples, got %v", samplerSampleSize, s.mode)
 	}
-	if s.winner != IDDeltaZstd {
-		t.Fatalf("expected delta_zstd winner on smooth field, got 0x%02X (bs=%d, dz=%d)",
-			s.winner, s.bitshuffleWins, s.deltaWins)
+	if s.winner != IDDeltaZstd && s.winner != IDLorenzoZstd {
+		t.Fatalf("expected delta_zstd or lorenzo_zstd winner on smooth field, got 0x%02X (bs=%d, dz=%d, lz=%d)",
+			s.winner, s.bitshuffleWins, s.deltaWins, s.lorenzoWins)
 	}
 
 	in := smoothU16Tile(w, 0xbeef)
 	blob := enc.EncodeBestSampled(in, p, n, "smooth")
-	if blob[0] != IDDeltaZstd {
-		t.Fatalf("exploit-phase blob tag = 0x%02X, want IDDeltaZstd", blob[0])
+	if blob[0] != IDDeltaZstd && blob[0] != IDLorenzoZstd {
+		t.Fatalf("exploit-phase blob tag = 0x%02X, want IDDeltaZstd or IDLorenzoZstd", blob[0])
 	}
 }
 
@@ -252,7 +252,7 @@ func TestEncodeBestSampledResamples(t *testing.T) {
 	if s.mode != samplerModeSample {
 		t.Fatalf("expected resample mode after exploit window, got %v (count=%d)", s.mode, s.countInPhase)
 	}
-	if s.bitshuffleWins+s.deltaWins == 0 {
+	if s.bitshuffleWins+s.deltaWins+s.lorenzoWins == 0 {
 		t.Fatalf("resample phase should have recorded the trigger tile")
 	}
 }

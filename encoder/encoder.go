@@ -60,11 +60,8 @@ type Options struct {
 	// large encodes don't churn 256 KB allocations per tile through the GC
 	OnPixelsConsumed func([]float32)
 
-	// DisableDeltaCodec turns off the bitshuffle-vs-delta sampler and forces
-	// every tile through bitshuffle+zstd. delta wins on smooth fields and can
-	// cut output size by ~50% on smooth GFS variables (2t, sp, geopotential),
-	// at the cost of 1.5-3× more CPU. default (delta on) is the size-optimal
-	// choice; set this when encode wall time matters more than file size
+	// forces every tile through bitshuffle+zstd, skipping delta/lorenzo. set
+	// when encode wall time matters more than file size
 	DisableDeltaCodec bool
 }
 
@@ -76,7 +73,7 @@ func defaults(o *Options) {
 		o.InternalCompression = format.CompZstd
 	}
 	if o.ZstdLevel == 0 {
-		o.ZstdLevel = zstd.SpeedDefault
+		o.ZstdLevel = zstd.SpeedBetterCompression
 	}
 }
 

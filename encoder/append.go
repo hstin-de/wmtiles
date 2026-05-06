@@ -25,6 +25,8 @@ type AppendOptions struct {
 	AllowReplace bool
 
 	CreationTime time.Time
+
+	DisableDeltaCodec bool
 }
 
 type AppendCtx struct {
@@ -38,6 +40,8 @@ type AppendCtx struct {
 	pixPerTile int
 
 	zstdLevel zstd.EncoderLevel
+
+	allowDelta bool
 
 	variables  []format.VariableEntry
 	idByName   map[string]uint16
@@ -127,6 +131,7 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 		pixelSize:            pixSize,
 		pixPerTile:           pixPerTile,
 		zstdLevel:            opts.ZstdLevel,
+		allowDelta:           !opts.DisableDeltaCodec,
 		variables:            clonedVars,
 		idByName:             idByName,
 		specByName:           specByName,
@@ -386,7 +391,7 @@ func (a *AppendCtx) Submit(t Tile) error {
 
 func (a *AppendCtx) worker() {
 	defer a.workerWg.Done()
-	tcEnc, err := codec.NewEncoder(a.zstdLevel)
+	tcEnc, err := codec.NewEncoderWithOpts(a.zstdLevel, a.allowDelta)
 	if err != nil {
 		a.setErr(err)
 		for range a.jobCh {

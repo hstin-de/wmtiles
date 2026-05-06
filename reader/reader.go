@@ -357,8 +357,6 @@ func (r *Reader) readTileFromBlock(blk format.BlockTableEntry, tid uint64, out [
 		Scale:  blk.Scale,
 		Offset: blk.Offset,
 	}
-	stride := p.DType.Bytes()
-	tileBytes := make([]byte, r.PixelCount()*stride)
 
 	v := r.decoderPool.Get()
 	if err, ok := v.(error); ok {
@@ -367,11 +365,7 @@ func (r *Reader) readTileFromBlock(blk format.BlockTableEntry, tid uint64, out [
 	dec := v.(*codec.Decoder)
 	defer r.decoderPool.Put(dec)
 
-	if err := dec.Decode(blob, p, r.PixelCount(), tileBytes); err != nil {
-		return err
-	}
-	quantize.Decode(tileBytes, p, out)
-	return nil
+	return dec.DecodeToFloat32(blob, p, r.PixelCount(), out)
 }
 
 func (r *Reader) loadBlockHeader(blockOff, blockLen uint64) (*format.BlockHeader, []directory.Entry, error) {

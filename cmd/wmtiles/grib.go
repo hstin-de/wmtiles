@@ -273,11 +273,9 @@ func buildVariableSpecs(bySig map[varKey]*varInfo, overrides map[string]float64)
 	return specs, plans, nil
 }
 
-// autoPrecisionSteps caps the quantisation grid for variables we have no entry
-// for. 4096 (12-bit) is well below the noise floor of any operational NWP field,
-// and lets bitshuffle skip 4 high bit-planes that would otherwise be all-zero
-// padding. Variables explicitly set to precision=0 by the user keep full u16.
-const autoPrecisionSteps = 4096
+// 10-bit cap on the observed range for variables not in the lookup table; well
+// above NWP-grade SNR. precision=0 explicitly set by the user still keeps u16
+const autoPrecisionSteps = 1024
 
 // resolvePrecision picks the quantisation precision for a variable in one of
 // three ways, in priority order: user override, hardcoded shortName/unit
@@ -511,7 +509,7 @@ func runEncodeGRIB(command string, args []string) error {
 			"sourceGrib":   in,
 			"messageCount": keptSeen,
 		},
-		OnPixelsConsumed: tiler.PutTileBuf,
+		OnPixelsConsumed:  tiler.PutTileBuf,
 		DisableDeltaCodec: flags.disableDelta,
 	}
 

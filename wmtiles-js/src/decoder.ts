@@ -12,6 +12,7 @@ export const CODEC_CONSTANT = 0x01;
 export const CODEC_RAW_ZSTD = 0x02;
 export const CODEC_BITSHUFFLE_ZSTD = 0x03;
 export const CODEC_DELTA_ZSTD = 0x04;
+export const CODEC_LORENZO_ZSTD = 0x05;
 
 export function dtypeBytes(d: number): number {
   if (d === DTYPE_U8) return 1;
@@ -76,6 +77,53 @@ function deltaDecode(src: Uint8Array, w: number, stride: number): Uint8Array {
   return dst;
 }
 
+function lorenzoDecode(src: Uint8Array, w: number, stride: number): Uint8Array {
+  const rowBytes = w * stride;
+  const dst = new Uint8Array(src.length);
+  if (stride === 1) {
+    dst[0] = src[0];
+    for (let c = 1; c < w; c++) {
+      dst[c] = (src[c] + dst[c - 1]) & 0xff;
+    }
+    for (let r = 1; r < w; r++) {
+      const base = r * rowBytes;
+      const prevRow = base - rowBytes;
+      dst[base] = (src[base] + dst[prevRow]) & 0xff;
+      for (let c = 1; c < w; c++) {
+        const pred =
+          dst[base + c - 1] + dst[prevRow + c] - dst[prevRow + c - 1];
+        dst[base + c] = (src[base + c] + pred) & 0xff;
+      }
+    }
+  } else if (stride === 2) {
+    const ldD = (p: number) => dst[p] | (dst[p + 1] << 8);
+    const stD = (p: number, v: number) => {
+      dst[p] = v & 0xff;
+      dst[p + 1] = (v >> 8) & 0xff;
+    };
+    const ldS = (p: number) => src[p] | (src[p + 1] << 8);
+    stD(0, ldS(0));
+    for (let c = 1; c < w; c++) {
+      stD(2 * c, (ldS(2 * c) + ldD(2 * (c - 1))) & 0xffff);
+    }
+    for (let r = 1; r < w; r++) {
+      const base = r * rowBytes;
+      const prevRow = base - rowBytes;
+      stD(base, (ldS(base) + ldD(prevRow)) & 0xffff);
+      for (let c = 1; c < w; c++) {
+        const pred =
+          ldD(base + 2 * (c - 1)) +
+          ldD(prevRow + 2 * c) -
+          ldD(prevRow + 2 * (c - 1));
+        stD(base + 2 * c, (ldS(base + 2 * c) + pred) & 0xffff);
+      }
+    }
+  } else {
+    throw new Error(`lorenzo_zstd: unsupported stride ${stride}`);
+  }
+  return dst;
+}
+
 export function decodeCodec(
   blob: Uint8Array,
   dtype: number,
@@ -124,6 +172,19 @@ export function decodeCodec(
         throw new Error("delta_zstd requires square tile");
       }
       return deltaDecode(inner, w, stride);
+    }
+    case CODEC_LORENZO_ZSTD: {
+      const inner = zstdDecompress(payload);
+      if (inner.length !== total) {
+        throw new Error(
+          `lorenzo_zstd inner len ${inner.length}, want ${total}`,
+        );
+      }
+      const w = Math.round(Math.sqrt(nPixels));
+      if (w * w !== nPixels) {
+        throw new Error("lorenzo_zstd requires square tile");
+      }
+      return lorenzoDecode(inner, w, stride);
     }
     default:
       throw new Error(`unknown codec 0x${tag.toString(16)}`);
