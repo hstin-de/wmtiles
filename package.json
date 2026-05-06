@@ -10,7 +10,7 @@
   "scripts": {
     "build": "bun -F wmtiles build && bun -F wmtiles-viewer build",
     "test": "bun -F wmtiles test",
-    "typecheck": "bun -F wmtiles typecheck && bun -F wmtiles-viewer typecheck"
+    "typecheck": "bun -F wmtiles typecheck && bun -F wmtiles build:esm && bun -F wmtiles-viewer typecheck"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

@@ -8,47 +8,91 @@ Bun, Cloudflare Workers, anywhere with `fetch`.
 ## Install
 
 ```sh
-npm install wmtiles fzstd
+npm install wmtiles
 # or
-bun add wmtiles fzstd
+bun add wmtiles
 ```
 
 ## Usage
 
-### Browser / HTTP-served file
-
 ```ts
-import { WMT, httpRangeFetcher } from "wmtiles";
+import { open } from "wmtiles";
 
-const r = await new WMT(httpRangeFetcher("/data.wmt")).open();
-// r.catalog: variable list
-// r.timeCatalog: time-step axis
-// r.header: bbox, zoom range, generation, …
+const wmt = await open("/data.wmt");
 
-const pixels = await r.getTilePixels("temperature_2m", 12, 5, 16, 11);
-// Float32Array of r.nPixels values, NaN where the encoder marked NoData.
+// Inspect
+wmt.bbox;              // { west, south, east, north }
+wmt.zoomRange;         // { min, max }
+wmt.tileSize;          // 256 (pixels per tile side)
+wmt.referenceTime;     // Date
+wmt.variables;         // ReadonlyArray<Variable>
+wmt.timeStepCount;     // 81
+wmt.timeAxis;          // { kind: "regular", start, intervalMs, count } | { kind: "irregular", times }
+
+// Resolve a variable handle once, reuse for many requests.
+const t2m = wmt.variable("temperature_2m");
+
+t2m.unit;              // "K"
+t2m.range;             // { min, max }
+t2m.colormap;          // "magma"
+
+// Fetch one tile (Float32Array of tileSize² values; NaN where NoData).
+const pixels = await t2m.tile({ time: 12, z: 5, x: 16, y: 11 });
+
+// Or by absolute time — must match a step exactly.
+const pixels2 = await t2m.tile({
+  time: new Date("2026-05-06T12:00:00Z"),
+  z: 5, x: 16, y: 11,
+});
+
+// Sample a single point (nearest pixel). Defaults z to maxZoom.
+const valueK = await t2m.sample({ time: 12, lat: 52.52, lon: 13.405 });
 ```
 
-### Node / Bun / from a local file
+### Batched tile fetch
+
+For UIs that paint several tiles in one frame, `tiles()` issues 1–2 coalesced
+range requests instead of one per tile (when all tiles share the same
+variable + time block):
+
+```ts
+const frame = await t2m.tiles({
+  time: 12,
+  coords: [
+    { z: 5, x: 16, y: 11 },
+    { z: 5, x: 17, y: 11 },
+    { z: 5, x: 18, y: 11 },
+  ],
+});
+// frame[i] is always a Float32Array (NaN-filled if missing/out-of-range).
+```
+
+You can tune coalescing with the `coalesce` option:
+
+```ts
+await t2m.tiles({ time: 12, coords, coalesce: { maxGapBytes: 32_000 } });
+```
+
+### Loading from a buffer
 
 ```ts
 import { readFileSync } from "node:fs";
-import { WMT, bytesFetcher } from "wmtiles";
+import { open } from "wmtiles";
 
-const r = await new WMT(
-  bytesFetcher(new Uint8Array(readFileSync("./data.wmt")))
-).open();
+const wmt = await open(
+  new Uint8Array(readFileSync("./data.wmt")),
+);
 ```
 
 ### Custom byte source
 
-Implement the `RangeFetcher` interface:
+Implement the `ByteSource` interface — one method, async byte-range reads:
 
 ```ts
-import type { RangeFetcher } from "wmtiles";
+import { open, type ByteSource } from "wmtiles";
 
-const s3Fetcher: RangeFetcher = {
-  async fetchRange(offset, length) {
+const s3: ByteSource = {
+  async read(offset, length) {
     const resp = await s3Client.send(new GetObjectCommand({
       Bucket: "wx",
       Key: "data.wmt",
@@ -58,36 +102,40 @@ const s3Fetcher: RangeFetcher = {
   },
 };
 
-const r = await new WMT(s3Fetcher).open();
+const wmt = await open(s3);
 ```
 
-### Coalesced multi-tile fetch
+### Errors
 
-For UIs that paint several tiles in one frame, `getTilesInBlock` issues 1 to 2
-range requests (instead of one per tile) when all tiles share the same
-`(variable, time)` block:
+All thrown errors derive from `WMTError`:
+
+| Error | When |
+|---|---|
+| `SourceError` | Source/read failure, for example an HTTP server that ignores range requests. |
+| `FormatError` | Malformed file: bad magic, bad CRC, truncated buffers, unsupported version. |
+| `UnknownVariableError` | `wmt.variable("foo")` for an absent name. |
+| `TimeOutOfRangeError` | `tile()` / `sample()` with a `Date` that doesn't align to a step, or an out-of-range index. |
 
 ```ts
-const tiles = await r.getTilesInBlock("temperature_2m", 12, [
-  { z: 5, x: 16, y: 11 },
-  { z: 5, x: 17, y: 11 },
-  { z: 5, x: 18, y: 11 },
-]);
-// tiles[i] is a Float32Array, or NaN-filled if that coord is out of range
-// or missing from the file.
+import { UnknownVariableError } from "wmtiles";
+
+try {
+  wmt.variable("nope");
+} catch (e) {
+  if (e instanceof UnknownVariableError) console.warn(e.variableName);
+}
 ```
 
 ## API surface
 
-The library exports three layers: pick what fits:
-
-| Layer | What |
-|---|---|
-| `WMT`, `httpRangeFetcher`, `bytesFetcher` | High-level reader. Use this. |
-| `parseHeader`, `parseSnapshotHeader`, `parseBlockTable`, … | Raw parsers if you want to build your own caching/streaming. |
-| `decodeCodec`, `dequantize`, `encode3D` | Tile-level primitives if you fetch blobs yourself. |
-
-See `src/index.ts` for the full export list.
+| Layer | Exports | When to use |
+|---|---|---|
+| **Root** | `open`, `WMT`, `Variable`, `httpSource`, `bytesSource`, `ByteSource`, request types | What normal callers want. |
+| **Geo helper** | `latLonToTilePixel` | Point sampling and custom map UIs. |
+| **Errors** | `WMTError`, `SourceError`, `FormatError`, `UnknownVariableError`, `TimeOutOfRangeError` | `instanceof` checks. |
+| **`wmtiles/format`** | `parseHeader`, `parseBlockTable`, format constants and structs | Advanced: build your own caching layer. |
+| **`wmtiles/codec`** | `decodeCodec`, `dequantize`, codec constants | Advanced: decode raw tile blobs. |
+| **`wmtiles/tileid`** | `encode3D`, `hilbertXY2D`, `zoomOffset` | Advanced: precompute format tile IDs. |
 
 This library is a faithful port of the Go reader in `reader/reader.go`.
 

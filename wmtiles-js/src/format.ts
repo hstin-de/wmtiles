@@ -134,12 +134,12 @@ export function readVarint(buf: Uint8Array, pos: number): VarintBig {
   let shift = 0n;
   for (let i = 0; i < 10; i++) {
     const c = buf[pos + i];
-    if (c === undefined) throw new Error("varint: truncated");
+    if (c === undefined) throw new FormatError("varint: truncated");
     v |= BigInt(c & 0x7f) << shift;
     if ((c & 0x80) === 0) return { value: v, used: i + 1 };
     shift += 7n;
   }
-  throw new Error("varint: overflow");
+  throw new FormatError("varint: overflow");
 }
 
 export function readVarintNum(buf: Uint8Array, pos: number): VarintNum {
@@ -153,14 +153,19 @@ function unzigzag64(v: bigint): bigint {
 }
 
 import { decompress as zstdDecompress } from "fzstd";
+import { FormatError } from "./errors.js";
 
 // uses the Streams API DecompressionStream so we don't bundle pako;
 // works in modern browsers and Node ≥18 (no extra dependency)
 async function gunzip(buf: Uint8Array): Promise<Uint8Array> {
-  const stream = new Blob([buf as BlobPart])
-    .stream()
-    .pipeThrough(new DecompressionStream("gzip"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  try {
+    const stream = new Blob([buf as BlobPart])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch (err) {
+    throw new FormatError("gzip decompression failed", { cause: err });
+  }
 }
 
 export async function decompressInternal(
@@ -173,21 +178,25 @@ export async function decompressInternal(
     case COMP_GZIP:
       return await gunzip(buf);
     case COMP_ZSTD:
-      return zstdDecompress(buf);
+      try {
+        return zstdDecompress(buf);
+      } catch (err) {
+        throw new FormatError("zstd decompression failed", { cause: err });
+      }
     default:
-      throw new Error(`unknown internal compression ${comp}`);
+      throw new FormatError(`unknown internal compression ${comp}`);
   }
 }
 
 export function parseHeader(buf: Uint8Array): Header {
   for (let i = 0; i < 8; i++) {
-    if (buf[i] !== MAGIC[i]) throw new Error("bad magic: not a WMTiles file");
+    if (buf[i] !== MAGIC[i]) throw new FormatError("bad magic: not a WMTiles file");
   }
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const u64 = (off: number) => Number(dv.getBigUint64(off, true));
   const tail = dv.getUint32(252, true);
   if (tail !== HEADER_MAGIC_TAIL) {
-    throw new Error(`header magic tail mismatch (got 0x${tail.toString(16)})`);
+    throw new FormatError(`header magic tail mismatch (got 0x${tail.toString(16)})`);
   }
   return {
     formatVersion: dv.getUint16(8, true),
@@ -239,7 +248,7 @@ export function parseSnapshotTrailer(buf: Uint8Array): SnapshotTrailer {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const m = dv.getUint32(0, true);
   if (m !== SNAPSHOT_TRAILER_MAGIC) {
-    throw new Error(
+    throw new FormatError(
       `snapshot trailer magic mismatch (got 0x${m.toString(16)})`,
     );
   }
@@ -437,7 +446,7 @@ export function parseBlockHeader(buf: Uint8Array): BlockHeader {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const m = dv.getUint32(0, true);
   if (m !== BLOCK_MAGIC) {
-    throw new Error(`block magic mismatch (got 0x${m.toString(16)})`);
+    throw new FormatError(`block magic mismatch (got 0x${m.toString(16)})`);
   }
   const u64 = (off: number) => Number(dv.getBigUint64(off, true));
   return {
@@ -509,7 +518,7 @@ export function parseDirectory(buf: Uint8Array): Directory {
     const r = readVarintNum(buf, pos);
     pos += r.used;
     if (r.value === 0) {
-      if (i === 0) throw new Error("directory: first offset cannot be implicit");
+      if (i === 0) throw new FormatError("directory: first offset cannot be implicit");
       offsets[i] = offsets[i - 1] + length[i - 1];
     } else {
       offsets[i] = r.value - 1;

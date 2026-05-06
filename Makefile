@@ -6,7 +6,7 @@
 # Usage:
 #   make             produce everything needed to run the CLI ($(BIN))
 #   make test        run all tests (Go + Bun)
-#   make typecheck   tsc --noEmit across both TS packages
+#   make typecheck   typecheck both TS packages
 #   make clean       remove all generated artifacts
 
 BIN := wmtiles

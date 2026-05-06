@@ -1,10 +1,10 @@
-import type { WMT } from "wmtiles";
+import type { Variable, WMT } from "wmtiles";
 import { renderTile } from "./colormap";
 
 declare const L: typeof import("leaflet");
 
 export interface LayerState {
-  variable: string;
+  variable: Variable;
   t: number;
   vmin: number;
   vmax: number;
@@ -19,14 +19,14 @@ export interface WMTLayer extends L.GridLayer {
 export function makeWMTLayer(wmt: WMT): WMTLayer {
   const Layer = L.GridLayer.extend({
     options: {
-      tileSize: wmt.pixSize,
-      minZoom: wmt.header.minZoom,
-      maxZoom: wmt.header.maxZoom,
+      tileSize: wmt.tileSize,
+      minZoom: wmt.zoomRange.min,
+      maxZoom: wmt.zoomRange.max,
       noWrap: false,
       opacity: 0.85,
     },
     state: {
-      variable: wmt.catalog[0].name,
+      variable: wmt.variables[0],
       t: 0,
       vmin: 0,
       vmax: 1,
@@ -39,8 +39,8 @@ export function makeWMTLayer(wmt: WMT): WMTLayer {
     },
     createTile(this: WMTLayer, coords: L.Coords, done: L.DoneCallback) {
       const canvas = document.createElement("canvas");
-      canvas.width = wmt.pixSize;
-      canvas.height = wmt.pixSize;
+      canvas.width = wmt.tileSize;
+      canvas.height = wmt.tileSize;
       const ctx = canvas.getContext("2d");
       if (!ctx) {
         done(new Error("no 2d context"), canvas);
@@ -49,15 +49,15 @@ export function makeWMTLayer(wmt: WMT): WMTLayer {
       const myGen = this.state.gen;
       const { variable, t, vmin, vmax } = this.state;
 
-      wmt
-        .getTilePixels(variable, t, coords.z, coords.x, coords.y)
+      variable
+        .tile({ time: t, z: coords.z, x: coords.x, y: coords.y })
         .then((pixels) => {
           if (myGen !== this.state.gen) return;
           if (!pixels) {
             done(undefined, canvas);
             return;
           }
-          renderTile(pixels, wmt.pixSize, vmin, vmax, ctx);
+          renderTile(pixels, wmt.tileSize, vmin, vmax, ctx);
           done(undefined, canvas);
         })
         .catch((err: Error) => {

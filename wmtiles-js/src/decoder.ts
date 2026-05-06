@@ -7,6 +7,7 @@ import {
   SENTINEL_U8,
   type BlockTableEntry,
 } from "./format.js";
+import { FormatError } from "./errors.js";
 
 export const CODEC_CONSTANT = 0x01;
 export const CODEC_RAW_ZSTD = 0x02;
@@ -19,6 +20,16 @@ export function dtypeBytes(d: number): number {
   if (d === DTYPE_U16) return 2;
   if (d === DTYPE_F32) return 4;
   return 0;
+}
+
+function zstdPayload(payload: Uint8Array, codec: string): Uint8Array {
+  try {
+    return zstdDecompress(payload);
+  } catch (err) {
+    throw new FormatError(`${codec}: zstd decompression failed`, {
+      cause: err,
+    });
+  }
 }
 
 // straight one-bit-at-a-time port: no 8x8 fast path. Tile sizes are small (≤1MB)
@@ -72,7 +83,7 @@ function deltaDecode(src: Uint8Array, w: number, stride: number): Uint8Array {
       }
     }
   } else {
-    throw new Error(`delta_zstd: unsupported stride ${stride}`);
+    throw new FormatError(`delta_zstd: unsupported stride ${stride}`);
   }
   return dst;
 }
@@ -119,7 +130,7 @@ function lorenzoDecode(src: Uint8Array, w: number, stride: number): Uint8Array {
       }
     }
   } else {
-    throw new Error(`lorenzo_zstd: unsupported stride ${stride}`);
+    throw new FormatError(`lorenzo_zstd: unsupported stride ${stride}`);
   }
   return dst;
 }
@@ -129,7 +140,7 @@ export function decodeCodec(
   dtype: number,
   nPixels: number,
 ): Uint8Array {
-  if (blob.length < 1) throw new Error("codec: empty blob");
+  if (blob.length < 1) throw new FormatError("codec: empty blob");
   const tag = blob[0];
   const stride = dtypeBytes(dtype);
   const total = stride * nPixels;
@@ -144,50 +155,50 @@ export function decodeCodec(
       return out;
     }
     case CODEC_RAW_ZSTD: {
-      const out = zstdDecompress(payload);
+      const out = zstdPayload(payload, "raw_zstd");
       if (out.length !== total) {
-        throw new Error(`raw_zstd: got ${out.length}, want ${total}`);
+        throw new FormatError(`raw_zstd: got ${out.length}, want ${total}`);
       }
       return out;
     }
     case CODEC_BITSHUFFLE_ZSTD: {
-      const inner = zstdDecompress(payload);
+      const inner = zstdPayload(payload, "bitshuffle_zstd");
       const expectedInner = 8 * stride * ((nPixels + 7) >> 3);
       if (inner.length !== expectedInner) {
-        throw new Error(
+        throw new FormatError(
           `bitshuffle inner len ${inner.length}, want ${expectedInner}`,
         );
       }
       return bitshuffleDecode(inner, stride, nPixels);
     }
     case CODEC_DELTA_ZSTD: {
-      const inner = zstdDecompress(payload);
+      const inner = zstdPayload(payload, "delta_zstd");
       if (inner.length !== total) {
-        throw new Error(
+        throw new FormatError(
           `delta_zstd inner len ${inner.length}, want ${total}`,
         );
       }
       const w = Math.round(Math.sqrt(nPixels));
       if (w * w !== nPixels) {
-        throw new Error("delta_zstd requires square tile");
+        throw new FormatError("delta_zstd requires square tile");
       }
       return deltaDecode(inner, w, stride);
     }
     case CODEC_LORENZO_ZSTD: {
-      const inner = zstdDecompress(payload);
+      const inner = zstdPayload(payload, "lorenzo_zstd");
       if (inner.length !== total) {
-        throw new Error(
+        throw new FormatError(
           `lorenzo_zstd inner len ${inner.length}, want ${total}`,
         );
       }
       const w = Math.round(Math.sqrt(nPixels));
       if (w * w !== nPixels) {
-        throw new Error("lorenzo_zstd requires square tile");
+        throw new FormatError("lorenzo_zstd requires square tile");
       }
       return lorenzoDecode(inner, w, stride);
     }
     default:
-      throw new Error(`unknown codec 0x${tag.toString(16)}`);
+      throw new FormatError(`unknown codec 0x${tag.toString(16)}`);
   }
 }
 

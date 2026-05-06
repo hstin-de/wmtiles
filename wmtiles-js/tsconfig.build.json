@@ -5,6 +5,13 @@
     "declaration": true,
     "outDir": "./dist"
   },
-  "include": ["src/index.ts", "src/format.ts", "src/decoder.ts", "src/tileid.ts", "src/reader.ts"],
+  "include": [
+    "src/index.ts",
+    "src/format.ts",
+    "src/decoder.ts",
+    "src/tileid.ts",
+    "src/reader.ts",
+    "src/errors.ts"
+  ],
   "exclude": ["src/**/*.test.ts"]
 }

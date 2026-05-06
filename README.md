@@ -105,25 +105,29 @@ backend. The viewer is a Bun-bundled IIFE compiled into the Go binary via
 ### Read from JavaScript
 
 ```ts
-import { WMT, httpRangeFetcher } from "wmtiles";
+import { open } from "wmtiles";
 
-const r = await new WMT(httpRangeFetcher("/forecast.wmt")).open();
-console.log(r.catalog);          // available variables
-console.log(r.timeCatalog);      // forecast steps
+const wmt = await open("/forecast.wmt");
+console.log(wmt.variables);      // available variables
+console.log(wmt.timeAxis);       // forecast steps
 
-const px = await r.getTilePixels("2t", /*timeStep*/ 12, /*z*/ 5, 16, 11);
+const t2m = wmt.variable("2t");
+const px = await t2m.tile({ time: 12, z: 5, x: 16, y: 11 });
 // Float32Array(256*256), NaN where the encoder marked NoData
 ```
 
-For multi-tile fetches at the same `(variable, time)`, `getTilesInBlock`
+For multi-tile fetches at the same `(variable, time)`, `tiles()`
 coalesces 9 viewport tiles into 1 to 2 range requests:
 
 ```ts
-const tiles = await r.getTilesInBlock("2t", 12, [
-  { z: 5, x: 16, y: 11 },
-  { z: 5, x: 17, y: 11 },
-  { z: 5, x: 18, y: 11 },
-]);
+const tiles = await t2m.tiles({
+  time: 12,
+  coords: [
+    { z: 5, x: 16, y: 11 },
+    { z: 5, x: 17, y: 11 },
+    { z: 5, x: 18, y: 11 },
+  ],
+});
 ```
 
 ### Read from Go
@@ -339,7 +343,7 @@ Then:
 ```sh
 make             # build the CLI binary with the embedded viewer
 make test        # go test -race ./...  +  bun test
-make typecheck   # tsc --noEmit on both TS packages
+make typecheck   # typecheck both TS packages
 make clean       # remove generated artifacts
 ```
 

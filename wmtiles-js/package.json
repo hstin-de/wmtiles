@@ -1,6 +1,6 @@
 {
   "name": "wmtiles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pure-TypeScript reader for the WMTiles single-file format. Parses headers, snapshots, block tables; decodes per-tile codecs; dequantizes per-block. No DOM dependency: works in browsers, Node, Bun, Cloudflare Workers.",
   "license": "MIT",
   "type": "module",
@@ -12,6 +12,26 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./format": {
+      "types": "./dist/format.d.ts",
+      "import": "./dist/format.js",
+      "require": "./dist/format.cjs"
+    },
+    "./codec": {
+      "types": "./dist/decoder.d.ts",
+      "import": "./dist/decoder.js",
+      "require": "./dist/decoder.cjs"
+    },
+    "./tileid": {
+      "types": "./dist/tileid.d.ts",
+      "import": "./dist/tileid.js",
+      "require": "./dist/tileid.cjs"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "import": "./dist/errors.js",
+      "require": "./dist/errors.cjs"
     }
   },
   "sideEffects": false,
@@ -32,7 +52,7 @@
     "prepublishOnly": "bun run typecheck && bun run test && bun run build",
     "build": "bun run build:esm && bun run build:cjs",
     "build:esm": "tsc -p tsconfig.build.json",
-    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs",
+    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs && bun build src/format.ts --outfile dist/format.cjs --target node --format cjs && bun build src/decoder.ts --outfile dist/decoder.cjs --target node --format cjs && bun build src/tileid.ts --outfile dist/tileid.cjs --target node --format cjs && bun build src/errors.ts --outfile dist/errors.cjs --target node --format cjs",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
