@@ -12,6 +12,8 @@ package parser
 */
 import "C"
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -338,6 +340,63 @@ func ForEachMessageMetaFiltered(path string, want func(shortName string) bool, f
 	})
 }
 
+// ForEachMessageBytes visits every GRIB2 message contained in data.
+func ForEachMessageBytes(data []byte, fn func(GRIBFile) error) error {
+	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
+		g, err := processHandle(gid)
+		if err != nil {
+			return err
+		}
+		return fn(g)
+	})
+}
+
+// ForEachMessageBytesFiltered visits GRIB2 messages in data, decoding values
+// only for messages whose header matches want.
+func ForEachMessageBytesFiltered(data []byte, want func(*GribHeader) bool, fn func(GRIBFile) error) error {
+	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
+		h, err := extractHeaderScalars(gid)
+		if err != nil {
+			return err
+		}
+		if want != nil && !want(&h) {
+			return nil
+		}
+		g, err := finishProcessHandle(gid, h)
+		if err != nil {
+			return err
+		}
+		return fn(g)
+	})
+}
+
+// ForEachMessageMetaBytes visits metadata for every GRIB2 message in data.
+func ForEachMessageMetaBytes(data []byte, fn func(HeaderInfo) error) error {
+	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
+		m, err := processHandleMeta(gid)
+		if err != nil {
+			return err
+		}
+		return fn(m)
+	})
+}
+
+// ForEachMessageMetaBytesFiltered visits metadata for GRIB2 messages in data
+// whose shortName matches want.
+func ForEachMessageMetaBytesFiltered(data []byte, want func(shortName string) bool, fn func(HeaderInfo) error) error {
+	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
+		shortName := getString(gid, "shortName")
+		if want != nil && !want(shortName) {
+			return nil
+		}
+		m, err := processHandleMeta(gid)
+		if err != nil {
+			return err
+		}
+		return fn(m)
+	})
+}
+
 func forEachHandle(path string, fn func(*C.codes_handle) error) error {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
@@ -364,6 +423,56 @@ func forEachHandle(path string, fn func(*C.codes_handle) error) error {
 		if err != nil {
 			return err
 		}
+	}
+}
+
+func forEachHandleBytes(data []byte, fn func(*C.codes_handle) error) error {
+	if len(data) == 0 {
+		return errors.New("empty grib data")
+	}
+	pos := 0
+	seen := 0
+	for {
+		i := bytes.Index(data[pos:], []byte("GRIB"))
+		if i < 0 {
+			if seen == 0 {
+				return errors.New("no GRIB message found")
+			}
+			return nil
+		}
+		start := pos + i
+		if len(data)-start < 16 {
+			return fmt.Errorf("truncated GRIB message header at byte %d", start)
+		}
+		if edition := data[start+7]; edition != 2 {
+			return fmt.Errorf("unsupported GRIB edition %d at byte %d", edition, start)
+		}
+		msgLen := binary.BigEndian.Uint64(data[start+8 : start+16])
+		if msgLen < 16 {
+			return fmt.Errorf("invalid GRIB message length %d at byte %d", msgLen, start)
+		}
+		if msgLen > uint64(len(data)-start) {
+			return fmt.Errorf("truncated GRIB message at byte %d: length %d, remaining %d",
+				start, msgLen, len(data)-start)
+		}
+
+		end := start + int(msgLen)
+		msg := data[start:end]
+		gid := C.codes_handle_new_from_message(
+			C.codes_context_get_default(),
+			unsafe.Pointer(&msg[0]),
+			C.size_t(len(msg)),
+		)
+		if gid == nil {
+			return fmt.Errorf("codes_handle_new_from_message returned nil at byte %d", start)
+		}
+		err := fn(gid)
+		C.codes_handle_delete(gid)
+		if err != nil {
+			return err
+		}
+		seen++
+		pos = end
 	}
 }
 

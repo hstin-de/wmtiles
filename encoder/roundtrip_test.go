@@ -411,3 +411,45 @@ func TestAppendRoundtrip(t *testing.T) {
 		t.Errorf("read appended tile: %v", err)
 	}
 }
+
+func TestAppendRejectsTimeOutsideCatalog(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "append-time-range.wmt")
+
+	const pixSize = 128
+	refTime := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	opts := encoder.Options{
+		TilePixelSizeLog2:     7,
+		MinZoom:               0,
+		MaxZoom:               0,
+		ReferenceForecastTime: refTime,
+		TimeCatalog:           regularTimeCatalog(refTime, 3600_000, 1),
+		BBox:                  [4]float64{-180, -85, 180, 85},
+		Variables:             []encoder.VariableSpec{{Name: "temp", Unit: "K"}},
+	}
+	if err := encoder.Encode(makeTiles("temp", pixSize, 0, 1), opts, out); err != nil {
+		t.Fatalf("initial encode: %v", err)
+	}
+
+	ctx, err := encoder.OpenForAppend(out, encoder.AppendOptions{})
+	if err != nil {
+		t.Fatalf("OpenForAppend: %v", err)
+	}
+	defer ctx.Close()
+
+	if err := ctx.DeclareBlock(encoder.BlockSpec{
+		Variable: "temp", TimeStep: 1, ValueMin: 250, ValueMax: 300,
+	}); err == nil {
+		t.Fatal("DeclareBlock outside time catalog succeeded")
+	}
+	if err := ctx.Submit(encoder.Tile{
+		Variable: "temp",
+		TimeStep: 1,
+		Z:        0,
+		X:        0,
+		Y:        0,
+		Pixels:   make([]float32, pixSize*pixSize),
+	}); err == nil {
+		t.Fatal("Submit outside time catalog succeeded")
+	}
+}

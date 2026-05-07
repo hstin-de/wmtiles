@@ -130,17 +130,89 @@ const tiles = await t2m.tiles({
 });
 ```
 
-### Read from Go
+### Use from Go
+
+The Go API has two packages: `decode` reads `.wmt` files and `encode` converts
+source data (currently GRIB2) into `.wmt`. Lower-level subpackages (`reader`,
+`encoder`, `format`, `codec`, ...) are available for tooling that needs direct
+wire-format access.
+
+Open a file and inspect the catalog:
 
 ```go
-import "github.com/hstin-de/wmtiles/reader"
+import "github.com/hstin-de/wmtiles/decode"
 
-r, err := reader.Open("forecast.wmt")
-defer r.Close()
+wmt, err := decode.Open("forecast.wmt")
+if err != nil {
+	panic(err)
+}
+defer wmt.Close()
 
-pixels := make([]float32, r.PixelCount())
-err = r.ReadTile("2t", /*timeStep*/ 12, /*z*/ 5, 16, 11, pixels)
+vars := wmt.Variables()
+times := wmt.Times()
+bounds := wmt.Bounds()
 ```
+
+Read one tile:
+
+```go
+pixels, err := wmt.ReadTile("2t", 12, decode.Coord(5, 16, 11))
+```
+
+Read a viewport worth of tiles with range coalescing:
+
+```go
+coords := []decode.TileCoord{
+	decode.Coord(5, 16, 11),
+	decode.Coord(5, 17, 11),
+	decode.Coord(5, 18, 11),
+}
+
+tiles, err := wmt.ReadTiles("2t", 12, coords)
+```
+
+Reuse buffers in hot loops:
+
+```go
+pixels := wmt.NewTileBuffer()
+err = wmt.ReadTileInto("2t", 12, decode.Coord(5, 16, 11), pixels)
+```
+
+Convert one or more source files to a fresh `.wmt`. GRIB2 is the first
+supported input format; the API is format-neutral so later formats can use the
+same workflow.
+
+```go
+import "github.com/hstin-de/wmtiles/encode"
+
+enc, err := encode.NewEncoder("forecast.wmt", encode.Options{
+	TileSize:        256,
+	MinZoom:         0,
+	MaxZoom:         5,
+	FilterVariables: []string{"2t", "10u", "10v"},
+	Precision: map[string]float64{
+		"2t":  0.05,
+		"10u": 0.1,
+		"10v": 0.1,
+	},
+})
+
+err = enc.AddFile("gfs-f000.grib2", encode.FormatGRIB2)
+err = enc.AddFile("gfs-f001.grib2", encode.FormatGRIB2)
+err = enc.AddBytes("extra.grib2", encode.FormatGRIB2, extraGRIB2)
+
+err = enc.Finish()
+```
+
+`encode.Encoder.Finish` scans all inputs together, builds one merged
+variable/time catalog, and writes one fresh `.wmt`. It does not append/extend
+once per input file.
+
+For appending new variable/time blocks to an existing file, the CLI's
+`wmtiles extend` covers the GRIB2 case. Programs that need to drive the
+streaming encoder or appender directly (e.g. for non-GRIB2 inputs) can use the
+lower-level `encoder` subpackage; that path is intentionally outside the
+stable public API.
 
 ---
 
@@ -317,8 +389,10 @@ codec/         per-tile codec registry (constant, raw_zstd, bitshuffle, delta)
 bitshuffle/    bit transpose
 varint/        PMTiles-style varints
 encoder/       streaming encoder + atomic header swap + append API
+encode/        source-data conversion API (GRIB2 now, other formats later)
+decode/        WMTiles reading API namespace
 reader/        cold-start, LRU, per-block decode
-parser/        GRIB2 ingest (cgo + eccodes)
+parser/        GRIB2 parser bindings (cgo + eccodes)
 tiler/         GRIB grid → Web-Mercator tile sampler
 cmd/wmtiles/   CLI: encode, extend, compact, inspect, verify, compare, serve
 cmd/wmtiles/web/   Bun-bundled HTML viewer, embedded into the binary

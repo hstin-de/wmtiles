@@ -318,23 +318,34 @@ func (a *AppendCtx) RegisterTimeStep(unixMs int64) (uint32, error) {
 	return uint32(len(a.timeCatalog.TimestampsMs) - 1), nil
 }
 
+// TimeCount returns the number of time steps in the current append catalog.
+func (a *AppendCtx) TimeCount() int {
+	a.blockMu.RLock()
+	defer a.blockMu.RUnlock()
+	return int(a.timeCatalog.Count)
+}
+
 func (a *AppendCtx) DeclareBlock(spec BlockSpec) error {
+	if !(spec.ValueMin <= spec.ValueMax) {
+		return fmt.Errorf("DeclareBlock %q t=%d: invalid range [%g, %g]",
+			spec.Variable, spec.TimeStep, spec.ValueMin, spec.ValueMax)
+	}
+
+	a.blockMu.Lock()
+	defer a.blockMu.Unlock()
 	id, ok := a.idByName[spec.Variable]
 	if !ok {
 		return fmt.Errorf("DeclareBlock: variable %q not registered (call RegisterVariable first)", spec.Variable)
 	}
-	if !(spec.ValueMin <= spec.ValueMax) {
-		return fmt.Errorf("DeclareBlock %q t=%d: invalid range [%g, %g]",
-			spec.Variable, spec.TimeStep, spec.ValueMin, spec.ValueMax)
+	if int64(spec.TimeStep) >= a.timeCatalog.Count {
+		return fmt.Errorf("DeclareBlock %q t=%d: time step out of range [0, %d)",
+			spec.Variable, spec.TimeStep, a.timeCatalog.Count)
 	}
 	precision := spec.Precision
 	if precision == 0 {
 		precision = a.specByName[spec.Variable].Precision
 	}
 	params := fitParamsFor(spec.ValueMin, spec.ValueMax, precision)
-
-	a.blockMu.Lock()
-	defer a.blockMu.Unlock()
 	k := blockKey{variableID: id, timeID: spec.TimeStep}
 	if _, dup := a.blocks[k]; dup {
 		return fmt.Errorf("DeclareBlock %q t=%d: already declared in this session", spec.Variable, spec.TimeStep)
@@ -366,10 +377,6 @@ func (a *AppendCtx) Submit(t Tile) error {
 		return fmt.Errorf("Submit %s/%d/(%d,%d,%d): pixel count %d, want %d",
 			t.Variable, t.TimeStep, t.Z, t.X, t.Y, len(t.Pixels), a.pixPerTile)
 	}
-	id, ok := a.idByName[t.Variable]
-	if !ok {
-		return fmt.Errorf("Submit: unknown variable %q", t.Variable)
-	}
 	if t.Z < a.header.MinZoom || t.Z > a.header.MaxZoom {
 		return fmt.Errorf("Submit %s/%d/(%d,%d,%d): zoom out of range [%d, %d]",
 			t.Variable, t.TimeStep, t.Z, t.X, t.Y, a.header.MinZoom, a.header.MaxZoom)
@@ -379,6 +386,16 @@ func (a *AppendCtx) Submit(t Tile) error {
 			t.Variable, t.TimeStep, t.Z, t.X, t.Y, n, t.Z)
 	}
 	a.blockMu.RLock()
+	id, ok := a.idByName[t.Variable]
+	if !ok {
+		a.blockMu.RUnlock()
+		return fmt.Errorf("Submit: unknown variable %q", t.Variable)
+	}
+	if int64(t.TimeStep) >= a.timeCatalog.Count {
+		a.blockMu.RUnlock()
+		return fmt.Errorf("Submit %s/%d: time step out of range [0, %d)",
+			t.Variable, t.TimeStep, a.timeCatalog.Count)
+	}
 	bb, ok := a.blocks[blockKey{variableID: id, timeID: t.TimeStep}]
 	a.blockMu.RUnlock()
 	if !ok {
