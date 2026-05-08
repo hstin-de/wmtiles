@@ -340,6 +340,23 @@ func ForEachMessageMetaFiltered(path string, want func(shortName string) bool, f
 	})
 }
 
+// ForEachMessageHeaderFiltered visits header scalars only. Eccodes computes
+// minimum/maximum by scanning the data section, so collecting them in a
+// pre-pass duplicates exactly what the value pass already does.
+func ForEachMessageHeaderFiltered(path string, want func(shortName string) bool, fn func(GribHeader) error) error {
+	return forEachHandle(path, func(gid *C.codes_handle) error {
+		shortName := getString(gid, "shortName")
+		if want != nil && !want(shortName) {
+			return nil
+		}
+		h, err := extractHeaderScalars(gid)
+		if err != nil {
+			return err
+		}
+		return fn(h)
+	})
+}
+
 // ForEachMessageBytes visits every GRIB2 message contained in data.
 func ForEachMessageBytes(data []byte, fn func(GRIBFile) error) error {
 	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
@@ -394,6 +411,20 @@ func ForEachMessageMetaBytesFiltered(data []byte, want func(shortName string) bo
 			return err
 		}
 		return fn(m)
+	})
+}
+
+func ForEachMessageHeaderBytesFiltered(data []byte, want func(shortName string) bool, fn func(GribHeader) error) error {
+	return forEachHandleBytes(data, func(gid *C.codes_handle) error {
+		shortName := getString(gid, "shortName")
+		if want != nil && !want(shortName) {
+			return nil
+		}
+		h, err := extractHeaderScalars(gid)
+		if err != nil {
+			return err
+		}
+		return fn(h)
 	})
 }
 

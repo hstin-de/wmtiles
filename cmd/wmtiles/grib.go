@@ -137,6 +137,7 @@ type varInfo struct {
 	hasFinite    bool
 	messageCount int
 	times        map[time.Time]struct{}
+	precSources  map[string]struct{}
 }
 
 type variablePlan struct {
@@ -151,7 +152,7 @@ type variablePlan struct {
 	step      float64
 }
 
-func scanGribMetadata(path, filterShortNames string) (
+func scanGribHeaders(path, filterShortNames string) (
 	bySig map[varKey]*varInfo,
 	allTimes []time.Time,
 	bbox [4]float64,
@@ -173,45 +174,36 @@ func scanGribMetadata(path, filterShortNames string) (
 	bbox = [4]float64{180, 90, -180, -90}
 	bboxInit := false
 
-	err = parser.ForEachMessageMetaFiltered(path,
+	err = parser.ForEachMessageHeaderFiltered(path,
 		func(sn string) bool {
 			totalSeen++
 			return keep == nil || keep[sn]
 		},
-		func(m parser.HeaderInfo) error {
+		func(h parser.GribHeader) error {
 			keptSeen++
 
-			k := varKeyOf(&m.Header)
+			k := varKeyOf(&h)
 			v, ok := bySig[k]
 			if !ok {
-				base := m.Header.ShortName
+				base := h.ShortName
 				if base == "" || base == "unknown" {
 					base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
 				}
 				v = &varInfo{
-					name:      base + levelSuffix(k.levelType, k.level, k.bottomLevel),
-					shortName: m.Header.ShortName,
-					unit:      m.Header.Units,
-					vmin:      math.Inf(+1),
-					vmax:      math.Inf(-1),
-					times:     map[time.Time]struct{}{},
+					name:        base + levelSuffix(k.levelType, k.level, k.bottomLevel),
+					shortName:   h.ShortName,
+					unit:        h.Units,
+					vmin:        math.Inf(+1),
+					vmax:        math.Inf(-1),
+					times:       map[time.Time]struct{}{},
+					precSources: map[string]struct{}{},
 				}
 				bySig[k] = v
 			}
 			v.messageCount++
-			v.times[m.Header.ReferenceTime] = struct{}{}
+			v.times[h.ReferenceTime] = struct{}{}
 
-			if m.HasFinite {
-				if m.Min < v.vmin {
-					v.vmin = m.Min
-				}
-				if m.Max > v.vmax {
-					v.vmax = m.Max
-				}
-				v.hasFinite = true
-			}
-
-			shell := parser.GRIBFile{Header: m.Header}
+			shell := parser.GRIBFile{Header: h}
 			gw, gs, ge, gn := tiler.GridBBox(&shell)
 			if !bboxInit {
 				bbox = [4]float64{gw, gs, ge, gn}
@@ -231,7 +223,7 @@ func scanGribMetadata(path, filterShortNames string) (
 				}
 			}
 
-			timesSeen[m.Header.ReferenceTime] = struct{}{}
+			timesSeen[h.ReferenceTime] = struct{}{}
 			return nil
 		})
 	if err != nil {
@@ -268,68 +260,66 @@ func scanGribMetadata(path, filterShortNames string) (
 	return
 }
 
-func buildVariableSpecs(bySig map[varKey]*varInfo, overrides map[string]float64) ([]encoder.VariableSpec, []variablePlan, error) {
+// buildPreliminaryVariableSpecs leaves Precision=0 for variables without a
+// known hint; the per-block auto-cap fills it in during streamTilesSinglePass.
+func buildPreliminaryVariableSpecs(bySig map[varKey]*varInfo, overrides map[string]float64) []encoder.VariableSpec {
 	specs := make([]encoder.VariableSpec, 0, len(bySig))
-	plans := make([]variablePlan, 0, len(bySig))
 	for _, v := range bySig {
-		plan, err := variablePlanFor(v, overrides)
-		if err != nil {
-			return nil, nil, err
+		var precision float64
+		if p, ok := overrides[v.name]; ok {
+			precision = p
+		} else if p, ok := overrides[v.shortName]; ok {
+			precision = p
+		} else if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+			precision = p
 		}
 		specs = append(specs, encoder.VariableSpec{
 			Name:      v.name,
 			Unit:      v.unit,
-			Precision: plan.precision,
+			Precision: precision,
 		})
-		plans = append(plans, plan)
 	}
-	return specs, plans, nil
+	return specs
+}
+
+func finalVariablePlans(bySig map[varKey]*varInfo, overrides map[string]float64) []variablePlan {
+	plans := make([]variablePlan, 0, len(bySig))
+	for _, v := range bySig {
+		if !v.hasFinite {
+			continue
+		}
+		precision, src := resolveBlockPrecision(v, v.vmin, v.vmax, overrides)
+		if v.precSources != nil {
+			src = dominantPrecSource(v.precSources)
+		}
+		params := quantize.FitParams(v.vmin, v.vmax, precision)
+		plans = append(plans, variablePlan{
+			name:      v.name,
+			unit:      v.unit,
+			messages:  v.messageCount,
+			vmin:      v.vmin,
+			vmax:      v.vmax,
+			precision: precision,
+			precSrc:   src,
+			dtype:     dtypeName(params.DType),
+			step:      params.Scale,
+		})
+	}
+	return plans
+}
+
+func dominantPrecSource(sources map[string]struct{}) string {
+	for _, candidate := range []string{"override", "auto", "cap", "default"} {
+		if _, ok := sources[candidate]; ok {
+			return candidate
+		}
+	}
+	return "default"
 }
 
 // 10-bit cap on the observed range for variables not in the lookup table; well
 // above NWP-grade SNR. precision=0 explicitly set by the user still keeps u16
 const autoPrecisionSteps = 1024
-
-// resolvePrecision picks the quantisation precision for a variable in one of
-// three ways, in priority order: user override, hardcoded shortName/unit
-// lookup, or an auto-cap derived from the observed range. The auto-cap fires
-// only when nothing else applies; an explicit override of 0 still means "use
-// full u16 for whatever range you observe".
-func resolvePrecision(v *varInfo, overrides map[string]float64) (float64, string) {
-	if p, ok := overrides[v.name]; ok {
-		return p, "override"
-	}
-	if p, ok := overrides[v.shortName]; ok {
-		return p, "override"
-	}
-	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
-		return p, "auto"
-	}
-	if v.vmax > v.vmin {
-		return (v.vmax - v.vmin) / autoPrecisionSteps, "cap"
-	}
-	return 0, "default"
-}
-
-func variablePlanFor(v *varInfo, overrides map[string]float64) (variablePlan, error) {
-	if !v.hasFinite {
-		return variablePlan{}, fmt.Errorf("variable %q has no finite values; refuse to encode", v.name)
-	}
-
-	precision, precSrc := resolvePrecision(v, overrides)
-	params := quantize.FitParams(v.vmin, v.vmax, precision)
-	return variablePlan{
-		name:      v.name,
-		unit:      v.unit,
-		messages:  v.messageCount,
-		vmin:      v.vmin,
-		vmax:      v.vmax,
-		precision: precision,
-		precSrc:   precSrc,
-		dtype:     dtypeName(params.DType),
-		step:      params.Scale,
-	}, nil
-}
 
 type tileWork struct {
 	name string
@@ -344,13 +334,21 @@ type vtKey struct {
 	tIdx uint32
 }
 
-func streamTilesIntoEncoder(
+// blockSink lets streamTilesSinglePass drive both StreamingEncoder and AppendCtx.
+type blockSink interface {
+	DeclareBlock(encoder.BlockSpec) error
+	Submit(encoder.Tile) error
+}
+
+func streamTilesSinglePass(
 	path string,
 	bySig map[varKey]*varInfo,
 	timeIdxByTime map[time.Time]uint32,
-	enc *encoder.StreamingEncoder,
+	overrides map[string]float64,
+	sink blockSink,
 	minZoom, maxZoom uint8,
 	pixSize int,
+	onDuplicate func(string, time.Time) error,
 ) (int64, int64, error) {
 	numWorkers := max(runtime.GOMAXPROCS(0), 1)
 	workCh := make(chan tileWork, numWorkers*4)
@@ -367,7 +365,7 @@ func streamTilesIntoEncoder(
 					skipped.Add(1)
 					continue
 				}
-				if err := enc.Submit(encoder.Tile{
+				if err := sink.Submit(encoder.Tile{
 					Variable: w.name, TimeStep: w.tIdx,
 					Z: w.z, X: w.x, Y: w.y, Pixels: px,
 				}); err != nil {
@@ -379,7 +377,7 @@ func streamTilesIntoEncoder(
 		}()
 	}
 
-	seen := map[vtKey]struct{}{}
+	declared := map[vtKey]struct{}{}
 	err := parser.ForEachMessageFiltered(path,
 		func(h *parser.GribHeader) bool {
 			_, ok := bySig[varKeyOf(h)]
@@ -396,10 +394,43 @@ func streamTilesIntoEncoder(
 				return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
 			}
 			vt := vtKey{k, tIdx}
-			if _, dup := seen[vt]; dup {
+			if _, dup := declared[vt]; dup {
+				if onDuplicate != nil {
+					return onDuplicate(v.name, g.Header.ReferenceTime)
+				}
 				return nil
 			}
-			seen[vt] = struct{}{}
+
+			vmin, vmax, hasFinite := finiteRange(g.DataValues, g.Header.MissingValue)
+			if !hasFinite {
+				declared[vt] = struct{}{}
+				return nil
+			}
+			if vmin < v.vmin {
+				v.vmin = vmin
+			}
+			if vmax > v.vmax {
+				v.vmax = vmax
+			}
+			v.hasFinite = true
+
+			precision, src := resolveBlockPrecision(v, vmin, vmax, overrides)
+			if v.precSources == nil {
+				v.precSources = map[string]struct{}{}
+			}
+			v.precSources[src] = struct{}{}
+
+			if err := sink.DeclareBlock(encoder.BlockSpec{
+				Variable:  v.name,
+				TimeStep:  tIdx,
+				ValueMin:  vmin,
+				ValueMax:  vmax,
+				Precision: precision,
+			}); err != nil {
+				return fmt.Errorf("declare block %q t=%d: %w", v.name, tIdx, err)
+			}
+			declared[vt] = struct{}{}
+
 			gc := g
 			s := tiler.NewSampler(&gc)
 			if s == nil {
@@ -419,6 +450,42 @@ func streamTilesIntoEncoder(
 	close(workCh)
 	wg.Wait()
 	return submitted.Load(), skipped.Load(), err
+}
+
+func finiteRange(values []float64, missing float64) (vmin, vmax float64, ok bool) {
+	vmin = math.Inf(+1)
+	vmax = math.Inf(-1)
+	for _, v := range values {
+		if v != v || v == missing {
+			continue
+		}
+		if v < vmin {
+			vmin = v
+		}
+		if v > vmax {
+			vmax = v
+		}
+		ok = true
+	}
+	return
+}
+
+// resolveBlockPrecision uses the per-block observed range for the auto-cap
+// fallback, which can drop cooler blocks from u16 to u8.
+func resolveBlockPrecision(v *varInfo, vmin, vmax float64, overrides map[string]float64) (float64, string) {
+	if p, ok := overrides[v.name]; ok {
+		return p, "override"
+	}
+	if p, ok := overrides[v.shortName]; ok {
+		return p, "override"
+	}
+	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+		return p, "auto"
+	}
+	if vmax > vmin {
+		return (vmax - vmin) / autoPrecisionSteps, "cap"
+	}
+	return 0, "default"
 }
 
 func runEncodeGRIB(command string, args []string) error {
@@ -479,7 +546,7 @@ func runEncodeGRIB(command string, args []string) error {
 	}
 
 	cliSection("Scan GRIB")
-	bySig, allTimes, bbox, totalSeen, keptSeen, err := scanGribMetadata(in, flags.filterShortNames)
+	bySig, allTimes, bbox, totalSeen, keptSeen, err := scanGribHeaders(in, flags.filterShortNames)
 	if err != nil {
 		return fmt.Errorf("read grib: %w", err)
 	}
@@ -500,15 +567,11 @@ func runEncodeGRIB(command string, args []string) error {
 		timeIdxByTime[t] = uint32(i)
 	}
 
-	specs, plans, err := buildVariableSpecs(bySig, flags.precisionOverrides)
-	if err != nil {
-		return err
-	}
+	specs := buildPreliminaryVariableSpecs(bySig, flags.precisionOverrides)
 	cliKVf("messages", "%s kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen)))
 	cliKVf("variables", "%d", len(specs))
 	cliKV("time axis", describeTimeCatalog(timeCatalog))
 	cliKV("grid bbox", formatBBox(bbox))
-	printVariablePlans(plans)
 
 	opts := encoder.Options{
 		TilePixelSizeLog2:     uint8(flags.tileSizeLog2),
@@ -531,31 +594,11 @@ func runEncodeGRIB(command string, args []string) error {
 		return fmt.Errorf("encoder init: %w", err)
 	}
 
-	for _, v := range bySig {
-		if !v.hasFinite {
-			continue
-		}
-		precision, _ := resolvePrecision(v, flags.precisionOverrides)
-		for t := range v.times {
-			idx, ok := timeIdxByTime[t]
-			if !ok {
-				continue
-			}
-			if err := enc.DeclareBlock(encoder.BlockSpec{
-				Variable: v.name, TimeStep: idx,
-				ValueMin: v.vmin, ValueMax: v.vmax,
-				Precision: precision,
-			}); err != nil {
-				enc.Close()
-				return fmt.Errorf("declare block %q t=%d: %w", v.name, idx, err)
-			}
-		}
-	}
-
 	pixSize := 1 << flags.tileSizeLog2
 	t0 := time.Now()
-	submitted, skipped, err := streamTilesIntoEncoder(in, bySig, timeIdxByTime, enc,
-		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize)
+	submitted, skipped, err := streamTilesSinglePass(in, bySig, timeIdxByTime,
+		flags.precisionOverrides, enc,
+		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize, nil)
 	if err != nil {
 		enc.Close()
 		return fmt.Errorf("tile stream: %w", err)
@@ -567,6 +610,9 @@ func runEncodeGRIB(command string, args []string) error {
 	cliKV("duration", formatDuration(encodeDuration))
 	cliKV("throughput", formatThroughput(submitted, encodeDuration, "tiles"))
 	cliKVf("workers", "%d", runtime.GOMAXPROCS(0))
+
+	plans := finalVariablePlans(bySig, flags.precisionOverrides)
+	printVariablePlans(plans)
 
 	if err := enc.Finish(); err != nil {
 		return fmt.Errorf("encode: %w", err)

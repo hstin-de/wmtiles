@@ -7,17 +7,14 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hstin-de/wmtiles/directory"
 	"github.com/hstin-de/wmtiles/encoder"
 	"github.com/hstin-de/wmtiles/format"
-	"github.com/hstin-de/wmtiles/parser"
 	"github.com/hstin-de/wmtiles/reader"
 	"github.com/hstin-de/wmtiles/tileid"
-	"github.com/hstin-de/wmtiles/tiler"
 )
 
 func runExtend(args []string) error {
@@ -68,7 +65,7 @@ func runExtend(args []string) error {
 	r.Close()
 
 	cliSection("Scan GRIB")
-	bySig, allTimes, _, totalSeen, keptSeen, err := scanGribMetadata(gribPath, *filterShortNames)
+	bySig, allTimes, _, totalSeen, keptSeen, err := scanGribHeaders(gribPath, *filterShortNames)
 	if err != nil {
 		return fmt.Errorf("scan GRIB: %w", err)
 	}
@@ -91,13 +88,11 @@ func runExtend(args []string) error {
 		return fmt.Errorf("open for append: %w", err)
 	}
 
-	for _, v := range bySig {
-		precision := pickPrecision(v, overrides)
-		if _, err := ctx.RegisterVariable(encoder.VariableSpec{
-			Name: v.name, Unit: v.unit, Precision: precision,
-		}); err != nil {
+	specs := buildPreliminaryVariableSpecs(bySig, overrides)
+	for _, s := range specs {
+		if _, err := ctx.RegisterVariable(s); err != nil {
 			ctx.Close()
-			return fmt.Errorf("register variable %q: %w", v.name, err)
+			return fmt.Errorf("register variable %q: %w", s.Name, err)
 		}
 	}
 
@@ -111,51 +106,27 @@ func runExtend(args []string) error {
 		timeIdxByTime[t] = idx
 	}
 
-	plans := make([]variablePlan, 0, len(bySig))
-	declared := 0
-	skipped := 0
-	for _, v := range bySig {
-		if !v.hasFinite {
-			continue
-		}
-		if plan, err := variablePlanFor(v, overrides); err == nil {
-			plans = append(plans, plan)
-		}
-		precision := pickPrecision(v, overrides)
-		for t := range v.times {
-			idx, ok := timeIdxByTime[t]
-			if !ok {
-				continue
-			}
-			err := ctx.DeclareBlock(encoder.BlockSpec{
-				Variable: v.name, TimeStep: idx,
-				ValueMin: v.vmin, ValueMax: v.vmax,
-				Precision: precision,
-			})
-			if err != nil {
-				// fragile: DeclareBlock doesn't expose a typed sentinel for this case yet
-				if strings.Contains(err.Error(), "already exists") {
-					skipped++
-					continue
-				}
-				ctx.Close()
-				return fmt.Errorf("declare block %q t=%d: %w", v.name, idx, err)
-			}
-			declared++
-		}
+	var alreadyPresent atomic.Int64
+	onDup := func(name string, t time.Time) error {
+		alreadyPresent.Add(1)
+		return nil
 	}
-	printVariablePlans(plans)
-	cliSection("Append plan")
-	cliKVf("new blocks", "%d", declared)
-	cliKVf("already present", "%d", skipped)
 
 	t0 := time.Now()
-	submitted, dropped, err := streamGribTilesIntoAppend(gribPath, bySig, timeIdxByTime, ctx, minZoom, maxZoom, pixelSize)
+	submitted, dropped, err := streamTilesSinglePass(gribPath, bySig, timeIdxByTime,
+		overrides, &appendSink{ctx: ctx, alreadyPresent: &alreadyPresent},
+		minZoom, maxZoom, pixelSize, onDup)
 	if err != nil {
 		ctx.Close()
 		return fmt.Errorf("stream: %w", err)
 	}
 	encodeDuration := time.Since(t0)
+
+	plans := finalVariablePlans(bySig, overrides)
+	printVariablePlans(plans)
+	cliSection("Append plan")
+	cliKVf("already present", "%d", alreadyPresent.Load())
+
 	cliSection("Tile encoding")
 	cliKV("tiles written", commaInt(submitted))
 	cliKV("tiles skipped", commaInt(dropped))
@@ -175,85 +146,24 @@ func runExtend(args []string) error {
 	return nil
 }
 
-func pickPrecision(v *varInfo, overrides map[string]float64) float64 {
-	p, _ := resolvePrecision(v, overrides)
-	return p
+// appendSink adapts AppendCtx to blockSink. "already exists" collisions are
+// counted, not propagated — extend reports them in the summary.
+type appendSink struct {
+	ctx            *encoder.AppendCtx
+	alreadyPresent *atomic.Int64
 }
 
-func streamGribTilesIntoAppend(
-	path string,
-	bySig map[varKey]*varInfo,
-	timeIdxByTime map[time.Time]uint32,
-	ctx *encoder.AppendCtx,
-	minZoom, maxZoom uint8,
-	pixSize int,
-) (int64, int64, error) {
-	numWorkers := max(runtime.GOMAXPROCS(0), 1)
-	workCh := make(chan tileWork, numWorkers*4)
-	var submitted, skipped atomic.Int64
-
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer wg.Done()
-			for w := range workCh {
-				px := tiler.Tile(w.s, w.z, w.x, w.y, pixSize)
-				if px == nil {
-					skipped.Add(1)
-					continue
-				}
-				if err := ctx.Submit(encoder.Tile{
-					Variable: w.name, TimeStep: w.tIdx,
-					Z: w.z, X: w.x, Y: w.y, Pixels: px,
-				}); err != nil {
-					skipped.Add(1)
-					continue
-				}
-				submitted.Add(1)
-			}
-		}()
+func (a *appendSink) DeclareBlock(spec encoder.BlockSpec) error {
+	err := a.ctx.DeclareBlock(spec)
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		a.alreadyPresent.Add(1)
+		return nil
 	}
+	return err
+}
 
-	seen := map[vtKey]struct{}{}
-	err := parser.ForEachMessageFiltered(path,
-		func(h *parser.GribHeader) bool {
-			_, ok := bySig[varKeyOf(h)]
-			return ok
-		},
-		func(g parser.GRIBFile) error {
-			k := varKeyOf(&g.Header)
-			v, ok := bySig[k]
-			if !ok {
-				return nil
-			}
-			tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
-			if !ok {
-				return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
-			}
-			vt := vtKey{k, tIdx}
-			if _, dup := seen[vt]; dup {
-				return nil
-			}
-			seen[vt] = struct{}{}
-			gc := g
-			s := tiler.NewSampler(&gc)
-			if s == nil {
-				return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
-			}
-			for z := minZoom; z <= maxZoom; z++ {
-				for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
-					workCh <- tileWork{
-						name: v.name, tIdx: tIdx,
-						z: z, x: c.X, y: c.Y, s: s,
-					}
-				}
-			}
-			return nil
-		})
-	close(workCh)
-	wg.Wait()
-	return submitted.Load(), skipped.Load(), err
+func (a *appendSink) Submit(t encoder.Tile) error {
+	return a.ctx.Submit(t)
 }
 
 func runCompact(args []string) error {

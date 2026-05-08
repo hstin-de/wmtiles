@@ -153,10 +153,7 @@ func (e *Encoder) Finish() error {
 		return errors.New("wmtiles/encode: no valid times found")
 	}
 
-	specs, err := e.variableSpecs(bySig)
-	if err != nil {
-		return err
-	}
+	specs := e.preliminaryVariableSpecs(bySig)
 	timeIdxByTime := make(map[time.Time]uint32, len(times))
 	for i, t := range times {
 		timeIdxByTime[t] = uint32(i)
@@ -189,34 +186,6 @@ func (e *Encoder) Finish() error {
 	}, e.outPath)
 	if err != nil {
 		return fmt.Errorf("wmtiles/encode: encoder init: %w", err)
-	}
-
-	for _, v := range sortedVarInfos(bySig) {
-		if !v.hasFinite {
-			continue
-		}
-		precision, _ := e.resolvePrecision(v)
-		timeList := make([]time.Time, 0, len(v.times))
-		for t := range v.times {
-			timeList = append(timeList, t)
-		}
-		sort.Slice(timeList, func(i, j int) bool { return timeList[i].Before(timeList[j]) })
-		for _, t := range timeList {
-			idx, ok := timeIdxByTime[t]
-			if !ok {
-				continue
-			}
-			if err := enc.DeclareBlock(encoder.BlockSpec{
-				Variable:  v.name,
-				TimeStep:  idx,
-				ValueMin:  v.vmin,
-				ValueMax:  v.vmax,
-				Precision: precision,
-			}); err != nil {
-				enc.Close()
-				return fmt.Errorf("wmtiles/encode: declare block %q t=%d: %w", v.name, idx, err)
-			}
-		}
 	}
 
 	if err := e.streamTiles(bySig, timeIdxByTime, enc, pixSize); err != nil {
@@ -303,20 +272,20 @@ func (e *Encoder) scanInputs() (
 	timesSeen := map[time.Time]struct{}{}
 	boundsInit := false
 	for _, in := range e.inputs {
-		err = in.forEachMetaFiltered(keepShortName, func(m parser.HeaderInfo) error {
+		err = in.forEachHeaderFiltered(keepShortName, func(h parser.GribHeader) error {
 			keptSeen++
 
-			k := varKeyOf(&m.Header)
+			k := varKeyOf(&h)
 			v, ok := bySig[k]
 			if !ok {
-				base := m.Header.ShortName
+				base := h.ShortName
 				if base == "" || base == "unknown" {
 					base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
 				}
 				v = &varInfo{
 					name:      base + levelSuffix(k.levelType, k.level, k.bottomLevel),
-					shortName: m.Header.ShortName,
-					unit:      m.Header.Units,
+					shortName: h.ShortName,
+					unit:      h.Units,
 					vmin:      math.Inf(+1),
 					vmax:      math.Inf(-1),
 					times:     map[time.Time]struct{}{},
@@ -324,19 +293,9 @@ func (e *Encoder) scanInputs() (
 				bySig[k] = v
 			}
 			v.messageCount++
-			v.times[m.Header.ReferenceTime] = struct{}{}
+			v.times[h.ReferenceTime] = struct{}{}
 
-			if m.HasFinite {
-				if m.Min < v.vmin {
-					v.vmin = m.Min
-				}
-				if m.Max > v.vmax {
-					v.vmax = m.Max
-				}
-				v.hasFinite = true
-			}
-
-			shell := parser.GRIBFile{Header: m.Header}
+			shell := parser.GRIBFile{Header: h}
 			west, south, east, north := tiler.GridBBox(&shell)
 			if !boundsInit {
 				bounds = scanBounds{West: west, South: south, East: east, North: north}
@@ -356,7 +315,7 @@ func (e *Encoder) scanInputs() (
 				}
 			}
 
-			timesSeen[m.Header.ReferenceTime] = struct{}{}
+			timesSeen[h.ReferenceTime] = struct{}{}
 			return nil
 		})
 		if err != nil {
@@ -404,40 +363,28 @@ func (e *Encoder) filterSet() map[string]bool {
 	return out
 }
 
-func (e *Encoder) variableSpecs(bySig map[varKey]*varInfo) ([]encoder.VariableSpec, error) {
+func (e *Encoder) preliminaryVariableSpecs(bySig map[varKey]*varInfo) []encoder.VariableSpec {
 	infos := sortedVarInfos(bySig)
 	specs := make([]encoder.VariableSpec, 0, len(infos))
 	for _, v := range infos {
-		if !v.hasFinite {
-			return nil, fmt.Errorf("wmtiles/encode: variable %q has no finite values", v.name)
+		var precision float64
+		if p, ok := e.opts.Precision[v.name]; ok {
+			precision = p
+		} else if p, ok := e.opts.Precision[v.shortName]; ok {
+			precision = p
+		} else if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+			precision = p
 		}
-		precision, _ := e.resolvePrecision(v)
 		specs = append(specs, encoder.VariableSpec{
 			Name:      v.name,
 			Unit:      v.unit,
 			Precision: precision,
 		})
 	}
-	return specs, nil
+	return specs
 }
 
 const autoPrecisionSteps = 1024
-
-func (e *Encoder) resolvePrecision(v *varInfo) (float64, string) {
-	if p, ok := e.opts.Precision[v.name]; ok {
-		return p, "override"
-	}
-	if p, ok := e.opts.Precision[v.shortName]; ok {
-		return p, "override"
-	}
-	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
-		return p, "auto"
-	}
-	if v.vmax > v.vmin {
-		return (v.vmax - v.vmin) / autoPrecisionSteps, "cap"
-	}
-	return 0, "default"
-}
 
 type tileWork struct {
 	name string
@@ -452,6 +399,10 @@ type vtKey struct {
 	tIdx uint32
 }
 
+// streamTiles parses each message once, computes (vmin, vmax) from the values
+// array, declares the block just-in-time, then queues tiles. DeclareBlock can
+// safely interleave with Submit: the streaming encoder's blockMu serialises
+// declarations against the read locks Submit takes.
 func (e *Encoder) streamTiles(
 	bySig map[varKey]*varInfo,
 	timeIdxByTime map[time.Time]uint32,
@@ -500,7 +451,7 @@ func (e *Encoder) streamTiles(
 		}()
 	}
 
-	seen := map[vtKey]string{}
+	declared := map[vtKey]string{}
 	var parseErr error
 	for _, in := range e.inputs {
 		if getErr() != nil {
@@ -525,14 +476,38 @@ func (e *Encoder) streamTiles(
 					return fmt.Errorf("message time %s not in merged time axis", msg.Header.ReferenceTime)
 				}
 				vt := vtKey{k: k, tIdx: tIdx}
-				if prev, dup := seen[vt]; dup {
+				if prev, dup := declared[vt]; dup {
 					if e.opts.AllowDuplicateMessages {
 						return nil
 					}
 					return fmt.Errorf("duplicate GRIB message for variable %q time %s in %s (already seen in %s)",
 						v.name, msg.Header.ReferenceTime.UTC().Format(time.RFC3339), in.name, prev)
 				}
-				seen[vt] = in.name
+
+				vmin, vmax, hasFinite := finiteRange(msg.DataValues, msg.Header.MissingValue)
+				if !hasFinite {
+					declared[vt] = in.name
+					return nil
+				}
+				if vmin < v.vmin {
+					v.vmin = vmin
+				}
+				if vmax > v.vmax {
+					v.vmax = vmax
+				}
+				v.hasFinite = true
+
+				precision := e.resolveBlockPrecision(v, vmin, vmax)
+				if err := enc.DeclareBlock(encoder.BlockSpec{
+					Variable:  v.name,
+					TimeStep:  tIdx,
+					ValueMin:  vmin,
+					ValueMax:  vmax,
+					Precision: precision,
+				}); err != nil {
+					return fmt.Errorf("wmtiles/encode: declare block %q t=%d: %w", v.name, tIdx, err)
+				}
+				declared[vt] = in.name
 
 				msgCopy := msg
 				s := tiler.NewSampler(&msgCopy)
@@ -570,13 +545,47 @@ func (e *Encoder) streamTiles(
 	return nil
 }
 
-func (in input) forEachMetaFiltered(want func(shortName string) bool, fn func(parser.HeaderInfo) error) error {
+func (e *Encoder) resolveBlockPrecision(v *varInfo, vmin, vmax float64) float64 {
+	if p, ok := e.opts.Precision[v.name]; ok {
+		return p
+	}
+	if p, ok := e.opts.Precision[v.shortName]; ok {
+		return p
+	}
+	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+		return p
+	}
+	if vmax > vmin {
+		return (vmax - vmin) / autoPrecisionSteps
+	}
+	return 0
+}
+
+func finiteRange(values []float64, missing float64) (vmin, vmax float64, ok bool) {
+	vmin = math.Inf(+1)
+	vmax = math.Inf(-1)
+	for _, v := range values {
+		if v != v || v == missing {
+			continue
+		}
+		if v < vmin {
+			vmin = v
+		}
+		if v > vmax {
+			vmax = v
+		}
+		ok = true
+	}
+	return
+}
+
+func (in input) forEachHeaderFiltered(want func(shortName string) bool, fn func(parser.GribHeader) error) error {
 	switch in.format {
 	case FormatGRIB2:
 		if in.path != "" {
-			return parser.ForEachMessageMetaFiltered(in.path, want, fn)
+			return parser.ForEachMessageHeaderFiltered(in.path, want, fn)
 		}
-		return parser.ForEachMessageMetaBytesFiltered(in.data, want, fn)
+		return parser.ForEachMessageHeaderBytesFiltered(in.data, want, fn)
 	default:
 		return unsupportedFormatError(in.format)
 	}
