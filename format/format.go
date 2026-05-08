@@ -9,7 +9,7 @@ import (
 	"hash/crc32"
 	"io"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/DataDog/zstd"
 )
 
 var Magic = [8]byte{'W', 'M', 'T', 'I', 'L', 'E', 'S', 0}
@@ -179,12 +179,7 @@ func Compress(data []byte, comp InternalCompression) ([]byte, error) {
 		}
 		return buf.Bytes(), nil
 	case CompZstd:
-		zw, err := zstd.NewWriter(nil)
-		if err != nil {
-			return nil, err
-		}
-		defer zw.Close()
-		return zw.EncodeAll(data, nil), nil
+		return zstd.Compress(nil, data)
 	}
 	return nil, fmt.Errorf("unknown internal compression %d", comp)
 }
@@ -201,12 +196,7 @@ func Decompress(data []byte, comp InternalCompression) ([]byte, error) {
 		defer r.Close()
 		return io.ReadAll(r)
 	case CompZstd:
-		zr, err := zstd.NewReader(nil)
-		if err != nil {
-			return nil, err
-		}
-		defer zr.Close()
-		return zr.DecodeAll(data, nil)
+		return zstd.Decompress(nil, data)
 	}
 	return nil, fmt.Errorf("unknown internal compression %d", comp)
 }

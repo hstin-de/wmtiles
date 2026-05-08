@@ -15,12 +15,11 @@ import (
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tileid"
-	"github.com/klauspost/compress/zstd"
 	"github.com/zeebo/blake3"
 )
 
 type AppendOptions struct {
-	ZstdLevel zstd.EncoderLevel
+	ZstdLevel int
 
 	AllowReplace bool
 
@@ -39,7 +38,7 @@ type AppendCtx struct {
 	pixelSize  int
 	pixPerTile int
 
-	zstdLevel zstd.EncoderLevel
+	zstdLevel int
 
 	allowDelta bool
 
@@ -80,7 +79,7 @@ type loadedSnapshot struct {
 
 func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 	if opts.ZstdLevel == 0 {
-		opts.ZstdLevel = zstd.SpeedDefault
+		opts.ZstdLevel = 3
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {

@@ -3,7 +3,7 @@ module github.com/hstin-de/wmtiles
 go 1.26.2
 
 require (
-	github.com/klauspost/compress v1.18.6
+	github.com/DataDog/zstd v1.5.7
 	github.com/zeebo/blake3 v0.2.4
 )
 

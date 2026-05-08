@@ -8,7 +8,6 @@ import (
 
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/quantize"
-	"github.com/klauspost/compress/zstd"
 )
 
 type VariableSpec struct {
@@ -49,7 +48,7 @@ type Options struct {
 
 	Metadata map[string]any
 
-	ZstdLevel zstd.EncoderLevel
+	ZstdLevel int
 
 	InternalCompression format.InternalCompression
 
@@ -73,7 +72,7 @@ func defaults(o *Options) {
 		o.InternalCompression = format.CompZstd
 	}
 	if o.ZstdLevel == 0 {
-		o.ZstdLevel = zstd.SpeedBetterCompression
+		o.ZstdLevel = 3
 	}
 }
 

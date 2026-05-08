@@ -6,12 +6,15 @@ import (
 	"testing"
 
 	"github.com/hstin-de/wmtiles/quantize"
-	"github.com/klauspost/compress/zstd"
 )
+
+// libzstd level 3 (default). matches what tests previously used (klauspost
+// SpeedDefault was also internally level 3)
+const testZstdLevel = 3
 
 func makeEncoder(t *testing.T) *Encoder {
 	t.Helper()
-	enc, err := NewEncoder(zstd.SpeedDefault)
+	enc, err := NewEncoder(testZstdLevel)
 	if err != nil {
 		t.Fatalf("NewEncoder: %v", err)
 	}
@@ -21,7 +24,7 @@ func makeEncoder(t *testing.T) *Encoder {
 
 func makeEncoderWithDelta(t *testing.T) *Encoder {
 	t.Helper()
-	enc, err := NewEncoderWithOpts(zstd.SpeedDefault, true)
+	enc, err := NewEncoderWithOpts(testZstdLevel, true)
 	if err != nil {
 		t.Fatalf("NewEncoderWithOpts: %v", err)
 	}
@@ -282,7 +285,7 @@ func TestEncodeBestSampledF32SkipsSampler(t *testing.T) {
 }
 
 func BenchmarkEncodeBest(b *testing.B) {
-	enc, err := NewEncoder(zstd.SpeedDefault)
+	enc, err := NewEncoder(testZstdLevel)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -298,7 +301,7 @@ func BenchmarkEncodeBest(b *testing.B) {
 }
 
 func BenchmarkEncodeBestSampled(b *testing.B) {
-	enc, err := NewEncoder(zstd.SpeedDefault)
+	enc, err := NewEncoder(testZstdLevel)
 	if err != nil {
 		b.Fatal(err)
 	}

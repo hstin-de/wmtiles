@@ -10,7 +10,6 @@ import (
 
 	"github.com/hstin-de/wmtiles/codec"
 	"github.com/hstin-de/wmtiles/quantize"
-	"github.com/klauspost/compress/zstd"
 )
 
 func main() {
@@ -35,7 +34,7 @@ func main() {
 		}
 	}
 
-	enc, err := codec.NewEncoder(zstd.SpeedBetterCompression)
+	enc, err := codec.NewEncoder(3)
 	if err != nil {
 		panic(err)
 	}

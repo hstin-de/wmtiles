@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/DataDog/zstd"
 	"github.com/hstin-de/wmtiles/bitshuffle"
 	"github.com/hstin-de/wmtiles/quantize"
-	"github.com/klauspost/compress/zstd"
 )
 
 // codec tag: first byte of every encoded tile blob, dispatches the rest of the payload
@@ -23,7 +23,8 @@ const (
 var ErrUnknownCodec = errors.New("codec: unknown tag")
 
 type Encoder struct {
-	zw         *zstd.Encoder
+	zw         zstd.Ctx
+	level      int
 	scratch    []byte
 	scratch2   []byte
 	scratch3   []byte
@@ -31,19 +32,17 @@ type Encoder struct {
 	allowDelta bool
 }
 
-func NewEncoder(level zstd.EncoderLevel) (*Encoder, error) {
+func NewEncoder(level int) (*Encoder, error) {
 	return NewEncoderWithOpts(level, false)
 }
 
 // allowDelta gates the predictor codecs (delta+zstd, lorenzo+zstd) which
 // win on smooth fields at ~3× the CPU of bitshuffle alone
-func NewEncoderWithOpts(level zstd.EncoderLevel, allowDelta bool) (*Encoder, error) {
-	// concurrency=1: each Encoder is owned by a single goroutine so EncodeAll reuses scratch state
-	zw, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level), zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		return nil, err
+func NewEncoderWithOpts(level int, allowDelta bool) (*Encoder, error) {
+	if level == 0 {
+		level = zstd.DefaultCompression
 	}
-	return &Encoder{zw: zw, allowDelta: allowDelta}, nil
+	return &Encoder{zw: zstd.NewCtx(), level: level, allowDelta: allowDelta}, nil
 }
 
 // per-block bandit: try both bitshuffle and delta for the first samplerSampleSize tiles,
@@ -76,29 +75,20 @@ type samplerState struct {
 }
 
 func (e *Encoder) Close() error {
-	return e.zw.Close()
+	return nil
 }
 
 type Decoder struct {
-	zr        *zstd.Decoder
+	zr        zstd.Ctx
 	scratch   []byte
 	tileBytes []byte
 }
 
 func NewDecoder() (*Decoder, error) {
-	zr, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, err
-	}
-	return &Decoder{zr: zr}, nil
+	return &Decoder{zr: zstd.NewCtx()}, nil
 }
 
-func (d *Decoder) Close() {
-	if d.zr != nil {
-		d.zr.Close()
-		d.zr = nil
-	}
-}
+func (d *Decoder) Close() {}
 
 func (d *Decoder) Decode(blob []byte, p quantize.Params, nPixels int, out []byte) error {
 	if len(blob) < 1 {
@@ -108,11 +98,8 @@ func (d *Decoder) Decode(blob []byte, p quantize.Params, nPixels int, out []byte
 	case IDConstant:
 		return decodeConstant(blob[1:], p, nPixels, out)
 	case IDRawZstd:
-		_, err := d.zr.DecodeAll(blob[1:], out[:0])
-		if err != nil {
-			return err
-		}
-		return nil
+		_, err := d.zr.DecompressInto(out, blob[1:])
+		return err
 	case IDBitshuffleZstd:
 		return d.decodeBitshuffleZstd(blob[1:], p, nPixels, out)
 	case IDDeltaZstd:
@@ -149,13 +136,13 @@ func (d *Decoder) decodeBitshuffleZstd(payload []byte, p quantize.Params, nPixel
 	if cap(d.scratch) < bsLen {
 		d.scratch = make([]byte, bsLen)
 	}
-	scratch := d.scratch[:0]
-	scratch, err := d.zr.DecodeAll(payload, scratch)
+	scratch := d.scratch[:bsLen]
+	n, err := d.zr.DecompressInto(scratch, payload)
 	if err != nil {
 		return err
 	}
-	if len(scratch) != bsLen {
-		return fmt.Errorf("codec: bitshuffle_zstd inner length %d, want %d", len(scratch), bsLen)
+	if n != bsLen {
+		return fmt.Errorf("codec: bitshuffle_zstd inner length %d, want %d", n, bsLen)
 	}
 	bitshuffle.Decode(scratch, stride, nPixels, out)
 	return nil
@@ -170,13 +157,13 @@ func (d *Decoder) decodeDeltaZstd(payload []byte, p quantize.Params, nPixels int
 	if cap(d.scratch) < len(out) {
 		d.scratch = make([]byte, len(out))
 	}
-	scratch := d.scratch[:0]
-	scratch, err := d.zr.DecodeAll(payload, scratch)
+	scratch := d.scratch[:len(out)]
+	n, err := d.zr.DecompressInto(scratch, payload)
 	if err != nil {
 		return err
 	}
-	if len(scratch) != len(out) {
-		return fmt.Errorf("codec: delta_zstd inner length %d, want %d", len(scratch), len(out))
+	if n != len(out) {
+		return fmt.Errorf("codec: delta_zstd inner length %d, want %d", n, len(out))
 	}
 	deltaDecode(scratch, out, w, stride)
 	return nil
@@ -338,11 +325,21 @@ func decodeConstant(payload []byte, p quantize.Params, nPixels int, out []byte) 
 	return nil
 }
 
-func (e *Encoder) encodeRawZstd(quantized []byte) []byte {
-	out := make([]byte, 1, 1+len(quantized)/2)
-	out[0] = IDRawZstd
-	out = e.zw.EncodeAll(quantized, out)
+// libzstd's CompressLevel overwrites dst (it's a reusable buffer, not an
+// append target), so we can't pre-fill the codec tag — prepend after
+func (e *Encoder) compressWithTag(tag byte, src []byte) []byte {
+	body, err := e.zw.CompressLevel(nil, src, e.level)
+	if err != nil {
+		panic(fmt.Sprintf("codec: zstd compress: %v", err))
+	}
+	out := make([]byte, 1+len(body))
+	out[0] = tag
+	copy(out[1:], body)
 	return out
+}
+
+func (e *Encoder) encodeRawZstd(quantized []byte) []byte {
+	return e.compressWithTag(IDRawZstd, quantized)
 }
 
 func (e *Encoder) encodeBitshuffleZstd(quantized []byte, p quantize.Params, nPixels int) []byte {
@@ -353,10 +350,7 @@ func (e *Encoder) encodeBitshuffleZstd(quantized []byte, p quantize.Params, nPix
 	}
 	scratch := e.scratch[:bsLen]
 	bitshuffle.Encode(quantized, stride, nPixels, scratch)
-	out := make([]byte, 1, 1+bsLen/2)
-	out[0] = IDBitshuffleZstd
-	out = e.zw.EncodeAll(scratch, out)
-	return out
+	return e.compressWithTag(IDBitshuffleZstd, scratch)
 }
 
 func (e *Encoder) encodeDeltaZstd(quantized []byte, p quantize.Params, nPixels int) []byte {
@@ -370,10 +364,7 @@ func (e *Encoder) encodeDeltaZstd(quantized []byte, p quantize.Params, nPixels i
 	}
 	delta := e.scratch2[:len(quantized)]
 	deltaEncode(quantized, delta, w, stride)
-	out := make([]byte, 1, 1+len(delta)/2)
-	out[0] = IDDeltaZstd
-	out = e.zw.EncodeAll(delta, out)
-	return out
+	return e.compressWithTag(IDDeltaZstd, delta)
 }
 
 // returns nil on non-square tiles or stride outside u8/u16
@@ -391,10 +382,7 @@ func (e *Encoder) encodeLorenzoZstd(quantized []byte, p quantize.Params, nPixels
 	}
 	residual := e.scratch3[:len(quantized)]
 	lorenzoEncode(quantized, residual, w, stride)
-	out := make([]byte, 1, 1+len(residual)/2)
-	out[0] = IDLorenzoZstd
-	out = e.zw.EncodeAll(residual, out)
-	return out
+	return e.compressWithTag(IDLorenzoZstd, residual)
 }
 
 func (d *Decoder) decodeLorenzoZstd(payload []byte, p quantize.Params, nPixels int, out []byte) error {
@@ -409,13 +397,13 @@ func (d *Decoder) decodeLorenzoZstd(payload []byte, p quantize.Params, nPixels i
 	if cap(d.scratch) < len(out) {
 		d.scratch = make([]byte, len(out))
 	}
-	scratch := d.scratch[:0]
-	scratch, err := d.zr.DecodeAll(payload, scratch)
+	scratch := d.scratch[:len(out)]
+	n, err := d.zr.DecompressInto(scratch, payload)
 	if err != nil {
 		return err
 	}
-	if len(scratch) != len(out) {
-		return fmt.Errorf("codec: lorenzo_zstd inner length %d, want %d", len(scratch), len(out))
+	if n != len(out) {
+		return fmt.Errorf("codec: lorenzo_zstd inner length %d, want %d", n, len(out))
 	}
 	lorenzoDecode(scratch, out, w, stride)
 	return nil
