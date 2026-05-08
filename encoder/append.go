@@ -26,6 +26,10 @@ type AppendOptions struct {
 	CreationTime time.Time
 
 	DisableDeltaCodec bool
+
+	// SkipInternalWorkers disables the channel-based quantize+codec pool;
+	// callers must drive the context via NewDirectAppendWorker.
+	SkipInternalWorkers bool
 }
 
 type AppendCtx struct {
@@ -40,7 +44,9 @@ type AppendCtx struct {
 
 	zstdLevel int
 
-	allowDelta bool
+	allowDelta          bool
+	skipInternalWorkers bool
+	sharedSampler       *codec.SharedSampler
 
 	variables  []format.VariableEntry
 	idByName   map[string]uint16
@@ -131,6 +137,7 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 		pixPerTile:           pixPerTile,
 		zstdLevel:            opts.ZstdLevel,
 		allowDelta:           !opts.DisableDeltaCodec,
+		skipInternalWorkers:  opts.SkipInternalWorkers,
 		variables:            clonedVars,
 		idByName:             idByName,
 		specByName:           specByName,
@@ -144,15 +151,20 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 
 	ctx.existingBlocks = existing
 
-	numWorkers := max(runtime.GOMAXPROCS(0), 1)
-	ctx.jobCh = make(chan submitMsg, numWorkers*4)
-	ctx.resCh = make(chan encodedTile, numWorkers*4)
+	if !opts.SkipInternalWorkers {
+		numWorkers := max(runtime.GOMAXPROCS(0), 1)
+		ctx.jobCh = make(chan submitMsg, numWorkers*4)
+		ctx.resCh = make(chan encodedTile, numWorkers*4)
 
-	ctx.workerWg.Add(numWorkers)
-	for range numWorkers {
-		go ctx.worker()
+		ctx.workerWg.Add(numWorkers)
+		for range numWorkers {
+			go ctx.worker()
+		}
+		go ctx.serializer()
+	} else {
+		ctx.sharedSampler = codec.NewSharedSampler()
+		close(ctx.serializerDone)
 	}
-	go ctx.serializer()
 
 	return ctx, nil
 }
@@ -451,10 +463,12 @@ func (a *AppendCtx) serializer() {
 func (a *AppendCtx) Finish() error {
 	var err error
 	a.finishing.Do(func() {
-		close(a.jobCh)
-		a.workerWg.Wait()
-		close(a.resCh)
-		<-a.serializerDone
+		if !a.skipInternalWorkers {
+			close(a.jobCh)
+			a.workerWg.Wait()
+			close(a.resCh)
+			<-a.serializerDone
+		}
 
 		if e := a.checkErr(); e != nil {
 			err = e
@@ -594,10 +608,12 @@ func (a *AppendCtx) Finish() error {
 func (a *AppendCtx) Close() error {
 	a.finishing.Do(func() {
 		a.setErr(errors.New("append context closed without Finish"))
-		close(a.jobCh)
-		a.workerWg.Wait()
-		close(a.resCh)
-		<-a.serializerDone
+		if !a.skipInternalWorkers {
+			close(a.jobCh)
+			a.workerWg.Wait()
+			close(a.resCh)
+			<-a.serializerDone
+		}
 		if a.out != nil {
 			a.out.Close()
 			a.out = nil

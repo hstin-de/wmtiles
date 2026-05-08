@@ -155,7 +155,21 @@ type variablePlan struct {
 	step      float64
 }
 
-func scanGribHeaders(path, filterShortNames string) (
+
+type parsedMsg struct {
+	header  parser.GribHeader
+	values  []float32
+	vmin    float64
+	vmax    float64
+	hasFin  bool
+	skipMsg bool
+}
+
+// parseAllMessages decodes every GRIB2 message in parallel, returning the
+// per-message cache plus the merged variable/time catalog and bounding box.
+// Filtered-out messages skip the values transfer.
+func parseAllMessages(data []byte, ranges []parser.MessageRange, filterShortNames string) (
+	parsed []parsedMsg,
 	bySig map[varKey]*varInfo,
 	allTimes []time.Time,
 	bbox [4]float64,
@@ -172,71 +186,114 @@ func scanGribHeaders(path, filterShortNames string) (
 		}
 	}
 
+	parsed = make([]parsedMsg, len(ranges))
+	parseErrs := make([]error, len(ranges))
+
+	numWorkers := max(runtime.GOMAXPROCS(0), 1)
+	idxCh := make(chan int, len(ranges))
+	for i := range ranges {
+		idxCh <- i
+	}
+	close(idxCh)
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for i := range idxCh {
+				r := ranges[i]
+				if keep != nil {
+					h, e := parser.ParseHeaderBytes(data[r.Offset : r.Offset+r.Length])
+					if e != nil {
+						parseErrs[i] = e
+						continue
+					}
+					if !keep[h.ShortName] {
+						parsed[i] = parsedMsg{header: h, skipMsg: true}
+						continue
+					}
+				}
+				g, e := parser.ParseFullBytes(data[r.Offset : r.Offset+r.Length])
+				if e != nil {
+					parseErrs[i] = e
+					continue
+				}
+				vmin, vmax, hasFin := finiteRange(g.DataValues, g.Header.MissingValue)
+				parsed[i] = parsedMsg{
+					header: g.Header,
+					values: g.DataValues,
+					vmin:   vmin,
+					vmax:   vmax,
+					hasFin: hasFin,
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, e := range parseErrs {
+		if e != nil {
+			err = e
+			return
+		}
+	}
+
 	bySig = map[varKey]*varInfo{}
 	timesSeen := map[time.Time]struct{}{}
 	bbox = [4]float64{180, 90, -180, -90}
 	bboxInit := false
 
-	err = parser.ForEachMessageHeaderFiltered(path,
-		func(sn string) bool {
-			totalSeen++
-			return keep == nil || keep[sn]
-		},
-		func(h parser.GribHeader) error {
-			keptSeen++
-
-			k := varKeyOf(&h)
-			v, ok := bySig[k]
-			if !ok {
-				base := h.ShortName
-				if base == "" || base == "unknown" {
-					base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
-				}
-				v = &varInfo{
-					name:        base + levelSuffix(k.levelType, k.level, k.bottomLevel),
-					shortName:   h.ShortName,
-					unit:        h.Units,
-					vmin:        math.Inf(+1),
-					vmax:        math.Inf(-1),
-					times:       map[time.Time]struct{}{},
-					precSources: map[string]struct{}{},
-				}
-				bySig[k] = v
+	for i := range parsed {
+		totalSeen++
+		if parsed[i].skipMsg {
+			continue
+		}
+		keptSeen++
+		h := &parsed[i].header
+		k := varKeyOf(h)
+		v, ok := bySig[k]
+		if !ok {
+			base := h.ShortName
+			if base == "" || base == "unknown" {
+				base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
 			}
-			v.messageCount++
-			v.times[h.ReferenceTime] = struct{}{}
-
-			shell := parser.GRIBFile{Header: h}
-			gw, gs, ge, gn := tiler.GridBBox(&shell)
-			if !bboxInit {
-				bbox = [4]float64{gw, gs, ge, gn}
-				bboxInit = true
-			} else {
-				if gw < bbox[0] {
-					bbox[0] = gw
-				}
-				if gs < bbox[1] {
-					bbox[1] = gs
-				}
-				if ge > bbox[2] {
-					bbox[2] = ge
-				}
-				if gn > bbox[3] {
-					bbox[3] = gn
-				}
+			v = &varInfo{
+				name:        base + levelSuffix(k.levelType, k.level, k.bottomLevel),
+				shortName:   h.ShortName,
+				unit:        h.Units,
+				vmin:        math.Inf(+1),
+				vmax:        math.Inf(-1),
+				times:       map[time.Time]struct{}{},
+				precSources: map[string]struct{}{},
 			}
+			bySig[k] = v
+		}
+		v.messageCount++
+		v.times[h.ReferenceTime] = struct{}{}
 
-			timesSeen[h.ReferenceTime] = struct{}{}
-			return nil
-		})
-	if err != nil {
-		return
+		shell := parser.GRIBFile{Header: *h}
+		gw, gs, ge, gn := tiler.GridBBox(&shell)
+		if !bboxInit {
+			bbox = [4]float64{gw, gs, ge, gn}
+			bboxInit = true
+		} else {
+			if gw < bbox[0] {
+				bbox[0] = gw
+			}
+			if gs < bbox[1] {
+				bbox[1] = gs
+			}
+			if ge > bbox[2] {
+				bbox[2] = ge
+			}
+			if gn > bbox[3] {
+				bbox[3] = gn
+			}
+		}
+		timesSeen[h.ReferenceTime] = struct{}{}
 	}
 
-	// disambiguate when shortName + level happen to collide across distinct varKeys.
-	// first pass: add _d_c_p (overlapping centre-specific tables). second pass: add
-	// the raw typeOfLevel + level when several typeOfLevel values share a friendly
-	// suffix (e.g. lowCloudLayer/lowCloudBottom/lowCloudTop all map to _lowcld).
 	disambiguate := func(suffix func(varKey) string) {
 		counts := map[string]int{}
 		for _, v := range bySig {
@@ -263,8 +320,170 @@ func scanGribHeaders(path, filterShortNames string) (
 	return
 }
 
+// tileFromParsed declares blocks, samples tiles and submits them in parallel
+// using the message cache produced by parseAllMessages. Each message is owned
+// by one worker, which clears its values slice as soon as its tiles are queued.
+func tileFromParsed(
+	parsed []parsedMsg,
+	bySig map[varKey]*varInfo,
+	timeIdxByTime map[time.Time]uint32,
+	overrides map[string]float64,
+	sink blockSink,
+	minZoom, maxZoom uint8,
+	pixSize int,
+	onDuplicate func(string, time.Time) error,
+) (int64, int64, error) {
+	numWorkers := max(runtime.GOMAXPROCS(0), 1)
+
+	var submitted, skipped atomic.Int64
+	var firstErr atomic.Value
+	setErr := func(e error) {
+		if e == nil {
+			return
+		}
+		firstErr.CompareAndSwap(nil, e)
+	}
+	getErr := func() error {
+		if v := firstErr.Load(); v != nil {
+			return v.(error)
+		}
+		return nil
+	}
+
+	var declMu sync.Mutex
+	declared := map[vtKey]struct{}{}
+	var varMu sync.Mutex
+
+	keepIdx := make([]int, 0, len(parsed))
+	for i := range parsed {
+		if !parsed[i].skipMsg && parsed[i].values != nil {
+			keepIdx = append(keepIdx, i)
+		}
+	}
+	idxCh := make(chan int, len(keepIdx))
+	for _, i := range keepIdx {
+		idxCh <- i
+	}
+	close(idxCh)
+
+	ds, _ := sink.(directSinker)
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			var dw *encoder.DirectWorker
+			if ds != nil {
+				w, e := ds.NewDirectWorker()
+				if e != nil {
+					setErr(e)
+					return
+				}
+				defer w.Close()
+				dw = w
+			}
+			for idx := range idxCh {
+				if getErr() != nil {
+					continue
+				}
+				m := &parsed[idx]
+				k := varKeyOf(&m.header)
+				v, ok := bySig[k]
+				if !ok {
+					continue
+				}
+				tIdx, ok := timeIdxByTime[m.header.ReferenceTime]
+				if !ok {
+					setErr(fmt.Errorf("variable %q time %s: time not in index", v.name, m.header.ReferenceTime))
+					continue
+				}
+				vt := vtKey{k, tIdx}
+				declMu.Lock()
+				if _, dup := declared[vt]; dup {
+					declMu.Unlock()
+					if onDuplicate != nil {
+						if e := onDuplicate(v.name, m.header.ReferenceTime); e != nil {
+							setErr(e)
+						}
+					}
+					continue
+				}
+				declared[vt] = struct{}{}
+				declMu.Unlock()
+
+				if !m.hasFin {
+					m.values = nil
+					continue
+				}
+				varMu.Lock()
+				if m.vmin < v.vmin {
+					v.vmin = m.vmin
+				}
+				if m.vmax > v.vmax {
+					v.vmax = m.vmax
+				}
+				v.hasFinite = true
+				precision, src := resolveBlockPrecision(v, m.vmin, m.vmax, overrides)
+				if v.precSources == nil {
+					v.precSources = map[string]struct{}{}
+				}
+				v.precSources[src] = struct{}{}
+				varMu.Unlock()
+
+				if e := sink.DeclareBlock(encoder.BlockSpec{
+					Variable:  v.name,
+					TimeStep:  tIdx,
+					ValueMin:  m.vmin,
+					ValueMax:  m.vmax,
+					Precision: precision,
+				}); e != nil {
+					setErr(fmt.Errorf("declare block %q t=%d: %w", v.name, tIdx, e))
+					m.values = nil
+					continue
+				}
+
+				gribFile := parser.GRIBFile{Header: m.header, DataValues: m.values}
+				s := tiler.NewSampler(&gribFile)
+				if s == nil {
+					setErr(fmt.Errorf("variable %q time %s: malformed grid", v.name, m.header.ReferenceTime))
+					m.values = nil
+					continue
+				}
+				for z := minZoom; z <= maxZoom; z++ {
+					for _, c := range tiler.TilesIntersectingGrid(&gribFile, z) {
+						px := tiler.Tile(s, z, c.X, c.Y, pixSize)
+						if px == nil {
+							skipped.Add(1)
+							continue
+						}
+						t := encoder.Tile{
+							Variable: v.name, TimeStep: tIdx,
+							Z: z, X: c.X, Y: c.Y, Pixels: px,
+						}
+						var subErr error
+						if dw != nil {
+							subErr = dw.SubmitDirect(t)
+						} else {
+							subErr = sink.Submit(t)
+						}
+						if subErr != nil {
+							skipped.Add(1)
+							continue
+						}
+						submitted.Add(1)
+					}
+				}
+				m.values = nil
+			}
+		}()
+	}
+	wg.Wait()
+	return submitted.Load(), skipped.Load(), getErr()
+}
+
 // buildPreliminaryVariableSpecs leaves Precision=0 for variables without a
-// known hint; the per-block auto-cap fills it in during streamTilesSinglePass.
+// known hint; the per-block auto-cap fills it in during tile encoding.
 func buildPreliminaryVariableSpecs(bySig map[varKey]*varInfo, overrides map[string]float64) []encoder.VariableSpec {
 	specs := make([]encoder.VariableSpec, 0, len(bySig))
 	for _, v := range bySig {
@@ -324,153 +543,43 @@ func dominantPrecSource(sources map[string]struct{}) string {
 // above NWP-grade SNR. precision=0 explicitly set by the user still keeps u16
 const autoPrecisionSteps = 1024
 
-type tileWork struct {
-	name string
-	tIdx uint32
-	z    uint8
-	x, y uint32
-	s    *tiler.Sampler
-}
-
 type vtKey struct {
 	k    varKey
 	tIdx uint32
 }
 
-// blockSink lets streamTilesSinglePass drive both StreamingEncoder and AppendCtx.
 type blockSink interface {
 	DeclareBlock(encoder.BlockSpec) error
 	Submit(encoder.Tile) error
 }
 
-func streamTilesSinglePass(
-	path string,
-	bySig map[varKey]*varInfo,
-	timeIdxByTime map[time.Time]uint32,
-	overrides map[string]float64,
-	sink blockSink,
-	minZoom, maxZoom uint8,
-	pixSize int,
-	onDuplicate func(string, time.Time) error,
-) (int64, int64, error) {
-	numWorkers := max(runtime.GOMAXPROCS(0), 1)
-	workCh := make(chan tileWork, numWorkers*4)
-	var submitted, skipped atomic.Int64
-
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer wg.Done()
-			for w := range workCh {
-				px := tiler.Tile(w.s, w.z, w.x, w.y, pixSize)
-				if px == nil {
-					skipped.Add(1)
-					continue
-				}
-				if err := sink.Submit(encoder.Tile{
-					Variable: w.name, TimeStep: w.tIdx,
-					Z: w.z, X: w.x, Y: w.y, Pixels: px,
-				}); err != nil {
-					skipped.Add(1)
-					continue
-				}
-				submitted.Add(1)
-			}
-		}()
-	}
-
-	declared := map[vtKey]struct{}{}
-	err := parser.ForEachMessageFiltered(path,
-		func(h *parser.GribHeader) bool {
-			_, ok := bySig[varKeyOf(h)]
-			return ok
-		},
-		func(g parser.GRIBFile) error {
-			k := varKeyOf(&g.Header)
-			v, ok := bySig[k]
-			if !ok {
-				return nil
-			}
-			tIdx, ok := timeIdxByTime[g.Header.ReferenceTime]
-			if !ok {
-				return fmt.Errorf("variable %q time %s: time not in index", v.name, g.Header.ReferenceTime)
-			}
-			vt := vtKey{k, tIdx}
-			if _, dup := declared[vt]; dup {
-				if onDuplicate != nil {
-					return onDuplicate(v.name, g.Header.ReferenceTime)
-				}
-				return nil
-			}
-
-			vmin, vmax, hasFinite := finiteRange(g.DataValues, g.Header.MissingValue)
-			if !hasFinite {
-				declared[vt] = struct{}{}
-				return nil
-			}
-			if vmin < v.vmin {
-				v.vmin = vmin
-			}
-			if vmax > v.vmax {
-				v.vmax = vmax
-			}
-			v.hasFinite = true
-
-			precision, src := resolveBlockPrecision(v, vmin, vmax, overrides)
-			if v.precSources == nil {
-				v.precSources = map[string]struct{}{}
-			}
-			v.precSources[src] = struct{}{}
-
-			if err := sink.DeclareBlock(encoder.BlockSpec{
-				Variable:  v.name,
-				TimeStep:  tIdx,
-				ValueMin:  vmin,
-				ValueMax:  vmax,
-				Precision: precision,
-			}); err != nil {
-				return fmt.Errorf("declare block %q t=%d: %w", v.name, tIdx, err)
-			}
-			declared[vt] = struct{}{}
-
-			gc := g
-			s := tiler.NewSampler(&gc)
-			if s == nil {
-				return fmt.Errorf("variable %q time %s: malformed grid", v.name, g.Header.ReferenceTime)
-			}
-			for z := minZoom; z <= maxZoom; z++ {
-				for _, c := range tiler.TilesIntersectingGrid(&gc, z) {
-					workCh <- tileWork{
-						name: v.name, tIdx: tIdx,
-						z: z, x: c.X, y: c.Y, s: s,
-					}
-				}
-			}
-			return nil
-		})
-
-	close(workCh)
-	wg.Wait()
-	return submitted.Load(), skipped.Load(), err
+// directSinker lets sinks expose a fast path that bypasses the encoder's
+// channel pipeline.
+type directSinker interface {
+	NewDirectWorker() (*encoder.DirectWorker, error)
 }
 
-func finiteRange(values []float64, missing float64) (vmin, vmax float64, ok bool) {
-	vmin = math.Inf(+1)
-	vmax = math.Inf(-1)
+func finiteRange(values []float32, missing float64) (vmin, vmax float64, ok bool) {
+	missing32 := float32(missing)
+	mn := float32(math.Inf(+1))
+	mx := float32(math.Inf(-1))
+	hasFin := false
 	for _, v := range values {
-		if v != v || v == missing {
+		if v != v || v == missing32 {
 			continue
 		}
-		if v < vmin {
-			vmin = v
+		if v < mn {
+			mn = v
 		}
-		if v > vmax {
-			vmax = v
+		if v > mx {
+			mx = v
 		}
-		ok = true
+		hasFin = true
 	}
-	return
+	if hasFin {
+		return float64(mn), float64(mx), true
+	}
+	return 0, 0, false
 }
 
 // resolveBlockPrecision uses the per-block observed range for the auto-cap
@@ -549,10 +658,21 @@ func runEncodeGRIB(command string, args []string) error {
 	}
 
 	cliSection("Scan GRIB")
-	bySig, allTimes, bbox, totalSeen, keptSeen, err := scanGribHeaders(in, flags.filterShortNames)
+	data, err := os.ReadFile(in)
 	if err != nil {
 		return fmt.Errorf("read grib: %w", err)
 	}
+	ranges, err := parser.MessageRanges(data)
+	if err != nil {
+		return fmt.Errorf("scan grib: %w", err)
+	}
+	tParse := time.Now()
+	parsed, bySig, allTimes, bbox, totalSeen, keptSeen, err := parseAllMessages(data, ranges, flags.filterShortNames)
+	if err != nil {
+		return fmt.Errorf("read grib: %w", err)
+	}
+	parseDuration := time.Since(tParse)
+	data = nil
 	if keptSeen == 0 {
 		if flags.filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", flags.filterShortNames, totalSeen)
@@ -588,9 +708,10 @@ func runEncodeGRIB(command string, args []string) error {
 			"sourceGrib":   in,
 			"messageCount": keptSeen,
 		},
-		OnPixelsConsumed:  tiler.PutTileBuf,
-		DisableDeltaCodec: flags.disableDelta,
-		ZstdLevel:         flags.zstdLevel,
+		OnPixelsConsumed:    tiler.PutTileBuf,
+		DisableDeltaCodec:   flags.disableDelta,
+		ZstdLevel:           flags.zstdLevel,
+		SkipInternalWorkers: true,
 	}
 
 	enc, err := encoder.NewStreamingEncoder(opts, flags.output)
@@ -600,7 +721,7 @@ func runEncodeGRIB(command string, args []string) error {
 
 	pixSize := 1 << flags.tileSizeLog2
 	t0 := time.Now()
-	submitted, skipped, err := streamTilesSinglePass(in, bySig, timeIdxByTime,
+	submitted, skipped, err := tileFromParsed(parsed, bySig, timeIdxByTime,
 		flags.precisionOverrides, enc,
 		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize, nil)
 	if err != nil {
@@ -611,16 +732,20 @@ func runEncodeGRIB(command string, args []string) error {
 	cliSection("Tile encoding")
 	cliKV("tiles written", commaInt(submitted))
 	cliKV("tiles skipped", commaInt(skipped))
-	cliKV("duration", formatDuration(encodeDuration))
-	cliKV("throughput", formatThroughput(submitted, encodeDuration, "tiles"))
+	cliKV("parse", formatDuration(parseDuration))
+	cliKV("tile+encode", formatDuration(encodeDuration))
+	cliKV("duration", formatDuration(parseDuration+encodeDuration))
+	cliKV("throughput", formatThroughput(submitted, parseDuration+encodeDuration, "tiles"))
 	cliKVf("workers", "%d", runtime.GOMAXPROCS(0))
 
 	plans := finalVariablePlans(bySig, flags.precisionOverrides)
 	printVariablePlans(plans)
 
+	tFinish := time.Now()
 	if err := enc.Finish(); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
+	cliKV("finish", formatDuration(time.Since(tFinish)))
 	st, _ := os.Stat(flags.output)
 	cliSection("Done")
 	if st != nil {

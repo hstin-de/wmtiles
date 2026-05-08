@@ -51,7 +51,7 @@ type GribHeader struct {
 
 type GRIBFile struct {
 	Header     GribHeader
-	DataValues []float64
+	DataValues []float32
 }
 
 func (g *GRIBFile) GetLatLng(x, y int) (float64, float64) {
@@ -83,7 +83,7 @@ func (g *GRIBFile) GetData(lat, lng float64) float64 {
 		return 9999
 	}
 
-	return g.DataValues[y*g.Header.Nx+x]
+	return float64(g.DataValues[y*g.Header.Nx+x])
 }
 
 // Catmull-Rom bicubic interpolation over the 4×4 stencil around (lat, lng);
@@ -159,7 +159,7 @@ func (g *GRIBFile) GetInterpolatedData(lat, lng float64) float64 {
 	v02 := data[y0m1*width+x0p1]
 	v03 := data[y0m1*width+x0p2]
 
-	if v00 == g.Header.MissingValue || v01 == g.Header.MissingValue || v02 == g.Header.MissingValue || v03 == g.Header.MissingValue {
+	if float64(v00) == g.Header.MissingValue || float64(v01) == g.Header.MissingValue || float64(v02) == g.Header.MissingValue || float64(v03) == g.Header.MissingValue {
 		return g.Header.MissingValue
 	}
 
@@ -168,7 +168,7 @@ func (g *GRIBFile) GetInterpolatedData(lat, lng float64) float64 {
 	v12 := data[y0*width+x0p1]
 	v13 := data[y0*width+x0p2]
 
-	if v10 == g.Header.MissingValue || v11 == g.Header.MissingValue || v12 == g.Header.MissingValue || v13 == g.Header.MissingValue {
+	if float64(v10) == g.Header.MissingValue || float64(v11) == g.Header.MissingValue || float64(v12) == g.Header.MissingValue || float64(v13) == g.Header.MissingValue {
 		return g.Header.MissingValue
 	}
 
@@ -177,7 +177,7 @@ func (g *GRIBFile) GetInterpolatedData(lat, lng float64) float64 {
 	v22 := data[y0p1*width+x0p1]
 	v23 := data[y0p1*width+x0p2]
 
-	if v20 == g.Header.MissingValue || v21 == g.Header.MissingValue || v22 == g.Header.MissingValue || v23 == g.Header.MissingValue {
+	if float64(v20) == g.Header.MissingValue || float64(v21) == g.Header.MissingValue || float64(v22) == g.Header.MissingValue || float64(v23) == g.Header.MissingValue {
 		return g.Header.MissingValue
 	}
 
@@ -186,14 +186,14 @@ func (g *GRIBFile) GetInterpolatedData(lat, lng float64) float64 {
 	v32 := data[y0p2*width+x0p1]
 	v33 := data[y0p2*width+x0p2]
 
-	if v30 == g.Header.MissingValue || v31 == g.Header.MissingValue || v32 == g.Header.MissingValue || v33 == g.Header.MissingValue {
+	if float64(v30) == g.Header.MissingValue || float64(v31) == g.Header.MissingValue || float64(v32) == g.Header.MissingValue || float64(v33) == g.Header.MissingValue {
 		return g.Header.MissingValue
 	}
 
-	return v00*wx0*wy0 + v01*wx1*wy0 + v02*wx2*wy0 + v03*wx3*wy0 +
-		v10*wx0*wy1 + v11*wx1*wy1 + v12*wx2*wy1 + v13*wx3*wy1 +
-		v20*wx0*wy2 + v21*wx1*wy2 + v22*wx2*wy2 + v23*wx3*wy2 +
-		v30*wx0*wy3 + v31*wx1*wy3 + v32*wx2*wy3 + v33*wx3*wy3
+	return float64(v00)*wx0*wy0 + float64(v01)*wx1*wy0 + float64(v02)*wx2*wy0 + float64(v03)*wx3*wy0 +
+		float64(v10)*wx0*wy1 + float64(v11)*wx1*wy1 + float64(v12)*wx2*wy1 + float64(v13)*wx3*wy1 +
+		float64(v20)*wx0*wy2 + float64(v21)*wx1*wy2 + float64(v22)*wx2*wy2 + float64(v23)*wx3*wy2 +
+		float64(v30)*wx0*wy3 + float64(v31)*wx1*wy3 + float64(v32)*wx2*wy3 + float64(v33)*wx3*wy3
 }
 
 func getLong(gid *C.codes_handle, key string) C.long {
@@ -228,6 +228,16 @@ func getDoubleArray(gid *C.codes_handle, key string, out []float64) C.int {
 	defer C.free(unsafe.Pointer(ckey))
 	n := C.size_t(len(out))
 	return C.codes_get_double_array(gid, ckey, (*C.double)(unsafe.Pointer(&out[0])), &n)
+}
+
+func getFloatArray(gid *C.codes_handle, key string, out []float32) C.int {
+	if len(out) == 0 {
+		return C.CODES_SUCCESS
+	}
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+	n := C.size_t(len(out))
+	return C.codes_get_float_array(gid, ckey, (*C.float)(unsafe.Pointer(&out[0])), &n)
 }
 
 func getSize(gid *C.codes_handle, key string) (C.size_t, C.int) {
@@ -617,10 +627,11 @@ type gridSig struct {
 
 type distinctCoords struct {
 	lats, lons []float64
+	ready      chan struct{}
 }
 
 var (
-	distinctCacheMu sync.RWMutex
+	distinctCacheMu sync.Mutex
 	distinctCache   = map[gridSig]*distinctCoords{}
 )
 
@@ -637,43 +648,41 @@ func processHandle(gid *C.codes_handle) (GRIBFile, error) {
 // split out so ForEachMessageFiltered can skip it for unwanted messages
 func finishProcessHandle(gid *C.codes_handle, h GribHeader) (GRIBFile, error) {
 	sig := gridSig{nx: h.Nx, ny: h.Ny, la1: h.La1, la2: h.La2, lo1: h.Lo1, lo2: h.Lo2}
-	distinctCacheMu.RLock()
+	// single-flight on cache miss; otherwise concurrent workers all redo the eccodes lookup.
+	distinctCacheMu.Lock()
 	dc, ok := distinctCache[sig]
-	distinctCacheMu.RUnlock()
-	if ok {
-		h.DistinctLatitudes = dc.lats
-		h.DistinctLongitudes = dc.lons
-	} else {
+	if !ok {
+		dc = &distinctCoords{ready: make(chan struct{})}
+		distinctCache[sig] = dc
+		distinctCacheMu.Unlock()
+
 		lats := make([]float64, h.Ny)
 		getDoubleArray(gid, "distinctLatitudes", lats)
 		lons := make([]float64, h.Nx)
 		getDoubleArray(gid, "distinctLongitudes", lons)
-
 		if h.Ny > 1 && h.La2 < h.La1 && lats[len(lats)-1] > lats[0] {
 			for i, j := 0, len(lats)-1; i < j; i, j = i+1, j-1 {
 				lats[i], lats[j] = lats[j], lats[i]
 			}
 		}
-
-		distinctCacheMu.Lock()
-		if existing, dup := distinctCache[sig]; dup {
-			lats, lons = existing.lats, existing.lons
-		} else {
-			distinctCache[sig] = &distinctCoords{lats: lats, lons: lons}
-		}
+		dc.lats = lats
+		dc.lons = lons
+		close(dc.ready)
+	} else {
 		distinctCacheMu.Unlock()
-		h.DistinctLatitudes = lats
-		h.DistinctLongitudes = lons
+		<-dc.ready
 	}
+	h.DistinctLatitudes = dc.lats
+	h.DistinctLongitudes = dc.lons
 
 	numValues, rc := getSize(gid, "values")
 	if rc != C.CODES_SUCCESS {
 		return GRIBFile{}, fmt.Errorf("codes_get_size(values) failed: %d", int(rc))
 	}
 
-	dataValues := make([]float64, numValues)
-	if rc := getDoubleArray(gid, "values", dataValues); rc != C.CODES_SUCCESS {
-		return GRIBFile{}, fmt.Errorf("codes_get_double_array(values) failed: %d", int(rc))
+	dataValues := make([]float32, numValues)
+	if rc := getFloatArray(gid, "values", dataValues); rc != C.CODES_SUCCESS {
+		return GRIBFile{}, fmt.Errorf("codes_get_float_array(values) failed: %d", int(rc))
 	}
 
 	return GRIBFile{Header: h, DataValues: dataValues}, nil

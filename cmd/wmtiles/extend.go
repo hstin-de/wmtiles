@@ -13,6 +13,7 @@ import (
 	"github.com/hstin-de/wmtiles/directory"
 	"github.com/hstin-de/wmtiles/encoder"
 	"github.com/hstin-de/wmtiles/format"
+	"github.com/hstin-de/wmtiles/parser"
 	"github.com/hstin-de/wmtiles/reader"
 	"github.com/hstin-de/wmtiles/tileid"
 )
@@ -65,10 +66,19 @@ func runExtend(args []string) error {
 	r.Close()
 
 	cliSection("Scan GRIB")
-	bySig, allTimes, _, totalSeen, keptSeen, err := scanGribHeaders(gribPath, *filterShortNames)
+	gribData, err := os.ReadFile(gribPath)
+	if err != nil {
+		return fmt.Errorf("read GRIB: %w", err)
+	}
+	gribRanges, err := parser.MessageRanges(gribData)
 	if err != nil {
 		return fmt.Errorf("scan GRIB: %w", err)
 	}
+	parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err := parseAllMessages(gribData, gribRanges, *filterShortNames)
+	if err != nil {
+		return fmt.Errorf("scan GRIB: %w", err)
+	}
+	gribData = nil
 	if keptSeen == 0 {
 		if *filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", *filterShortNames, totalSeen)
@@ -83,7 +93,7 @@ func runExtend(args []string) error {
 	cliKVf("variables", "%d", len(bySig))
 	cliKV("time axis", describeTimeCatalog(timeCatalog))
 
-	ctx, err := encoder.OpenForAppend(wmtPath, encoder.AppendOptions{AllowReplace: *allowReplace})
+	ctx, err := encoder.OpenForAppend(wmtPath, encoder.AppendOptions{AllowReplace: *allowReplace, SkipInternalWorkers: true})
 	if err != nil {
 		return fmt.Errorf("open for append: %w", err)
 	}
@@ -113,7 +123,7 @@ func runExtend(args []string) error {
 	}
 
 	t0 := time.Now()
-	submitted, dropped, err := streamTilesSinglePass(gribPath, bySig, timeIdxByTime,
+	submitted, dropped, err := tileFromParsed(parsedMsgs, bySig, timeIdxByTime,
 		overrides, &appendSink{ctx: ctx, alreadyPresent: &alreadyPresent},
 		minZoom, maxZoom, pixelSize, onDup)
 	if err != nil {
@@ -164,6 +174,12 @@ func (a *appendSink) DeclareBlock(spec encoder.BlockSpec) error {
 
 func (a *appendSink) Submit(t encoder.Tile) error {
 	return a.ctx.Submit(t)
+}
+
+// NewDirectWorker satisfies the directSinker fast path so tileFromParsed can
+// run quantize+codec inline on parser goroutines.
+func (a *appendSink) NewDirectWorker() (*encoder.DirectWorker, error) {
+	return a.ctx.NewDirectAppendWorker()
 }
 
 func runCompact(args []string) error {

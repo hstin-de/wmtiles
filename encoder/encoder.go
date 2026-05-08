@@ -62,6 +62,10 @@ type Options struct {
 	// forces every tile through bitshuffle+zstd, skipping delta/lorenzo. set
 	// when encode wall time matters more than file size
 	DisableDeltaCodec bool
+
+	// SkipInternalWorkers disables the channel-based quantize+codec pool;
+	// callers must drive the encoder via DirectWorker.SubmitDirect.
+	SkipInternalWorkers bool
 }
 
 func defaults(o *Options) {

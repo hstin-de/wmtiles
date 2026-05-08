@@ -46,6 +46,8 @@ type StreamingEncoder struct {
 
 	cursor uint64
 
+	sharedSampler *codec.SharedSampler
+
 	blockTable []format.BlockTableEntry
 
 	globalMin map[uint16]float64
@@ -134,18 +136,23 @@ func NewStreamingEncoder(opts Options, outPath string) (*StreamingEncoder, error
 		serializerDone: make(chan struct{}),
 	}
 
-	numWorkers := max(runtime.GOMAXPROCS(0), 1)
-	// *4 keeps workers fed across the producer's bursts without unbounded memory growth
-	se.jobCh = make(chan submitMsg, numWorkers*4)
-	se.resCh = make(chan encodedTile, numWorkers*4)
+	if opts.SkipInternalWorkers {
+		se.sharedSampler = codec.NewSharedSampler()
+		close(se.serializerDone)
+	} else {
+		numWorkers := max(runtime.GOMAXPROCS(0), 1)
+		// *4 keeps workers fed across the producer's bursts without unbounded memory growth
+		se.jobCh = make(chan submitMsg, numWorkers*4)
+		se.resCh = make(chan encodedTile, numWorkers*4)
 
-	// pipeline: Submit → jobCh → workers (quantize+codec) → resCh → serializer (per-block dedup+append)
-	// shutdown is driven from Finish: close(jobCh) drains workers, then close(resCh) drains serializer
-	se.workerWg.Add(numWorkers)
-	for range numWorkers {
-		go se.worker()
+		// pipeline: Submit → jobCh → workers (quantize+codec) → resCh → serializer (per-block dedup+append)
+		// shutdown is driven from Finish: close(jobCh) drains workers, then close(resCh) drains serializer
+		se.workerWg.Add(numWorkers)
+		for range numWorkers {
+			go se.worker()
+		}
+		go se.serializer()
 	}
-	go se.serializer()
 
 	return se, nil
 }
@@ -266,10 +273,12 @@ func (s *StreamingEncoder) Submit(t Tile) error {
 func (s *StreamingEncoder) Finish() error {
 	var err error
 	s.finishing.Do(func() {
-		close(s.jobCh)
-		s.workerWg.Wait()
-		close(s.resCh)
-		<-s.serializerDone
+		if !s.opts.SkipInternalWorkers {
+			close(s.jobCh)
+			s.workerWg.Wait()
+			close(s.resCh)
+			<-s.serializerDone
+		}
 		s.closed = true
 
 		if e := s.checkErr(); e != nil {
@@ -428,10 +437,12 @@ func (s *StreamingEncoder) Finish() error {
 func (s *StreamingEncoder) Close() error {
 	s.finishing.Do(func() {
 		s.setErr(errors.New("streaming encoder closed without Finish"))
-		close(s.jobCh)
-		s.workerWg.Wait()
-		close(s.resCh)
-		<-s.serializerDone
+		if !s.opts.SkipInternalWorkers {
+			close(s.jobCh)
+			s.workerWg.Wait()
+			close(s.resCh)
+			<-s.serializerDone
+		}
 		s.closed = true
 		s.cleanupOnErr()
 	})

@@ -18,10 +18,10 @@ func makeGrid() *parser.GRIBFile {
 	for j := range nx {
 		lons[j] = -10 + float64(j)
 	}
-	data := make([]float64, nx*ny)
+	data := make([]float32, nx*ny)
 	for r := range ny {
 		for c := range nx {
-			data[r*nx+c] = lats[r] + 0.1*lons[c]
+			data[r*nx+c] = float32(lats[r] + 0.1*lons[c])
 		}
 	}
 	return &parser.GRIBFile{
@@ -91,7 +91,7 @@ func TestNorthDownGridSampler(t *testing.T) {
 	}
 	g.Header.DistinctLatitudes = rev
 	rowBytes := g.Header.Nx
-	revData := make([]float64, len(g.DataValues))
+	revData := make([]float32, len(g.DataValues))
 	for r := range g.Header.Ny {
 		copy(revData[r*rowBytes:(r+1)*rowBytes],
 			g.DataValues[(g.Header.Ny-1-r)*rowBytes:(g.Header.Ny-r)*rowBytes])

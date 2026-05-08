@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/DataDog/zstd"
 	"github.com/hstin-de/wmtiles/bitshuffle"
@@ -72,6 +73,18 @@ type samplerState struct {
 	deltaWins      int
 	lorenzoWins    int
 	winner         byte
+}
+
+// SharedSampler holds bandit state shared across encoders so concurrent
+// goroutines encoding tiles for the same variable run the sampling phase
+// once globally instead of once per worker.
+type SharedSampler struct {
+	mu     sync.Mutex
+	states map[string]*samplerState
+}
+
+func NewSharedSampler() *SharedSampler {
+	return &SharedSampler{states: map[string]*samplerState{}}
 }
 
 func (e *Encoder) Close() error {
@@ -181,6 +194,84 @@ func (e *Encoder) EncodeBest(quantized []byte, p quantize.Params, nPixels int) [
 			best = alt
 		}
 	}
+	return best
+}
+
+// EncodeBestShared is EncodeBestSampled with bandit state coordinated across
+// goroutines via shared.
+func (e *Encoder) EncodeBestShared(quantized []byte, p quantize.Params, nPixels int, key string, shared *SharedSampler) []byte {
+	if shared == nil {
+		return e.EncodeBestSampled(quantized, p, nPixels, key)
+	}
+	if isConstant(quantized, p.DType.Bytes()) {
+		return encodeConstant(quantized[:p.DType.Bytes()])
+	}
+	if p.DType == quantize.DTypeF32 || !e.allowDelta {
+		return e.encodeBitshuffleZstd(quantized, p, nPixels)
+	}
+
+	shared.mu.Lock()
+	s, ok := shared.states[key]
+	if !ok {
+		s = &samplerState{mode: samplerModeSample, winner: IDBitshuffleZstd}
+		shared.states[key] = s
+	}
+	mode, winner := s.mode, s.winner
+	shared.mu.Unlock()
+
+	if mode == samplerModeExploit {
+		switch winner {
+		case IDDeltaZstd:
+			return e.encodeDeltaZstd(quantized, p, nPixels)
+		case IDLorenzoZstd:
+			if blob := e.encodeLorenzoZstd(quantized, p, nPixels); blob != nil {
+				return blob
+			}
+			return e.encodeBitshuffleZstd(quantized, p, nPixels)
+		default:
+			return e.encodeBitshuffleZstd(quantized, p, nPixels)
+		}
+	}
+
+	bs := e.encodeBitshuffleZstd(quantized, p, nPixels)
+	dz := e.encodeDeltaZstd(quantized, p, nPixels)
+	lz := e.encodeLorenzoZstd(quantized, p, nPixels)
+
+	best := bs
+	bestID := byte(IDBitshuffleZstd)
+	if len(dz) < len(best) {
+		best = dz
+		bestID = IDDeltaZstd
+	}
+	if lz != nil && len(lz) < len(best) {
+		best = lz
+		bestID = IDLorenzoZstd
+	}
+
+	shared.mu.Lock()
+	switch bestID {
+	case IDLorenzoZstd:
+		s.lorenzoWins++
+	case IDDeltaZstd:
+		s.deltaWins++
+	default:
+		s.bitshuffleWins++
+	}
+	s.countInPhase++
+	if s.countInPhase >= samplerSampleSize {
+		s.winner = IDBitshuffleZstd
+		bestCount := s.bitshuffleWins
+		if s.deltaWins > bestCount {
+			s.winner = IDDeltaZstd
+			bestCount = s.deltaWins
+		}
+		if s.lorenzoWins > bestCount {
+			s.winner = IDLorenzoZstd
+		}
+		s.mode = samplerModeExploit
+		s.countInPhase = 0
+	}
+	shared.mu.Unlock()
 	return best
 }
 

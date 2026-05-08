@@ -561,22 +561,27 @@ func (e *Encoder) resolveBlockPrecision(v *varInfo, vmin, vmax float64) float64 
 	return 0
 }
 
-func finiteRange(values []float64, missing float64) (vmin, vmax float64, ok bool) {
-	vmin = math.Inf(+1)
-	vmax = math.Inf(-1)
+func finiteRange(values []float32, missing float64) (vmin, vmax float64, ok bool) {
+	missing32 := float32(missing)
+	mn := float32(math.Inf(+1))
+	mx := float32(math.Inf(-1))
+	hasFin := false
 	for _, v := range values {
-		if v != v || v == missing {
+		if v != v || v == missing32 {
 			continue
 		}
-		if v < vmin {
-			vmin = v
+		if v < mn {
+			mn = v
 		}
-		if v > vmax {
-			vmax = v
+		if v > mx {
+			mx = v
 		}
-		ok = true
+		hasFin = true
 	}
-	return
+	if hasFin {
+		return float64(mn), float64(mx), true
+	}
+	return 0, 0, false
 }
 
 func (in input) forEachHeaderFiltered(want func(shortName string) bool, fn func(parser.GribHeader) error) error {

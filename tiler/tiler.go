@@ -134,6 +134,7 @@ type Sampler struct {
 	latDescend bool
 	lonDescend bool
 	missing    float64
+	missingF32 float32
 
 	uniform  bool
 	lat0     float64
@@ -152,10 +153,11 @@ func NewSampler(g *parser.GRIBFile) *Sampler {
 		return nil
 	}
 	s := &Sampler{
-		g:       g,
-		lats:    g.Header.DistinctLatitudes,
-		lons:    g.Header.DistinctLongitudes,
-		missing: g.Header.MissingValue,
+		g:          g,
+		lats:       g.Header.DistinctLatitudes,
+		lons:       g.Header.DistinctLongitudes,
+		missing:    g.Header.MissingValue,
+		missingF32: float32(g.Header.MissingValue),
 	}
 	s.latDescend = s.lats[0] > s.lats[len(s.lats)-1]
 	s.lonDescend = s.lons[0] > s.lons[len(s.lons)-1]
@@ -253,10 +255,10 @@ func (s *Sampler) At(lat, lon float64) float64 {
 	v10 := s.g.DataValues[row0+x0+1]
 	v01 := s.g.DataValues[row1+x0]
 	v11 := s.g.DataValues[row1+x0+1]
-	if v00 == s.missing || v10 == s.missing || v01 == s.missing || v11 == s.missing {
+	if v00 == s.missingF32 || v10 == s.missingF32 || v01 == s.missingF32 || v11 == s.missingF32 {
 		return math.NaN()
 	}
-	return (1-u)*(1-v)*v00 + u*(1-v)*v10 + (1-u)*v*v01 + u*v*v11
+	return (1-u)*(1-v)*float64(v00) + u*(1-v)*float64(v10) + (1-u)*v*float64(v01) + u*v*float64(v11)
 }
 
 func fracIndex(arr []float64, target float64, descend bool) (float64, bool) {
@@ -395,7 +397,7 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 	nLatM1F := float64(nLatM1)
 	nLonM1F := float64(nLonM1)
 	w := s.g.Header.Nx
-	missing := s.missing
+	missing := s.missingF32
 	data := s.g.DataValues
 	lonGrid0 := s.lonGrid0
 
@@ -460,7 +462,7 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 			}
 			u := colU[c]
 			oneU := 1.0 - u
-			rowOut[c] = float32(oneU*oneV*v00 + u*oneV*v10 + oneU*v*v01 + u*v*v11)
+			rowOut[c] = float32(oneU*oneV*float64(v00) + u*oneV*float64(v10) + oneU*v*float64(v01) + u*v*float64(v11))
 		}
 	}
 }
