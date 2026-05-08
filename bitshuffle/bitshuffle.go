@@ -6,11 +6,14 @@ package bitshuffle
 
 func Encode(src []byte, elemSize, elemCount int, dst []byte) {
 	bytesPerPlane := (elemCount + 7) / 8
-	for i := range dst {
-		dst[i] = 0
+	blockEnd := (elemCount / 8) * 8
+	if blockEnd != elemCount {
+		tailByte := blockEnd / 8
+		for plane := 0; plane < elemSize*8; plane++ {
+			dst[plane*bytesPerPlane+tailByte] = 0
+		}
 	}
 
-	blockEnd := (elemCount / 8) * 8
 	for elem0 := 0; elem0 < blockEnd; elem0 += 8 {
 		byteOff := elem0 / 8
 		for b := 0; b < elemSize; b++ {
@@ -53,11 +56,17 @@ func Encode(src []byte, elemSize, elemCount int, dst []byte) {
 
 func Decode(src []byte, elemSize, elemCount int, dst []byte) {
 	bytesPerPlane := (elemCount + 7) / 8
-	for i := range dst {
-		dst[i] = 0
+	blockEnd := (elemCount / 8) * 8
+	// only the tail uses |= on dst; the fast path overwrites everything else
+	if blockEnd != elemCount {
+		for elem := blockEnd; elem < elemCount; elem++ {
+			base := elem * elemSize
+			for b := 0; b < elemSize; b++ {
+				dst[base+b] = 0
+			}
+		}
 	}
 
-	blockEnd := (elemCount / 8) * 8
 	for elem0 := 0; elem0 < blockEnd; elem0 += 8 {
 		byteOff := elem0 / 8
 		for b := 0; b < elemSize; b++ {
