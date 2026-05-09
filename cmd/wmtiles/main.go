@@ -17,12 +17,27 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "encode":
-		if err := runEncodeGRIB("encode", os.Args[2:]); err != nil {
+		format, rest, err := detectFormat(os.Args[2:])
+		if err != nil {
 			fatal("encode", err)
+		}
+		switch format {
+		case "hdf5":
+			if err := runEncodeHDF5("encode", rest); err != nil {
+				fatal("encode", err)
+			}
+		default:
+			if err := runEncodeGRIB("encode", rest); err != nil {
+				fatal("encode", err)
+			}
 		}
 	case "encode-grib":
 		if err := runEncodeGRIB("encode-grib", os.Args[2:]); err != nil {
 			fatal("encode-grib", err)
+		}
+	case "encode-hdf5":
+		if err := runEncodeHDF5("encode-hdf5", os.Args[2:]); err != nil {
+			fatal("encode-hdf5", err)
 		}
 	case "extend":
 		if err := runExtend(os.Args[2:]); err != nil {
@@ -71,7 +86,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `wmtiles: cloud optimised tiled weather data format
 
 usage:
-  wmtiles encode           <input.grib2> -o out.wmt ... convert a GRIB2 file into a fresh .wmt
+  wmtiles encode           <input>     -o out.wmt ...  convert GRIB2 or HDF5 (auto-detected) into a fresh .wmt
+  wmtiles encode-grib      <input.grib2> -o out.wmt    force GRIB2 encoder
+  wmtiles encode-hdf5      <input.h5|glob> -o out.wmt  force HDF5 encoder (ODIM_H5 or CF/NetCDF4)
   wmtiles extend           <file.wmt> <input.grib2>    append blocks for new (variable, time) pairs
   wmtiles compact          <input.wmt> <output.wmt>    rewrite a file with the snapshot in the cold start window
   wmtiles snapshot-history <file.wmt>                  list active + previous snapshots
@@ -82,10 +99,11 @@ usage:
 
 encode flags:
   -o PATH                  output .wmt path (required)
+  --format FMT             override input format (grib2|hdf5); default = auto-detect by magic bytes / extension
   --min-zoom N             minimum zoom (default 0)
   --max-zoom N             maximum zoom (default 5)
   --tile-size-log2 N       tile size log2 (default 8 = 256 px; allowed 7..10)
-  --filter SHORTNAMES      comma-separated GRIB shortNames to keep (default: all)
+  --filter SHORTNAMES      comma-separated shortNames to keep (default: all)
   --precision NAME=K,...   per variable quantisation precision overrides`)
 }
 

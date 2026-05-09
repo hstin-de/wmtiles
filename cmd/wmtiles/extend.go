@@ -20,17 +20,18 @@ import (
 
 func runExtend(args []string) error {
 	fs := flag.NewFlagSet("extend", flag.ContinueOnError)
-	filterShortNames := fs.String("filter", "", "comma-separated list of GRIB shortNames to keep (default: all)")
+	filterShortNames := fs.String("filter", "", "comma-separated list of shortNames to keep (default: all)")
 	allowReplace := fs.Bool("allow-replace", false, "overwrite existing (variable, time) blocks instead of erroring")
 	precisionOverride := fs.String("precision", "", "per variable quantization precision overrides")
+	formatOverride := fs.String("format", "", "override input format (grib2|hdf5); default = auto-detect")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: wmtiles extend <file.wmt> <input.grib2>")
+		return fmt.Errorf("usage: wmtiles extend <file.wmt> <input.{grib2|h5}> [--format grib2|hdf5]")
 	}
 	wmtPath := fs.Arg(0)
-	gribPath := fs.Arg(1)
+	srcPath := fs.Arg(1)
 	overrides, err := parsePrecisionOverrides(*precisionOverride)
 	if err != nil {
 		return err
@@ -39,15 +40,30 @@ func runExtend(args []string) error {
 	if _, err := os.Stat(wmtPath); err != nil {
 		return err
 	}
-	if _, err := os.Stat(gribPath); err != nil {
+	if _, err := os.Stat(srcPath); err != nil {
 		return err
+	}
+
+	srcFormat := srcFormatGRIB2
+	if *formatOverride != "" {
+		switch strings.ToLower(*formatOverride) {
+		case "hdf5":
+			srcFormat = srcFormatHDF5
+		case "grib2":
+			srcFormat = srcFormatGRIB2
+		default:
+			return fmt.Errorf("--format must be grib2 or hdf5, got %q", *formatOverride)
+		}
+	} else if parser.IsHDF5File(srcPath) {
+		srcFormat = srcFormatHDF5
 	}
 
 	cliSection("WMTiles extend")
 	cliKV("file", wmtPath)
-	cliKV("input", gribPath)
+	cliKV("input", srcPath)
+	cliKV("source format", srcFormat.String())
 	if *filterShortNames == "" {
-		cliKV("filter", "all GRIB shortNames")
+		cliKV("filter", "all shortNames")
 	} else {
 		cliKV("filter", *filterShortNames)
 	}
@@ -65,25 +81,38 @@ func runExtend(args []string) error {
 	cliKVf("tile size", "%d px", pixelSize)
 	r.Close()
 
-	cliSection("Scan GRIB")
-	gribData, err := os.ReadFile(gribPath)
-	if err != nil {
-		return fmt.Errorf("read GRIB: %w", err)
+	cliSection("Scan source")
+	var (
+		parsedMsgs           []parsedMsg
+		bySig                map[varKey]*varInfo
+		allTimes             []time.Time
+		totalSeen, keptSeen  int
+	)
+	switch srcFormat {
+	case srcFormatHDF5:
+		parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err = parseAllHDF5Messages(srcPath, *filterShortNames)
+		if err != nil {
+			return fmt.Errorf("scan HDF5: %w", err)
+		}
+	default:
+		gribData, gerr := os.ReadFile(srcPath)
+		if gerr != nil {
+			return fmt.Errorf("read GRIB: %w", gerr)
+		}
+		gribRanges, gerr := parser.MessageRanges(gribData)
+		if gerr != nil {
+			return fmt.Errorf("scan GRIB: %w", gerr)
+		}
+		parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err = parseAllMessages(gribData, gribRanges, *filterShortNames)
+		if err != nil {
+			return fmt.Errorf("scan GRIB: %w", err)
+		}
 	}
-	gribRanges, err := parser.MessageRanges(gribData)
-	if err != nil {
-		return fmt.Errorf("scan GRIB: %w", err)
-	}
-	parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err := parseAllMessages(gribData, gribRanges, *filterShortNames)
-	if err != nil {
-		return fmt.Errorf("scan GRIB: %w", err)
-	}
-	gribData = nil
 	if keptSeen == 0 {
 		if *filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", *filterShortNames, totalSeen)
 		}
-		return fmt.Errorf("no GRIB messages found in %s", gribPath)
+		return fmt.Errorf("no records found in %s", srcPath)
 	}
 	if len(allTimes) == 0 {
 		return fmt.Errorf("no forecast timestamps?")

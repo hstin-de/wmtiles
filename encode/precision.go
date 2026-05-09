@@ -34,6 +34,15 @@ var precisionByShortName = map[string]float64{
 	"cape": 1, "cin": 1, "mlcape": 1, "mucape": 1, "sbcape": 1,
 
 	"vis": 10,
+
+	"dbzh": 0.5, "dbzv": 0.5, "th": 0.5, "tv": 0.5,
+	"rate": 0.01, "rr": 0.01, "acrr": 0.05,
+	"vrad": 0.1, "vradh": 0.1, "vradv": 0.1, "wrad": 0.1,
+	"zdr":   0.05,
+	"rhohv": 0.005,
+	"phidp": 0.5,
+	"kdp":   0.05,
+	"sqi":   0.005, "snr": 0.1,
 }
 
 var precisionByUnit = map[string]float64{

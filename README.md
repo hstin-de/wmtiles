@@ -4,8 +4,9 @@
 > time-resolved weather data, plus the encoder, reader, library and viewer
 > that go with it.
 
-WMTiles takes a GRIB2 forecast and turns it into one `.wmt` file you can drop
-on any static HTTP host. Browsers stream it tile-by-tile with HTTP Range
+WMTiles takes a weather dataset (GRIB2 forecasts or HDF5 — ODIM_H5 radar
+composites and CF-1.x/NetCDF4 files) and turns it into one `.wmt` file you can
+drop on any static HTTP host. Browsers stream it tile-by-tile with HTTP Range
 requests, with no tile server, no database, no pre-rendering. On local/POSIX
 storage, new forecast hours or variables are appended in place; readers either
 see the previous snapshot or the new one after a crash or torn write.
@@ -58,8 +59,8 @@ WMTiles is the in-between point:
 ### Install
 
 ```sh
-# CLI (Go ≥ 1.26, eccodes for GRIB2 parsing)
-sudo apt install libeccodes-dev   # or `brew install eccodes`
+# CLI (Go ≥ 1.26; eccodes for GRIB2, libhdf5 for HDF5/ODIM_H5/NetCDF4)
+sudo apt install libeccodes-dev libhdf5-dev   # or `brew install eccodes hdf5`
 git clone https://github.com/hstin-de/wmtiles && cd wmtiles
 make                               # builds the wmtiles binary with viewer
 
@@ -70,16 +71,27 @@ npm install wmtiles fzstd
 ### Encode
 
 ```sh
+# GRIB2 forecast (auto-detected by the GRIB magic)
 wmtiles encode forecast.grib2 -o forecast.wmt \
     --min-zoom 0 --max-zoom 6 \
     --filter 2t,10u,10v \
     --precision 2t=0.05,10u=0.1,10v=0.1
+
+# DWD ODIM_H5 radar composite (polar-stere is reprojected to lat-lon at parse time)
+wmtiles encode 'composite_wn_*-hd5' -o radar.wmt --max-zoom 7
+
+# CF-1.x / NetCDF4 file (regular lat-lon coords)
+wmtiles encode model.nc4 -o model.wmt
 ```
+
+The input format is auto-detected by magic bytes (`GRIB` vs `\x89HDF`) with a
+fallback to the file extension. Pass `--format grib2|hdf5` to override.
 
 ### Append a follow-up run
 
 ```sh
-wmtiles extend forecast.wmt next-run.grib2
+wmtiles extend forecast.wmt next-run.grib2     # GRIB2 source
+wmtiles extend radar.wmt next-scan-hd5         # HDF5 source (auto-detected)
 ```
 
 ### Inspect, verify, compact
@@ -178,9 +190,9 @@ pixels := wmt.NewTileBuffer()
 err = wmt.ReadTileInto("2t", 12, decode.Coord(5, 16, 11), pixels)
 ```
 
-Convert one or more source files to a fresh `.wmt`. GRIB2 is the first
-supported input format; the API is format-neutral so later formats can use the
-same workflow.
+Convert one or more source files to a fresh `.wmt`. GRIB2 (via ecCodes) and
+HDF5 (ODIM_H5 radar composites and CF-1.x/NetCDF4 via libhdf5) are supported;
+the API is format-neutral so additional readers can plug in alongside.
 
 ```go
 import "github.com/hstin-de/wmtiles/encode"
@@ -201,6 +213,9 @@ err = enc.AddFile("gfs-f000.grib2", encode.FormatGRIB2)
 err = enc.AddFile("gfs-f001.grib2", encode.FormatGRIB2)
 err = enc.AddBytes("extra.grib2", encode.FormatGRIB2, extraGRIB2)
 
+// HDF5 inputs (ODIM_H5 or CF-1.x) use the same surface:
+err = enc.AddFile("radar-composite-hd5", encode.FormatHDF5)
+
 err = enc.Finish()
 ```
 
@@ -208,11 +223,11 @@ err = enc.Finish()
 variable/time catalog, and writes one fresh `.wmt`. It does not append/extend
 once per input file.
 
-For appending new variable/time blocks to an existing file, the CLI's
-`wmtiles extend` covers the GRIB2 case. Programs that need to drive the
-streaming encoder or appender directly (e.g. for non-GRIB2 inputs) can use the
-lower-level `encoder` subpackage; that path is intentionally outside the
-stable public API.
+For appending new variable/time blocks to an existing file the CLI's
+`wmtiles extend` accepts both GRIB2 and HDF5 sources. Programs that need to
+drive the streaming encoder or appender directly can use the lower-level
+`encoder` subpackage; that path is intentionally outside the stable public
+API.
 
 ---
 
@@ -316,13 +331,15 @@ topic; today this flow targets local filesystems with random writes.
 ## CLI reference
 
 ```
-wmtiles encode           <input.grib2> -o out.wmt …    convert GRIB2 → fresh .wmt
-wmtiles extend           <file.wmt> <input.grib2>      append blocks for new (var, time) pairs
+wmtiles encode           <input> -o out.wmt …          convert GRIB2 or HDF5 → fresh .wmt (auto-detected)
+wmtiles encode-grib      <input.grib2> -o out.wmt      force the GRIB2 encoder
+wmtiles encode-hdf5      <input.h5|glob> -o out.wmt    force the HDF5 encoder (ODIM_H5 or CF/NetCDF4)
+wmtiles extend           <file.wmt> <input>            append blocks for new (var, time) pairs (GRIB2 or HDF5)
 wmtiles compact          <input.wmt> <output.wmt>      rewrite with snapshot in cold-start window
 wmtiles snapshot-history <file.wmt>                    list active + previous snapshots
 wmtiles inspect          <file.wmt>                    dump header + catalog + stats
 wmtiles verify           <file.wmt>                    structural sanity + CRC validation
-wmtiles compare          <input.grib2> <file.wmt> …    pixel-by-pixel fidelity vs. source GRIB
+wmtiles compare          <input> <file.wmt> …          pixel-by-pixel fidelity vs. source (GRIB2 or HDF5)
 wmtiles serve            <file.wmt> [--addr :8080]     bundled web viewer
 ```
 
@@ -331,10 +348,11 @@ wmtiles serve            <file.wmt> [--addr :8080]     bundled web viewer
 | Flag | Default | Meaning |
 |---|---|---|
 | `-o PATH` | (required) | output `.wmt` path |
+| `--format FMT` | auto-detect | `grib2` or `hdf5`; overrides the magic-byte/extension sniff |
 | `--min-zoom N` | `0` | minimum zoom level |
 | `--max-zoom N` | `5` | maximum zoom level |
 | `--tile-size-log2 N` | `8` (256 px) | tile pixel size, allowed `7..10` (128..1024) |
-| `--filter SHORTNAMES` | (none = all) | comma-separated GRIB shortNames to keep |
+| `--filter SHORTNAMES` | (none = all) | comma-separated shortNames to keep (GRIB shortName, ODIM quantity, or CF mapping) |
 | `--precision NAME=K,…` | shortName/unit lookup, then 10-bit auto-cap | quantisation precision overrides; `=0` forces full-range u16 |
 
 ---

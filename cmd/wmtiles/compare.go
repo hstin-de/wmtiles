@@ -22,10 +22,27 @@ import (
 )
 
 type compareFlags struct {
-	gribPath, wmtPath string
-	varFilter         string
-	zoomFilter        int
-	tolOverride       float64
+	srcPath, wmtPath string
+	srcFormat        encodeSrcFormat
+	varFilter        string
+	zoomFilter       int
+	tolOverride      float64
+}
+
+type encodeSrcFormat int
+
+const (
+	srcFormatGRIB2 encodeSrcFormat = iota
+	srcFormatHDF5
+)
+
+func (f encodeSrcFormat) String() string {
+	switch f {
+	case srcFormatHDF5:
+		return "hdf5"
+	default:
+		return "grib2"
+	}
 }
 
 func parseCompareFlags(args []string) (compareFlags, error) {
@@ -33,15 +50,31 @@ func parseCompareFlags(args []string) (compareFlags, error) {
 	varFilter := fs.String("variable", "", "only check this .wmt variable name (default: all)")
 	zoomFilter := fs.Int("zoom", -1, "only check tiles at this zoom level (default: all zooms in the file)")
 	tolOverride := fs.Float64("tolerance", 0, "override per variable tolerance (default: per block scale/2)")
+	formatOverride := fs.String("format", "", "override source format (grib2|hdf5); default = auto-detect")
 	if err := fs.Parse(args); err != nil {
 		return compareFlags{}, err
 	}
 	if fs.NArg() != 2 {
-		return compareFlags{}, fmt.Errorf("usage: wmtiles compare <input.grib2> <file.wmt> [--variable NAME] [--zoom Z] [--tolerance K]")
+		return compareFlags{}, fmt.Errorf("usage: wmtiles compare <input.{grib2|h5}> <file.wmt> [--variable NAME] [--zoom Z] [--tolerance K] [--format grib2|hdf5]")
+	}
+	srcPath := fs.Arg(0)
+	srcFormat := srcFormatGRIB2
+	if *formatOverride != "" {
+		switch strings.ToLower(*formatOverride) {
+		case "hdf5":
+			srcFormat = srcFormatHDF5
+		case "grib2":
+			srcFormat = srcFormatGRIB2
+		default:
+			return compareFlags{}, fmt.Errorf("--format must be grib2 or hdf5, got %q", *formatOverride)
+		}
+	} else if parser.IsHDF5File(srcPath) {
+		srcFormat = srcFormatHDF5
 	}
 	return compareFlags{
-		gribPath:    fs.Arg(0),
+		srcPath:     srcPath,
 		wmtPath:     fs.Arg(1),
+		srcFormat:   srcFormat,
 		varFilter:   *varFilter,
 		zoomFilter:  *zoomFilter,
 		tolOverride: *tolOverride,
@@ -53,7 +86,7 @@ func runCompare(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(flags.gribPath); err != nil {
+	if _, err := os.Stat(flags.srcPath); err != nil {
 		return err
 	}
 
@@ -71,7 +104,8 @@ func runCompare(args []string) error {
 	timeToIdx := buildTimeToIdx(r)
 
 	cliSection("WMTiles compare")
-	cliKV("source GRIB", flags.gribPath)
+	cliKV("source", flags.srcPath)
+	cliKV("source format", flags.srcFormat.String())
 	cliKV("wmtiles file", flags.wmtPath)
 	if flags.varFilter == "" {
 		cliKV("variables", fmt.Sprintf("%d selected", len(wantNames)))
@@ -89,14 +123,14 @@ func runCompare(args []string) error {
 		cliKV("tolerance", "per block scale/2 plus f32 slack")
 	}
 
-	cliSection("Scan GRIB")
-	samplers, err := buildSamplersForVariables(flags.gribPath, wantNames, timeToIdx)
+	cliSection("Scan source")
+	samplers, err := buildSamplersForVariables(flags.srcPath, flags.srcFormat, wantNames, timeToIdx)
 	if err != nil {
 		return err
 	}
 	reportSamplerCoverage(samplers, wantNames, r)
 	if matchedAny(samplers) == 0 {
-		return fmt.Errorf("no .wmt variables found in GRIB; nothing to compare")
+		return fmt.Errorf("no .wmt variables found in source; nothing to compare")
 	}
 
 	totalAddressed := uint64(0)
@@ -476,7 +510,8 @@ func printCompareResults(stats map[string]*accum) bool {
 	return anyFail
 }
 
-func buildSamplersForVariables(path string, want map[string]bool, timeToIdx map[int64]uint32) (map[string]map[uint32]*tiler.Sampler, error) {
+func buildSamplersForVariables(path string, format encodeSrcFormat,
+	want map[string]bool, timeToIdx map[int64]uint32) (map[string]map[uint32]*tiler.Sampler, error) {
 	out := map[string]map[uint32]*tiler.Sampler{}
 	headerName := func(h *parser.GribHeader) string {
 		base := h.ShortName
@@ -485,36 +520,42 @@ func buildSamplersForVariables(path string, want map[string]bool, timeToIdx map[
 		}
 		return base + levelSuffix(h.TypeOfLevel, h.Level, h.BottomLevel)
 	}
-	err := parser.ForEachMessageFiltered(path,
-		func(h *parser.GribHeader) bool {
-			if !want[headerName(h)] {
-				return false
-			}
-			_, ok := timeToIdx[h.ReferenceTime.UnixMilli()]
-			return ok
-		},
-		func(g parser.GRIBFile) error {
-			name := headerName(&g.Header)
-			tIdx, ok := timeToIdx[g.Header.ReferenceTime.UnixMilli()]
-			if !ok {
-				return nil
-			}
-			if out[name] == nil {
-				out[name] = map[uint32]*tiler.Sampler{}
-			}
-			if _, exists := out[name][tIdx]; exists {
-				return nil
-			}
-			gc := g
-			s := tiler.NewSampler(&gc)
-			if s == nil {
-				return fmt.Errorf("variable %q: malformed grid in GRIB", name)
-			}
-			out[name][tIdx] = s
+	keep := func(h *parser.GribHeader) bool {
+		if !want[headerName(h)] {
+			return false
+		}
+		_, ok := timeToIdx[h.ReferenceTime.UnixMilli()]
+		return ok
+	}
+	consume := func(g parser.GRIBFile) error {
+		name := headerName(&g.Header)
+		tIdx, ok := timeToIdx[g.Header.ReferenceTime.UnixMilli()]
+		if !ok {
 			return nil
-		})
+		}
+		if out[name] == nil {
+			out[name] = map[uint32]*tiler.Sampler{}
+		}
+		if _, exists := out[name][tIdx]; exists {
+			return nil
+		}
+		gc := g
+		s := tiler.NewSampler(&gc)
+		if s == nil {
+			return fmt.Errorf("variable %q: malformed grid", name)
+		}
+		out[name][tIdx] = s
+		return nil
+	}
+	var err error
+	switch format {
+	case srcFormatHDF5:
+		err = parser.ForEachHDF5MessageFiltered(path, keep, consume)
+	default:
+		err = parser.ForEachMessageFiltered(path, keep, consume)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("scan grib: %w", err)
+		return nil, fmt.Errorf("scan %s: %w", format, err)
 	}
 	return out, nil
 }

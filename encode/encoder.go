@@ -22,6 +22,9 @@ type Format string
 const (
 	// FormatGRIB2 reads GRIB edition 2 messages through ecCodes.
 	FormatGRIB2 Format = "grib2"
+	// FormatHDF5 reads ODIM_H5 radar composites and CF-1.x HDF5/NetCDF4 files via
+	// libhdf5. ODIM polar-stere grids are resampled to regular lat-lon at parse.
+	FormatHDF5 Format = "hdf5"
 )
 
 // Options configures source-data-to-WMT encoding.
@@ -47,6 +50,9 @@ type Options struct {
 
 	// DisableDeltaCodec skips the slower delta/Lorenzo codec candidates.
 	DisableDeltaCodec bool
+
+	// ZstdLevel sets the per-tile libzstd level (1..22). 0 = encoder default (3).
+	ZstdLevel int
 
 	// AllowDuplicateMessages lets Finish ignore repeated records/messages for
 	// the same resolved variable and valid time. By default duplicates are an
@@ -183,6 +189,7 @@ func (e *Encoder) Finish() error {
 		CreationTime:          e.opts.CreationTime,
 		OnPixelsConsumed:      tiler.PutTileBuf,
 		DisableDeltaCodec:     e.opts.DisableDeltaCodec,
+		ZstdLevel:             e.opts.ZstdLevel,
 	}, e.outPath)
 	if err != nil {
 		return fmt.Errorf("wmtiles/encode: encoder init: %w", err)
@@ -591,6 +598,11 @@ func (in input) forEachHeaderFiltered(want func(shortName string) bool, fn func(
 			return parser.ForEachMessageHeaderFiltered(in.path, want, fn)
 		}
 		return parser.ForEachMessageHeaderBytesFiltered(in.data, want, fn)
+	case FormatHDF5:
+		if in.path != "" {
+			return parser.ForEachHDF5HeaderFiltered(in.path, want, fn)
+		}
+		return parser.ForEachHDF5HeaderBytesFiltered(in.data, want, fn)
 	default:
 		return unsupportedFormatError(in.format)
 	}
@@ -603,6 +615,11 @@ func (in input) forEachMessageFiltered(want func(*parser.GribHeader) bool, fn fu
 			return parser.ForEachMessageFiltered(in.path, want, fn)
 		}
 		return parser.ForEachMessageBytesFiltered(in.data, want, fn)
+	case FormatHDF5:
+		if in.path != "" {
+			return parser.ForEachHDF5MessageFiltered(in.path, want, fn)
+		}
+		return parser.ForEachHDF5MessageBytesFiltered(in.data, want, fn)
 	default:
 		return unsupportedFormatError(in.format)
 	}
@@ -631,7 +648,7 @@ func tileSize(size int) (int, error) {
 
 func validateFormat(format Format) error {
 	switch format {
-	case FormatGRIB2:
+	case FormatGRIB2, FormatHDF5:
 		return nil
 	default:
 		return unsupportedFormatError(format)

@@ -19,7 +19,10 @@ RUN bun -F wmtiles build \
 # codes_get_float_array (added in eccodes 2.31).
 FROM golang:1.26-trixie AS build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libeccodes-dev pkg-config \
+ && apt-get install -y --no-install-recommends \
+        libeccodes-dev \
+        libhdf5-dev \
+        pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -48,6 +51,8 @@ FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         libeccodes0 \
+        libhdf5-310 \
+        libhdf5-hl-310 \
         ca-certificates \
         curl \
  && rm -rf /var/lib/apt/lists/*
