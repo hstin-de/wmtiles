@@ -3,7 +3,7 @@ package parser
 // thin cgo wrapper over libhdf5; entry point for ODIM_H5 and CF/NetCDF4 readers
 
 /*
-#cgo LDFLAGS: -lhdf5
+#cgo pkg-config: hdf5
 #include "wmt_hdf5.h"
 #include <stdlib.h>
 */

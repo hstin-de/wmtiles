@@ -4,7 +4,7 @@
 package cfsynth
 
 /*
-#cgo LDFLAGS: -lhdf5
+#cgo pkg-config: hdf5
 #include <hdf5.h>
 #include <stdlib.h>
 #include <string.h>
