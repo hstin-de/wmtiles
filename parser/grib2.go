@@ -6,7 +6,7 @@ package parser
 /*
 #cgo CFLAGS: -I/usr/include/x86_64-linux-gnu/
 #cgo LDFLAGS: -leccodes
-#include "eccodes.h"
+#include "wmt_eccodes.h"
 #include <stdio.h>
 #include <stdlib.h>
 */
@@ -518,50 +518,28 @@ func forEachHandleBytes(data []byte, fn func(*C.codes_handle) error) error {
 }
 
 func extractHeaderScalars(gid *C.codes_handle) (GribHeader, error) {
-	nx := getLong(gid, "Ni")
-	ny := getLong(gid, "Nj")
-	la1 := getDouble(gid, "latitudeOfFirstGridPointInDegrees")
-	la2 := getDouble(gid, "latitudeOfLastGridPointInDegrees")
-	lo1 := getDouble(gid, "longitudeOfFirstGridPointInDegrees")
-	lo2 := getDouble(gid, "longitudeOfLastGridPointInDegrees")
-	dx := getDouble(gid, "iDirectionIncrement")
-	dy := getDouble(gid, "jDirectionIncrement")
-	basicAngle := getDouble(gid, "basicAngleOfTheInitialProductionDomain")
-	subdivisions := getDouble(gid, "subdivisionsOfBasicAngle")
-	missingValue := getDouble(gid, "missingValue")
+	var sc C.wmt_scalars_t
+	C.wmt_read_scalars(gid, &sc)
+	return scalarsToHeader(&sc)
+}
 
+func scalarsToHeader(sc *C.wmt_scalars_t) (GribHeader, error) {
 	scale := 1e6
-	if basicAngle != 0 {
-		scale = float64(basicAngle) / float64(subdivisions)
+	if sc.basicAngle != 0 {
+		scale = float64(sc.basicAngle) / float64(sc.subdivisions)
 	}
 
-	year := getLong(gid, "year")
-	month := getLong(gid, "month")
-	day := getLong(gid, "day")
-	hour := getLong(gid, "hour")
-	minute := getLong(gid, "minute")
-	second := getLong(gid, "second")
-	timeUnit := getLong(gid, "indicatorOfUnitOfTimeRange")
-	forecastTime := getLong(gid, "forecastTime")
-	endStep := getLong(gid, "endStep")
-	scanMode := getLong(gid, "scanMode")
-	discipline := getLong(gid, "discipline")
-	parameterCategory := getLong(gid, "parameterCategory")
-	parameterNumber := getLong(gid, "parameterNumber")
+	gribType := int32((int64(sc.discipline) & 0xFF) |
+		((int64(sc.parameterCategory) & 0xFF) << 8) |
+		((int64(sc.parameterNumber) & 0xFF) << 16))
 
-	gribType := int32((discipline & 0xFF) | ((parameterCategory & 0xFF) << 8) | ((parameterNumber & 0xFF) << 16))
+	referenceTime := time.Date(int(sc.year), time.Month(sc.month), int(sc.day),
+		int(sc.hour), int(sc.minute), int(sc.second), 0, time.UTC)
 
-	shortName := getString(gid, "shortName")
-	units := getString(gid, "units")
-	typeOfLevel := getString(gid, "typeOfLevel")
-	level := getLong(gid, "level")
-	bottomLevel := getLong(gid, "bottomLevel")
-
-	referenceTime := time.Date(int(year), time.Month(month), int(day), int(hour), int(minute), int(second), 0, time.UTC)
-
-	// GRIB2 Code Table 4.4: indicatorOfUnitOfTimeRange
+	// GRIB2 Code Table 4.4
+	forecastTime := int64(sc.forecastTime)
 	var forecastDuration time.Duration
-	switch timeUnit {
+	switch sc.timeUnit {
 	case 0:
 		forecastDuration = time.Duration(forecastTime) * time.Minute
 	case 1:
@@ -588,33 +566,76 @@ func extractHeaderScalars(gid *C.codes_handle) (GribHeader, error) {
 		forecastDuration = time.Duration(forecastTime) * time.Second
 	case 255:
 	default:
-		return GribHeader{}, fmt.Errorf("unsupported time unit: %d", timeUnit)
+		return GribHeader{}, fmt.Errorf("unsupported time unit: %d", int(sc.timeUnit))
 	}
 
 	return GribHeader{
 		Type:              gribType,
-		ShortName:         shortName,
-		Units:             units,
-		Nx:                int(nx),
-		Ny:                int(ny),
-		La1:               float64(la1),
-		La2:               float64(la2),
-		Lo1:               float64(lo1),
-		Lo2:               float64(lo2),
-		DX:                float64(dx) / scale,
-		DY:                float64(dy) / scale,
-		ScanMode:          int(scanMode),
-		Discipline:        int(discipline),
-		ParameterCategory: int(parameterCategory),
-		ParameterNumber:   int(parameterNumber),
+		ShortName:         C.GoString(&sc.shortName[0]),
+		Units:             C.GoString(&sc.units[0]),
+		Nx:                int(sc.ni),
+		Ny:                int(sc.nj),
+		La1:               float64(sc.la1),
+		La2:               float64(sc.la2),
+		Lo1:               float64(sc.lo1),
+		Lo2:               float64(sc.lo2),
+		DX:                float64(sc.dx) / scale,
+		DY:                float64(sc.dy) / scale,
+		Discipline:        int(sc.discipline),
+		ParameterCategory: int(sc.parameterCategory),
+		ParameterNumber:   int(sc.parameterNumber),
 		ReferenceTime:     referenceTime.Add(forecastDuration),
 		ForecastTime:      int(forecastTime),
-		EndStep:           int(endStep),
-		MissingValue:      float64(missingValue),
-		TypeOfLevel:       typeOfLevel,
-		Level:             int(level),
-		BottomLevel:       int(bottomLevel),
+		MissingValue:      float64(sc.missingValue),
+		TypeOfLevel:       C.GoString(&sc.typeOfLevel[0]),
+		Level:             int(sc.level),
+		BottomLevel:       int(sc.bottomLevel),
 	}, nil
+}
+
+func attachDistinct(h *GribHeader, msg []byte) error {
+	sig := gridSig{nx: h.Nx, ny: h.Ny, la1: h.La1, la2: h.La2, lo1: h.Lo1, lo2: h.Lo2}
+	distinctCacheMu.Lock()
+	dc, ok := distinctCache[sig]
+	if ok {
+		distinctCacheMu.Unlock()
+		<-dc.ready
+		h.DistinctLatitudes = dc.lats
+		h.DistinctLongitudes = dc.lons
+		return nil
+	}
+	dc = &distinctCoords{ready: make(chan struct{})}
+	distinctCache[sig] = dc
+	distinctCacheMu.Unlock()
+
+	gid := C.codes_handle_new_from_message(
+		C.codes_context_get_default(),
+		unsafe.Pointer(&msg[0]),
+		C.size_t(len(msg)),
+	)
+	if gid == nil {
+		distinctCacheMu.Lock()
+		delete(distinctCache, sig)
+		distinctCacheMu.Unlock()
+		close(dc.ready)
+		return errors.New("codes_handle_new_from_message returned nil (distinct)")
+	}
+	lats := make([]float64, h.Ny)
+	getDoubleArray(gid, "distinctLatitudes", lats)
+	lons := make([]float64, h.Nx)
+	getDoubleArray(gid, "distinctLongitudes", lons)
+	C.codes_handle_delete(gid)
+	if h.Ny > 1 && h.La2 < h.La1 && lats[len(lats)-1] > lats[0] {
+		for i, j := 0, len(lats)-1; i < j; i, j = i+1, j-1 {
+			lats[i], lats[j] = lats[j], lats[i]
+		}
+	}
+	dc.lats = lats
+	dc.lons = lons
+	close(dc.ready)
+	h.DistinctLatitudes = lats
+	h.DistinctLongitudes = lons
+	return nil
 }
 
 // gridSig identifies a regular_ll-style coordinate grid: messages with identical

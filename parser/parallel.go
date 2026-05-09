@@ -1,7 +1,9 @@
 package parser
 
 /*
-#include "eccodes.h"
+#cgo CFLAGS: -I/usr/include/x86_64-linux-gnu/
+#cgo LDFLAGS: -leccodes
+#include "wmt_eccodes.h"
 */
 import "C"
 
@@ -18,8 +20,6 @@ type MessageRange struct {
 	Length int
 }
 
-// MessageRanges scans GRIB2 message boundaries without cgo, so the results
-// can drive a parallel parser pool.
 func MessageRanges(data []byte) ([]MessageRange, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty grib data")
@@ -54,7 +54,6 @@ func MessageRanges(data []byte) ([]MessageRange, error) {
 	}
 }
 
-// ParseHeaderBytes decodes header scalars from a single GRIB2 message.
 func ParseHeaderBytes(msg []byte) (GribHeader, error) {
 	if len(msg) == 0 {
 		return GribHeader{}, errors.New("empty grib message")
@@ -71,7 +70,6 @@ func ParseHeaderBytes(msg []byte) (GribHeader, error) {
 	return extractHeaderScalars(gid)
 }
 
-// ParseFullBytes decodes header and values from a single GRIB2 message.
 func ParseFullBytes(msg []byte) (GRIBFile, error) {
 	if len(msg) == 0 {
 		return GRIBFile{}, errors.New("empty grib message")
@@ -86,6 +84,55 @@ func ParseFullBytes(msg []byte) (GRIBFile, error) {
 	}
 	defer C.codes_handle_delete(gid)
 	return processHandle(gid)
+}
+
+// ParseMessage decodes a GRIB2 message, preferring the pure-Go fast path
+// and falling back to eccodes for unsupported templates. scratch may be nil.
+func ParseMessage(msg []byte, scratch []float32) (GRIBFile, []float32, error) {
+	if len(msg) == 0 {
+		return GRIBFile{}, scratch, errors.New("empty grib message")
+	}
+	if g, vals, ok, err := FastDecodeRegularLL(msg, scratch); err != nil {
+		return GRIBFile{}, scratch, err
+	} else if ok {
+		return g, vals, nil
+	}
+	var sc C.wmt_scalars_t
+	var got C.size_t
+	values := scratch
+	if cap(values) == 0 {
+		values = make([]float32, 1<<20)
+	} else {
+		values = values[:cap(values)]
+	}
+	for {
+		rc := C.wmt_decode_full(
+			nil,
+			unsafe.Pointer(&msg[0]), C.size_t(len(msg)),
+			&sc, (*C.float)(unsafe.Pointer(&values[0])), C.size_t(cap(values)), &got,
+		)
+		if rc == 0 {
+			break
+		}
+		if rc == -2 {
+			n := int(sc.ni) * int(sc.nj)
+			if n <= cap(values) || n <= 0 {
+				return GRIBFile{}, scratch, fmt.Errorf("wmt_decode_full reported -2 but cap=%d, ni*nj=%d", cap(values), n)
+			}
+			values = make([]float32, n)
+			continue
+		}
+		return GRIBFile{}, scratch, fmt.Errorf("wmt_decode_full failed: %d", int(rc))
+	}
+	h, err := scalarsToHeader(&sc)
+	if err != nil {
+		return GRIBFile{}, scratch, err
+	}
+	values = values[:int(got)]
+	if err := attachDistinct(&h, msg); err != nil {
+		return GRIBFile{}, scratch, err
+	}
+	return GRIBFile{Header: h, DataValues: values}, values, nil
 }
 
 // ParseValuesBytes decodes the values array from a GRIB2 message and attaches

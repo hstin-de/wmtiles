@@ -2,6 +2,7 @@
 *.wmt
 ./data/*.grib2
 ./data/*.wmt
+*hd5
 
 # JS/TS workspace
 node_modules/

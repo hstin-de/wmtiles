@@ -7,12 +7,49 @@ import (
 	"github.com/hstin-de/wmtiles/parser"
 )
 
-// pool of [pixSize*pixSize]float32 tile buffers; the encoder is the last reader
-// (quantize copies the values out), so it can return the slice via PutTileBuf
-// once it's done with it. *[]float32 (not []float32) avoids the per-Put boxing
-// alloc that bare slices in sync.Pool incur.
+// *[]float32 (not []float32) avoids the per-Put boxing alloc bare slices
+// in sync.Pool incur.
 var tileBufPool = sync.Pool{
 	New: func() any { return (*[]float32)(nil) },
+}
+
+type tileScratch struct {
+	lats, lons []float64
+	colX0      []int32
+	colU       []float32
+}
+
+var tileScratchPool = sync.Pool{
+	New: func() any { return &tileScratch{} },
+}
+
+func getTileScratch(pixSize int) *tileScratch {
+	s := tileScratchPool.Get().(*tileScratch)
+	if cap(s.lats) < pixSize {
+		s.lats = make([]float64, pixSize)
+	} else {
+		s.lats = s.lats[:pixSize]
+	}
+	if cap(s.lons) < pixSize {
+		s.lons = make([]float64, pixSize)
+	} else {
+		s.lons = s.lons[:pixSize]
+	}
+	if cap(s.colX0) < pixSize {
+		s.colX0 = make([]int32, pixSize)
+	} else {
+		s.colX0 = s.colX0[:pixSize]
+	}
+	if cap(s.colU) < pixSize {
+		s.colU = make([]float32, pixSize)
+	} else {
+		s.colU = s.colU[:pixSize]
+	}
+	return s
+}
+
+func putTileScratch(s *tileScratch) {
+	tileScratchPool.Put(s)
 }
 
 func getTileBuf(n int) []float32 {
@@ -310,8 +347,10 @@ func fracIndex(arr []float64, target float64, descend bool) (float64, bool) {
 }
 
 func Tile(s *Sampler, z uint8, x, y uint32, pixSize int) []float32 {
-	lats := make([]float64, pixSize)
-	lons := make([]float64, pixSize)
+	ts := getTileScratch(pixSize)
+	defer putTileScratch(ts)
+	lats := ts.lats
+	lons := ts.lons
 	TileLats(z, y, pixSize, lats)
 	TileLons(z, x, pixSize, lons)
 
@@ -358,7 +397,7 @@ func Tile(s *Sampler, z uint8, x, y uint32, pixSize int) []float32 {
 
 	out := getTileBuf(pixSize * pixSize)
 	if s.uniform {
-		fillTileUniform(s, lats, lons, out, pixSize)
+		fillTileUniformScratch(s, lats, lons, out, pixSize, ts.colX0, ts.colU)
 	} else {
 		fillTileGeneric(s, lats, lons, out, pixSize)
 	}
@@ -381,12 +420,7 @@ func fillTileGeneric(s *Sampler, lats, lons []float64, out []float32, pixSize in
 	}
 }
 
-// fillTileUniform is the hot path: ~99% of real-world GRIB grids are uniform
-// regular_ll. precomputes per-column indices once per tile, then hoists per-row
-// invariants (yFrac, y0, v, row offsets) out of the inner pixel loop. previously
-// Sampler.At recomputed all of that per-pixel — 65k redundant evaluations per
-// tile and 36% of total CPU at scale.
-func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize int) {
+func fillTileUniformScratch(s *Sampler, lats, lons []float64, out []float32, pixSize int, colX0 []int32, colU []float32) {
 	nan := float32(math.NaN())
 	lon0 := s.lon0
 	lat0 := s.lat0
@@ -400,11 +434,7 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 	missing := s.missingF32
 	data := s.g.DataValues
 	lonGrid0 := s.lonGrid0
-
-	// pre-resolve per-column state once; reused across all pixSize rows.
-	// invalid columns are flagged via x0 = -1 so the row loop can branch once
-	colX0 := make([]int32, pixSize)
-	colU := make([]float64, pixSize)
+	c0, c1 := pixSize, 0
 	for c, lon := range lons {
 		if lonGrid0 {
 			if lon < 0 {
@@ -423,7 +453,13 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 			x0 = nLonM1 - 1
 		}
 		colX0[c] = int32(x0)
-		colU[c] = xFrac - float64(x0)
+		colU[c] = float32(xFrac - float64(x0))
+		if c < c0 {
+			c0 = c
+		}
+		if c+1 > c1 {
+			c1 = c + 1
+		}
 	}
 
 	for r, lat := range lats {
@@ -441,12 +477,19 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 		if y0 >= nLatM1 {
 			y0 = nLatM1 - 1
 		}
-		v := yFrac - float64(y0)
-		oneV := 1.0 - v
+		vF := float32(yFrac - float64(y0))
+		oneV := 1 - vF
 		row0 := y0 * w
 		row1 := row0 + w
 
-		for c := range pixSize {
+		for c := 0; c < c0; c++ {
+			rowOut[c] = nan
+		}
+		for c := c1; c < pixSize; c++ {
+			rowOut[c] = nan
+		}
+
+		for c := c0; c < c1; c++ {
 			x0 := int(colX0[c])
 			if x0 < 0 {
 				rowOut[c] = nan
@@ -461,8 +504,10 @@ func fillTileUniform(s *Sampler, lats, lons []float64, out []float32, pixSize in
 				continue
 			}
 			u := colU[c]
-			oneU := 1.0 - u
-			rowOut[c] = float32(oneU*oneV*float64(v00) + u*oneV*float64(v10) + oneU*v*float64(v01) + u*v*float64(v11))
+			oneU := 1 - u
+			top := oneU*v00 + u*v10
+			bot := oneU*v01 + u*v11
+			rowOut[c] = oneV*top + vF*bot
 		}
 	}
 }

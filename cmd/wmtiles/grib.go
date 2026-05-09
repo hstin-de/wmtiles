@@ -165,6 +165,367 @@ type parsedMsg struct {
 	skipMsg bool
 }
 
+// Recycle values buffers across parse → tile → release.
+var valuesPool = sync.Pool{
+	New: func() any { b := make([]float32, 0, 1<<20); return &b },
+}
+
+func getValuesBuf() []float32 {
+	p := valuesPool.Get().(*[]float32)
+	return (*p)[:0]
+}
+
+func putValuesBuf(b []float32) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:0]
+	valuesPool.Put(&b)
+}
+
+// scanHeadersOnly extracts per-message metadata in pure Go (with eccodes
+// fallback) so the encoder can be built up front while the parallel
+// parse + tile + encode pipeline runs.
+func scanHeadersOnly(data []byte, ranges []parser.MessageRange, filterShortNames string) (
+	headers []parser.GribHeader,
+	skip []bool,
+	bySig map[varKey]*varInfo,
+	allTimes []time.Time,
+	bbox [4]float64,
+	totalSeen, keptSeen int,
+	err error,
+) {
+	var keep map[string]bool
+	if filterShortNames != "" {
+		keep = map[string]bool{}
+		for n := range strings.SplitSeq(filterShortNames, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				keep[n] = true
+			}
+		}
+	}
+
+	headers = make([]parser.GribHeader, len(ranges))
+	skip = make([]bool, len(ranges))
+	scanErrs := make([]error, len(ranges))
+
+	numWorkers := max(runtime.GOMAXPROCS(0), 1)
+	idxCh := make(chan int, len(ranges))
+	for i := range ranges {
+		idxCh <- i
+	}
+	close(idxCh)
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for i := range idxCh {
+				r := ranges[i]
+				msg := data[r.Offset : r.Offset+r.Length]
+				h, ok, e := parser.FastScanMetadata(msg)
+				if e != nil {
+					scanErrs[i] = e
+					continue
+				}
+				if !ok {
+					// fall back to eccodes for header read
+					h2, e2 := parser.ParseHeaderBytes(msg)
+					if e2 != nil {
+						scanErrs[i] = e2
+						continue
+					}
+					h = h2
+				}
+				if keep != nil && !keep[h.ShortName] {
+					skip[i] = true
+				}
+				headers[i] = h
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, e := range scanErrs {
+		if e != nil {
+			err = e
+			return
+		}
+	}
+
+	bySig = map[varKey]*varInfo{}
+	timesSeen := map[time.Time]struct{}{}
+	bbox = [4]float64{180, 90, -180, -90}
+	bboxInit := false
+	for i := range headers {
+		totalSeen++
+		if skip[i] {
+			continue
+		}
+		keptSeen++
+		h := &headers[i]
+		k := varKeyOf(h)
+		v, ok := bySig[k]
+		if !ok {
+			base := h.ShortName
+			if base == "" || base == "unknown" {
+				base = fmt.Sprintf("param_%d_%d_%d", k.d, k.c, k.p)
+			}
+			v = &varInfo{
+				name:        base + levelSuffix(k.levelType, k.level, k.bottomLevel),
+				shortName:   h.ShortName,
+				unit:        h.Units,
+				vmin:        math.Inf(+1),
+				vmax:        math.Inf(-1),
+				times:       map[time.Time]struct{}{},
+				precSources: map[string]struct{}{},
+			}
+			bySig[k] = v
+		}
+		v.messageCount++
+		v.times[h.ReferenceTime] = struct{}{}
+
+		shell := parser.GRIBFile{Header: *h}
+		gw, gs, ge, gn := tiler.GridBBox(&shell)
+		if !bboxInit {
+			bbox = [4]float64{gw, gs, ge, gn}
+			bboxInit = true
+		} else {
+			if gw < bbox[0] {
+				bbox[0] = gw
+			}
+			if gs < bbox[1] {
+				bbox[1] = gs
+			}
+			if ge > bbox[2] {
+				bbox[2] = ge
+			}
+			if gn > bbox[3] {
+				bbox[3] = gn
+			}
+		}
+		timesSeen[h.ReferenceTime] = struct{}{}
+	}
+
+	disambiguate := func(suffix func(varKey) string) {
+		counts := map[string]int{}
+		for _, v := range bySig {
+			counts[v.name]++
+		}
+		for k, v := range bySig {
+			if counts[v.name] > 1 {
+				v.name += suffix(k)
+			}
+		}
+	}
+	disambiguate(func(k varKey) string {
+		return fmt.Sprintf("_%d_%d_%d", k.d, k.c, k.p)
+	})
+	disambiguate(func(k varKey) string {
+		return fmt.Sprintf("_%s_%d_%d", k.levelType, k.level, k.bottomLevel)
+	})
+
+	allTimes = make([]time.Time, 0, len(timesSeen))
+	for t := range timesSeen {
+		allTimes = append(allTimes, t)
+	}
+	sort.Slice(allTimes, func(i, j int) bool { return allTimes[i].Before(allTimes[j]) })
+	return
+}
+
+// streamParseAndTile is the pipelined encode worker pool: each worker
+// decodes values, declares the block, samples tiles and submits them.
+func streamParseAndTile(
+	data []byte,
+	ranges []parser.MessageRange,
+	headers []parser.GribHeader,
+	skip []bool,
+	bySig map[varKey]*varInfo,
+	timeIdxByTime map[time.Time]uint32,
+	overrides map[string]float64,
+	sink blockSink,
+	minZoom, maxZoom uint8,
+	pixSize int,
+	onDuplicate func(string, time.Time) error,
+) (int64, int64, error) {
+	numWorkers := max(runtime.GOMAXPROCS(0), 1)
+
+	var submitted, skipped atomic.Int64
+	var firstErr atomic.Value
+	setErr := func(e error) {
+		if e == nil {
+			return
+		}
+		firstErr.CompareAndSwap(nil, e)
+	}
+	getErr := func() error {
+		if v := firstErr.Load(); v != nil {
+			return v.(error)
+		}
+		return nil
+	}
+
+	var declMu sync.Mutex
+	declared := map[vtKey]struct{}{}
+	var varMu sync.Mutex
+
+	keepIdx := make([]int, 0, len(ranges))
+	for i := range ranges {
+		if !skip[i] {
+			keepIdx = append(keepIdx, i)
+		}
+	}
+	idxCh := make(chan int, len(keepIdx))
+	for _, i := range keepIdx {
+		idxCh <- i
+	}
+	close(idxCh)
+
+	ds, _ := sink.(directSinker)
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			var dw *encoder.DirectWorker
+			if ds != nil {
+				w, e := ds.NewDirectWorker()
+				if e != nil {
+					setErr(e)
+					return
+				}
+				defer w.Close()
+				dw = w
+			}
+			scratch := getValuesBuf()
+			for idx := range idxCh {
+				if getErr() != nil {
+					continue
+				}
+				r := ranges[idx]
+				msg := data[r.Offset : r.Offset+r.Length]
+				g, sc, st, fastOK, fastErr := parser.FastDecodeRegularLLStats(msg, scratch[:0])
+				if fastErr != nil {
+					setErr(fastErr)
+					continue
+				}
+				var values []float32
+				var stats parser.Stats
+				if fastOK {
+					values = sc
+					scratch = sc[:0]
+					stats = st
+				} else {
+					gg, _, e := parser.ParseMessage(msg, getValuesBuf())
+					if e != nil {
+						setErr(e)
+						continue
+					}
+					g = gg
+					values = gg.DataValues
+					vmin, vmax, hasFin := finiteRange(values, gg.Header.MissingValue)
+					stats = parser.Stats{Min: vmin, Max: vmax, HasFinite: hasFin}
+				}
+				h := &g.Header
+				if !fastOK {
+					headers[idx] = g.Header
+				}
+				k := varKeyOf(h)
+				v, ok := bySig[k]
+				if !ok {
+					_ = values
+					continue
+				}
+				tIdx, ok := timeIdxByTime[h.ReferenceTime]
+				if !ok {
+					setErr(fmt.Errorf("variable %q time %s: time not in index", v.name, h.ReferenceTime))
+					continue
+				}
+				vt := vtKey{k, tIdx}
+				declMu.Lock()
+				if _, dup := declared[vt]; dup {
+					declMu.Unlock()
+					if onDuplicate != nil {
+						if e := onDuplicate(v.name, h.ReferenceTime); e != nil {
+							setErr(e)
+						}
+					}
+					continue
+				}
+				declared[vt] = struct{}{}
+				declMu.Unlock()
+
+				if !stats.HasFinite {
+					continue
+				}
+				vmin, vmax := stats.Min, stats.Max
+
+				varMu.Lock()
+				if vmin < v.vmin {
+					v.vmin = vmin
+				}
+				if vmax > v.vmax {
+					v.vmax = vmax
+				}
+				v.hasFinite = true
+				precision, src := resolveBlockPrecision(v, vmin, vmax, overrides)
+				if v.precSources == nil {
+					v.precSources = map[string]struct{}{}
+				}
+				v.precSources[src] = struct{}{}
+				varMu.Unlock()
+
+				if e := sink.DeclareBlock(encoder.BlockSpec{
+					Variable:  v.name,
+					TimeStep:  tIdx,
+					ValueMin:  vmin,
+					ValueMax:  vmax,
+					Precision: precision,
+				}); e != nil {
+					setErr(fmt.Errorf("declare block %q t=%d: %w", v.name, tIdx, e))
+					continue
+				}
+
+				gribFile := parser.GRIBFile{Header: *h, DataValues: values}
+				s := tiler.NewSampler(&gribFile)
+				if s == nil {
+					setErr(fmt.Errorf("variable %q time %s: malformed grid", v.name, h.ReferenceTime))
+					continue
+				}
+				for z := minZoom; z <= maxZoom; z++ {
+					for _, c := range tiler.TilesIntersectingGrid(&gribFile, z) {
+						px := tiler.Tile(s, z, c.X, c.Y, pixSize)
+						if px == nil {
+							skipped.Add(1)
+							continue
+						}
+						t := encoder.Tile{
+							Variable: v.name, TimeStep: tIdx,
+							Z: z, X: c.X, Y: c.Y, Pixels: px,
+						}
+						var subErr error
+						if dw != nil {
+							subErr = dw.SubmitDirect(t)
+						} else {
+							subErr = sink.Submit(t)
+						}
+						if subErr != nil {
+							skipped.Add(1)
+							continue
+						}
+						submitted.Add(1)
+					}
+				}
+			}
+			putValuesBuf(scratch)
+		}()
+	}
+	wg.Wait()
+	return submitted.Load(), skipped.Load(), getErr()
+}
+
 // parseAllMessages decodes every GRIB2 message in parallel, returning the
 // per-message cache plus the merged variable/time catalog and bounding box.
 // Filtered-out messages skip the values transfer.
@@ -189,6 +550,34 @@ func parseAllMessages(data []byte, ranges []parser.MessageRange, filterShortName
 	parsed = make([]parsedMsg, len(ranges))
 	parseErrs := make([]error, len(ranges))
 
+	parseOne := func(i int) {
+		r := ranges[i]
+		msg := data[r.Offset : r.Offset+r.Length]
+		if keep != nil {
+			h, e := parser.ParseHeaderBytes(msg)
+			if e != nil {
+				parseErrs[i] = e
+				return
+			}
+			if !keep[h.ShortName] {
+				parsed[i] = parsedMsg{header: h, skipMsg: true}
+				return
+			}
+		}
+		g, _, e := parser.ParseMessage(msg, getValuesBuf())
+		if e != nil {
+			parseErrs[i] = e
+			return
+		}
+		vmin, vmax, hasFin := finiteRange(g.DataValues, g.Header.MissingValue)
+		parsed[i] = parsedMsg{
+			header: g.Header,
+			values: g.DataValues,
+			vmin:   vmin,
+			vmax:   vmax,
+			hasFin: hasFin,
+		}
+	}
 	numWorkers := max(runtime.GOMAXPROCS(0), 1)
 	idxCh := make(chan int, len(ranges))
 	for i := range ranges {
@@ -202,31 +591,7 @@ func parseAllMessages(data []byte, ranges []parser.MessageRange, filterShortName
 		go func() {
 			defer wg.Done()
 			for i := range idxCh {
-				r := ranges[i]
-				if keep != nil {
-					h, e := parser.ParseHeaderBytes(data[r.Offset : r.Offset+r.Length])
-					if e != nil {
-						parseErrs[i] = e
-						continue
-					}
-					if !keep[h.ShortName] {
-						parsed[i] = parsedMsg{header: h, skipMsg: true}
-						continue
-					}
-				}
-				g, e := parser.ParseFullBytes(data[r.Offset : r.Offset+r.Length])
-				if e != nil {
-					parseErrs[i] = e
-					continue
-				}
-				vmin, vmax, hasFin := finiteRange(g.DataValues, g.Header.MissingValue)
-				parsed[i] = parsedMsg{
-					header: g.Header,
-					values: g.DataValues,
-					vmin:   vmin,
-					vmax:   vmax,
-					hasFin: hasFin,
-				}
+				parseOne(i)
 			}
 		}()
 	}
@@ -413,6 +778,7 @@ func tileFromParsed(
 				declMu.Unlock()
 
 				if !m.hasFin {
+					putValuesBuf(m.values)
 					m.values = nil
 					continue
 				}
@@ -439,6 +805,7 @@ func tileFromParsed(
 					Precision: precision,
 				}); e != nil {
 					setErr(fmt.Errorf("declare block %q t=%d: %w", v.name, tIdx, e))
+					putValuesBuf(m.values)
 					m.values = nil
 					continue
 				}
@@ -447,6 +814,7 @@ func tileFromParsed(
 				s := tiler.NewSampler(&gribFile)
 				if s == nil {
 					setErr(fmt.Errorf("variable %q time %s: malformed grid", v.name, m.header.ReferenceTime))
+					putValuesBuf(m.values)
 					m.values = nil
 					continue
 				}
@@ -474,6 +842,7 @@ func tileFromParsed(
 						submitted.Add(1)
 					}
 				}
+				putValuesBuf(m.values)
 				m.values = nil
 			}
 		}()
@@ -667,12 +1036,11 @@ func runEncodeGRIB(command string, args []string) error {
 		return fmt.Errorf("scan grib: %w", err)
 	}
 	tParse := time.Now()
-	parsed, bySig, allTimes, bbox, totalSeen, keptSeen, err := parseAllMessages(data, ranges, flags.filterShortNames)
+	headers, skipMsg, bySig, allTimes, bbox, totalSeen, keptSeen, err := scanHeadersOnly(data, ranges, flags.filterShortNames)
 	if err != nil {
-		return fmt.Errorf("read grib: %w", err)
+		return fmt.Errorf("scan headers: %w", err)
 	}
 	parseDuration := time.Since(tParse)
-	data = nil
 	if keptSeen == 0 {
 		if flags.filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", flags.filterShortNames, totalSeen)
@@ -721,14 +1089,15 @@ func runEncodeGRIB(command string, args []string) error {
 
 	pixSize := 1 << flags.tileSizeLog2
 	t0 := time.Now()
-	submitted, skipped, err := tileFromParsed(parsed, bySig, timeIdxByTime,
-		flags.precisionOverrides, enc,
+	submitted, skipped, err := streamParseAndTile(data, ranges, headers, skipMsg,
+		bySig, timeIdxByTime, flags.precisionOverrides, enc,
 		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize, nil)
 	if err != nil {
 		enc.Close()
 		return fmt.Errorf("tile stream: %w", err)
 	}
 	encodeDuration := time.Since(t0)
+	data = nil
 	cliSection("Tile encoding")
 	cliKV("tiles written", commaInt(submitted))
 	cliKV("tiles skipped", commaInt(skipped))

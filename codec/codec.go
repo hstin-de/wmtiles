@@ -416,8 +416,8 @@ func decodeConstant(payload []byte, p quantize.Params, nPixels int, out []byte) 
 	return nil
 }
 
-// libzstd's CompressLevel overwrites dst (it's a reusable buffer, not an
-// append target), so we can't pre-fill the codec tag — prepend after
+// Returned slice is a fresh allocation; blobs travel across goroutines
+// via resCh and must not alias per-encoder scratch.
 func (e *Encoder) compressWithTag(tag byte, src []byte) []byte {
 	body, err := e.zw.CompressLevel(nil, src, e.level)
 	if err != nil {

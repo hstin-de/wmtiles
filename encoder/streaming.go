@@ -79,9 +79,6 @@ func NewStreamingEncoder(opts Options, outPath string) (*StreamingEncoder, error
 	if opts.TimeCatalog.Count == 0 && len(opts.TimeCatalog.TimestampsMs) == 0 && opts.TimeCatalog.IntervalMs == 0 {
 		return nil, errors.New("time catalog count is zero")
 	}
-	if len(opts.Variables) == 0 {
-		return nil, errors.New("no variables in opts")
-	}
 	if opts.MaxZoom < opts.MinZoom {
 		return nil, fmt.Errorf("max-zoom %d < min-zoom %d", opts.MaxZoom, opts.MinZoom)
 	}
@@ -157,8 +154,35 @@ func NewStreamingEncoder(opts Options, outPath string) (*StreamingEncoder, error
 	return se, nil
 }
 
+// RegisterVariable adds a variable lazily and returns its ID.
+func (s *StreamingEncoder) RegisterVariable(spec VariableSpec) uint16 {
+	s.blockMu.Lock()
+	defer s.blockMu.Unlock()
+	if id, ok := s.idByName[spec.Name]; ok {
+		s.specByName[spec.Name] = spec
+		return id
+	}
+	id := uint16(len(s.variables))
+	s.variables = append(s.variables, format.VariableEntry{
+		VariableID:             id,
+		Name:                   spec.Name,
+		Unit:                   spec.Unit,
+		DefaultDType:           uint8(quantize.DTypeU16),
+		DefaultCodec:           defaultCodec,
+		DefaultPrecisionHint:   spec.Precision,
+		ColormapHint:           spec.ColormapHint,
+		ValueMinObservedGlobal: math.NaN(),
+		ValueMaxObservedGlobal: math.NaN(),
+	})
+	s.idByName[spec.Name] = id
+	s.specByName[spec.Name] = spec
+	return id
+}
+
 func (s *StreamingEncoder) DeclareBlock(spec BlockSpec) error {
+	s.blockMu.RLock()
 	id, ok := s.idByName[spec.Variable]
+	s.blockMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("DeclareBlock: unknown variable %q", spec.Variable)
 	}
