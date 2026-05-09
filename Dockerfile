@@ -15,7 +15,9 @@ RUN bun -F wmtiles build \
  && bun -F wmtiles-viewer build
 
 # Stage 2: CLI binary (Go + cgo + eccodes)
-FROM golang:1.26-bookworm AS build
+# trixie ships libeccodes-dev ≥ 2.36; bookworm only has 2.28, which is missing
+# codes_get_float_array (added in eccodes 2.31).
+FROM golang:1.26-trixie AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libeccodes-dev pkg-config \
  && rm -rf /var/lib/apt/lists/*
@@ -41,7 +43,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -o /out/wmtiles ./cmd/wmtiles/
 
 # Stage 3: runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
