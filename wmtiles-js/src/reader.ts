@@ -6,6 +6,7 @@ import {
   HEADER_SIZE,
   MAX_BLOCK_ROOT,
   SNAPSHOT_TRAILER_SIZE,
+  crc32c,
   decompressInternal,
   findTile,
   lookupBlockTable,
@@ -640,10 +641,23 @@ export class WMT {
 
   private async _loadSnapshot(off: number, length: number): Promise<void> {
     const snapBuf = await this._readAbs(off, length);
+    if (snapBuf.length < SNAPSHOT_TRAILER_SIZE + 128) {
+      throw new FormatError(`snapshot too short (${snapBuf.length} B)`);
+    }
     this._snapshot = parseSnapshotHeader(snapBuf.subarray(0, 128));
-    parseSnapshotTrailer(
-      snapBuf.subarray(snapBuf.length - SNAPSHOT_TRAILER_SIZE),
-    );
+    const trailerOff = snapBuf.length - SNAPSHOT_TRAILER_SIZE;
+    const trailer = parseSnapshotTrailer(snapBuf.subarray(trailerOff));
+    if (trailer.snapshotTotalLength !== snapBuf.length) {
+      throw new FormatError(
+        `snapshot trailer total ${trailer.snapshotTotalLength} != buf ${snapBuf.length}`,
+      );
+    }
+    const got = crc32c(snapBuf.subarray(0, trailerOff));
+    if (got !== trailer.crc32c) {
+      throw new FormatError(
+        `snapshot CRC mismatch: stored=0x${trailer.crc32c.toString(16)} computed=0x${got.toString(16)}`,
+      );
+    }
 
     const sh = this._snapshot;
     const comp = this._header.internalCompression;
