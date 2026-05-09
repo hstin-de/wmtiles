@@ -9,6 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+// the link-iterator and vlen-reclaim APIs got renamed in HDF5 1.12 (with the
+// `_2` suffix). bridge to the legacy spellings on 1.10 (Ubuntu 24.04 ships
+// 1.10.10) so the same source builds on Trixie/Arch/Noble alike.
+#if H5_VERSION_GE(1, 12, 0)
+typedef H5L_info2_t wmt_h5_link_info_t;
+#define WMT_H5LITERATE H5Literate2
+#define WMT_H5VLEN_RECLAIM H5Treclaim
+#else
+typedef H5L_info_t wmt_h5_link_info_t;
+#define WMT_H5LITERATE H5Literate
+#define WMT_H5VLEN_RECLAIM H5Dvlen_reclaim
+#endif
+
 // returns the file id (>=0) on success, -1 on failure. libhdf5 errors silenced
 // so a failed open isn't noise on stderr.
 static inline int64_t wmt_h5_open_ro(const char *path) {
@@ -81,7 +94,7 @@ static inline int wmt_h5_attr_str(int64_t loc, const char *obj_path,
                 out[n] = '\0';
                 rc = 0;
                 aspace = H5Aget_space(attr);
-                H5Treclaim(mtype, aspace, H5P_DEFAULT, &vbuf);
+                WMT_H5VLEN_RECLAIM(mtype, aspace, H5P_DEFAULT, &vbuf);
             }
         } else {
             sz = H5Tget_size(atype);
@@ -252,7 +265,7 @@ typedef struct wmt_h5_link_iter_state {
 } wmt_h5_link_iter_state_t;
 
 static inline herr_t wmt_h5_collect_link_(hid_t group, const char *name,
-                                          const H5L_info2_t *info, void *op_data) {
+                                          const wmt_h5_link_info_t *info, void *op_data) {
     wmt_h5_link_iter_state_t *st;
     size_t n;
     (void)group; (void)info;
@@ -287,8 +300,8 @@ static inline int wmt_h5_list_links(int64_t loc, const char *path,
     H5E_BEGIN_TRY {
         obj = wmt_h5_open_obj_(loc, path);
         if (obj < 0) goto done;
-        H5Literate2(obj, H5_INDEX_NAME, H5_ITER_INC, &idx,
-                    wmt_h5_collect_link_, &st);
+        WMT_H5LITERATE(obj, H5_INDEX_NAME, H5_ITER_INC, &idx,
+                       wmt_h5_collect_link_, &st);
         *bytes_used = st.used;
         *count = st.count;
         rc = 0;
