@@ -13,14 +13,15 @@ import (
 // goroutine can drive a StreamingEncoder or AppendCtx without going through
 // the channel-based worker pool. Not safe to share across goroutines.
 type DirectWorker struct {
-	enc     *StreamingEncoder
-	app     *AppendCtx
-	tcEnc   *codec.Encoder
-	hasher  *blake3.Hasher
-	scratch []byte
-	pixPer  int
-	zstdLvl int
-	delta   bool
+	enc      *StreamingEncoder
+	app      *AppendCtx
+	tcEnc    *codec.Encoder
+	hasher   *blake3.Hasher
+	scratch  []byte
+	pixPer   int
+	zstdLvl  int
+	delta    bool
+	dictMode bool
 }
 
 func (s *StreamingEncoder) NewDirectWorker() (*DirectWorker, error) {
@@ -29,10 +30,11 @@ func (s *StreamingEncoder) NewDirectWorker() (*DirectWorker, error) {
 		return nil, err
 	}
 	return &DirectWorker{
-		enc:    s,
-		tcEnc:  tcEnc,
-		hasher: blake3.New(),
-		pixPer: s.pixPerTile,
+		enc:      s,
+		tcEnc:    tcEnc,
+		hasher:   blake3.New(),
+		pixPer:   s.pixPerTile,
+		dictMode: s.opts.EnableTileDict,
 	}, nil
 }
 
@@ -42,10 +44,11 @@ func (a *AppendCtx) NewDirectAppendWorker() (*DirectWorker, error) {
 		return nil, err
 	}
 	return &DirectWorker{
-		app:    a,
-		tcEnc:  tcEnc,
-		hasher: blake3.New(),
-		pixPer: a.pixPerTile,
+		app:      a,
+		tcEnc:    tcEnc,
+		hasher:   blake3.New(),
+		pixPer:   a.pixPerTile,
+		dictMode: a.enableTileDict,
 	}, nil
 }
 
@@ -146,6 +149,12 @@ func (w *DirectWorker) encodeAndStore(bb *blockBuilder, tid uint64, pixels []flo
 	w.hasher.Write(quant)
 	var key [32]byte
 	w.hasher.Sum(key[:0])
+
+	if w.dictMode {
+		tag, inner := w.tcEnc.EncodeInnerOnly(quant, bb.params, w.pixPer)
+		bb.addEncodedInner(tid, key, tag, inner)
+		return
+	}
 
 	var blob []byte
 	switch {

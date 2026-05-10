@@ -18,11 +18,12 @@ type blockBuilder struct {
 	timeID     uint32
 	variable   string
 
-	params quantize.Params
-	codec  uint8
-	nodata uint32
-	vmin   float64
-	vmax   float64
+	params  quantize.Params
+	codec   uint8
+	nodata  uint32
+	vmin    float64
+	vmax    float64
+	nPixels int
 
 	mu        sync.Mutex
 	dedup     map[[32]byte]dedupVal
@@ -31,13 +32,25 @@ type blockBuilder struct {
 	uniqueLen uint64
 	contents  uint64
 
+	// uniques holds post-transform inner bytes per deduplicated content in
+	// single-pass dict mode; finishBlockDict drains it into tileData. Empty
+	// when dict mode isn't active.
+	uniques []uniqueInner
+
 	rootBytes  []byte
 	leavesBlob []byte
 	hasLeaves  bool
 	rootLen    uint32
+
+	dictBytes []byte
 }
 
-func newBlockBuilder(varID uint16, varName string, timeID uint32, params quantize.Params, defaultCodec uint8) *blockBuilder {
+type uniqueInner struct {
+	tag   byte
+	inner []byte
+}
+
+func newBlockBuilder(varID uint16, varName string, timeID uint32, params quantize.Params, defaultCodec uint8, nPixels int) *blockBuilder {
 	var nodata uint32
 	switch params.DType {
 	case quantize.DTypeU8:
@@ -54,6 +67,7 @@ func newBlockBuilder(varID uint16, varName string, timeID uint32, params quantiz
 		params:     params,
 		codec:      defaultCodec,
 		nodata:     nodata,
+		nPixels:    nPixels,
 		dedup:      make(map[[32]byte]dedupVal),
 	}
 }
@@ -74,10 +88,40 @@ func (b *blockBuilder) addEncoded(tid uint64, key [32]byte, blob []byte) {
 	b.records = append(b.records, recordVal{tid: tid, offset: off, length: ln})
 }
 
-func (b *blockBuilder) finishBlock(comp format.InternalCompression) error {
+// addEncodedInner is the dict-mode counterpart to addEncoded: it stores
+// post-transform bytes in b.uniques and lets finishBlockDict compress later.
+// dedup offsets index into b.uniques until that pass rewrites them.
+func (b *blockBuilder) addEncodedInner(tid uint64, key [32]byte, tag byte, inner []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if v, ok := b.dedup[key]; ok {
+		b.records = append(b.records, recordVal{tid: tid, offset: v.offset, length: v.length})
+		return
+	}
+	idx := uint64(len(b.uniques))
+	b.uniques = append(b.uniques, uniqueInner{tag: tag, inner: inner})
+	b.contents++
+	b.dedup[key] = dedupVal{offset: idx, length: 0}
+	b.records = append(b.records, recordVal{tid: tid, offset: idx, length: 0})
+}
+
+func (b *blockBuilder) finishBlock(comp format.InternalCompression, dictOpts dictOptions) error {
 	if len(b.records) == 0 {
 		return fmt.Errorf("block (var=%d time=%d): no tiles", b.variableID, b.timeID)
 	}
+
+	if len(b.uniques) > 0 {
+		// single-pass dict mode: workers staged inner bytes; train + compress now
+		if err := b.finishBlockDict(dictOpts); err != nil {
+			return fmt.Errorf("block (var=%d time=%d) dict pass: %w", b.variableID, b.timeID, err)
+		}
+	} else if dictOpts.enabled {
+		// two-pass mode: tiles already compressed; peel + recompress with dict
+		if err := b.optimizeWithDict(dictOpts); err != nil {
+			return fmt.Errorf("block (var=%d time=%d) dict pass: %w", b.variableID, b.timeID, err)
+		}
+	}
+
 	// directory entries must be tile-id sorted: FindTile relies on binary search
 	sort.Slice(b.records, func(i, j int) bool { return b.records[i].tid < b.records[j].tid })
 
@@ -112,6 +156,9 @@ func (b *blockBuilder) header() *format.BlockHeader {
 	if b.hasLeaves {
 		flags |= format.BlockFlagHasLeafDirectories
 	}
+	if len(b.dictBytes) > 0 {
+		flags |= format.BlockFlagHasDict
+	}
 	rootOff := uint64(format.BlockHeaderSize)
 	leavesOff := rootOff + uint64(b.rootLen)
 	leavesLen := uint64(len(b.leavesBlob))
@@ -129,6 +176,7 @@ func (b *blockBuilder) header() *format.BlockHeader {
 		BlockFlags:            flags,
 		RootDirectoryOffset:   rootOff,
 		RootDirectoryLength:   b.rootLen,
+		DictLength:            uint32(len(b.dictBytes)),
 		LeafDirectoriesOffset: leavesOff,
 		LeafDirectoriesLength: leavesLen,
 		TileDataOffset:        tileDataOff,
@@ -138,10 +186,9 @@ func (b *blockBuilder) header() *format.BlockHeader {
 	}
 }
 
-// writeBlockTo streams the block layout (header + root dir + leaves + tile data)
-// directly to w, avoiding the need to materialize one giant []byte. for large
-// encodes (e.g. full GFS, 18 GB output) the merged-slice approach doubled peak
-// memory and OOM'd; streaming keeps peak resident at the largest single part
+// writeBlockTo streams the block layout (header, root, leaves, tile data, dict)
+// to w. Streaming keeps peak memory at the largest single part — materialising
+// one merged buffer doubled peak resident set on full GFS encodes and OOM'd.
 func (b *blockBuilder) writeBlockTo(w io.Writer) (int64, error) {
 	var total int64
 	hdr := b.header()
@@ -165,6 +212,13 @@ func (b *blockBuilder) writeBlockTo(w io.Writer) (int64, error) {
 	} else {
 		total += int64(n)
 	}
+	if len(b.dictBytes) > 0 {
+		if n, err := w.Write(b.dictBytes); err != nil {
+			return total + int64(n), err
+		} else {
+			total += int64(n)
+		}
+	}
 	return total, nil
 }
 
@@ -184,7 +238,7 @@ func (b *blockBuilder) blockTableEntry(fileOffset uint64) format.BlockTableEntry
 		VariableID:          b.variableID,
 		TimeID:              b.timeID,
 		BlockOffset:         fileOffset,
-		BlockLength:         uint64(format.BlockHeaderSize) + uint64(b.rootLen) + uint64(len(b.leavesBlob)) + b.uniqueLen,
+		BlockLength:         uint64(format.BlockHeaderSize) + uint64(b.rootLen) + uint64(len(b.leavesBlob)) + b.uniqueLen + uint64(len(b.dictBytes)),
 		DType:               uint8(b.params.DType),
 		Codec:               b.codec,
 		Scale:               b.params.Scale,

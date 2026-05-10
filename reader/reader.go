@@ -59,6 +59,11 @@ type blockCacheEntry struct {
 	header *format.BlockHeader
 	root   []directory.Entry
 
+	// dict is loaded lazily on the first dict-flagged tile read.
+	dictMu     sync.Mutex
+	dictLoaded bool
+	dict       *codec.Dict
+
 	elem *list.Element
 }
 
@@ -325,7 +330,7 @@ func (r *Reader) ReadTile(variable string, t uint32, z uint8, x, y uint32, out [
 }
 
 func (r *Reader) readTileFromBlock(blk format.BlockTableEntry, tid uint64, out []float32) error {
-	hdr, root, err := r.loadBlockHeader(blk.BlockOffset, blk.BlockLength)
+	hdr, root, cacheEntry, err := r.loadBlockHeaderEntry(blk.BlockOffset, blk.BlockLength)
 	if err != nil {
 		return err
 	}
@@ -365,15 +370,62 @@ func (r *Reader) readTileFromBlock(blk format.BlockTableEntry, tid uint64, out [
 	dec := v.(*codec.Decoder)
 	defer r.decoderPool.Put(dec)
 
+	if hdr.BlockFlags&format.BlockFlagHasDict != 0 && hdr.DictLength > 0 {
+		dict, err := r.loadBlockDict(blk.BlockOffset, blk.BlockLength, hdr, cacheEntry)
+		if err != nil {
+			return err
+		}
+		return dec.DecodeToFloat32WithDict(blob, p, r.PixelCount(), dict, out)
+	}
 	return dec.DecodeToFloat32(blob, p, r.PixelCount(), out)
 }
 
+// loadBlockDict reads the dict bytes from the tail of the block on first use
+// and caches the digested processor on the block cache entry.
+func (r *Reader) loadBlockDict(blockOff, blockLen uint64, hdr *format.BlockHeader, ce *blockCacheEntry) (*codec.Dict, error) {
+	ce.dictMu.Lock()
+	if ce.dictLoaded {
+		d := ce.dict
+		ce.dictMu.Unlock()
+		return d, nil
+	}
+	ce.dictMu.Unlock()
+
+	dictOff := hdr.TileDataOffset + hdr.TileDataLength
+	if dictOff+uint64(hdr.DictLength) > blockLen {
+		return nil, fmt.Errorf("block dict: range %d..%d exceeds block length %d",
+			dictOff, dictOff+uint64(hdr.DictLength), blockLen)
+	}
+	raw := make([]byte, hdr.DictLength)
+	if _, err := r.src.ReadAt(raw, int64(blockOff+dictOff)); err != nil {
+		return nil, fmt.Errorf("read block dict: %w", err)
+	}
+	d, err := codec.NewDict(raw, 0)
+	if err != nil {
+		return nil, fmt.Errorf("init block dict: %w", err)
+	}
+	ce.dictMu.Lock()
+	if !ce.dictLoaded {
+		ce.dict = d
+		ce.dictLoaded = true
+	} else {
+		d = ce.dict
+	}
+	ce.dictMu.Unlock()
+	return d, nil
+}
+
 func (r *Reader) loadBlockHeader(blockOff, blockLen uint64) (*format.BlockHeader, []directory.Entry, error) {
+	hdr, root, _, err := r.loadBlockHeaderEntry(blockOff, blockLen)
+	return hdr, root, err
+}
+
+func (r *Reader) loadBlockHeaderEntry(blockOff, blockLen uint64) (*format.BlockHeader, []directory.Entry, *blockCacheEntry, error) {
 	r.cacheMu.Lock()
 	if entry, ok := r.blockCache[blockOff]; ok {
 		r.blockOrder.MoveToBack(entry.elem)
 		r.cacheMu.Unlock()
-		return entry.header, entry.root, nil
+		return entry.header, entry.root, entry, nil
 	}
 	r.cacheMu.Unlock()
 
@@ -385,11 +437,11 @@ func (r *Reader) loadBlockHeader(blockOff, blockLen uint64) (*format.BlockHeader
 	}
 	prefix := make([]byte, initial)
 	if _, err := r.src.ReadAt(prefix, int64(blockOff)); err != nil && err != io.EOF {
-		return nil, nil, fmt.Errorf("read block header+root: %w", err)
+		return nil, nil, nil, fmt.Errorf("read block header+root: %w", err)
 	}
 	hdr, err := format.UnmarshalBlockHeader(prefix[:format.BlockHeaderSize])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	rootEnd := hdr.RootDirectoryOffset + uint64(hdr.RootDirectoryLength)
 	var rootRaw []byte
@@ -398,23 +450,23 @@ func (r *Reader) loadBlockHeader(blockOff, blockLen uint64) (*format.BlockHeader
 	} else {
 		rootRaw = make([]byte, hdr.RootDirectoryLength)
 		if _, err := r.src.ReadAt(rootRaw, int64(blockOff+hdr.RootDirectoryOffset)); err != nil {
-			return nil, nil, fmt.Errorf("read block root: %w", err)
+			return nil, nil, nil, fmt.Errorf("read block root: %w", err)
 		}
 	}
 	rootDecomp, err := format.Decompress(rootRaw, r.Header.InternalCompression)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decompress block root: %w", err)
+		return nil, nil, nil, fmt.Errorf("decompress block root: %w", err)
 	}
 	root, err := directory.Decode(rootDecomp)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse block root: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse block root: %w", err)
 	}
 
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if existing, ok := r.blockCache[blockOff]; ok {
 		r.blockOrder.MoveToBack(existing.elem)
-		return existing.header, existing.root, nil
+		return existing.header, existing.root, existing, nil
 	}
 	entry := &blockCacheEntry{header: hdr, root: root}
 	entry.elem = r.blockOrder.PushBack(blockOff)
@@ -429,7 +481,7 @@ func (r *Reader) loadBlockHeader(blockOff, blockLen uint64) (*format.BlockHeader
 		delete(r.blockCache, oldest.Value.(uint64))
 		r.blockTotal--
 	}
-	return hdr, root, nil
+	return hdr, root, entry, nil
 }
 
 func (r *Reader) loadBlockLeaf(blockOff uint64, hdr *format.BlockHeader, leafOffWithinLeaves uint64, leafLen uint32) ([]directory.Entry, error) {

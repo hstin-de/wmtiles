@@ -33,6 +33,7 @@ type gribEncodeFlags struct {
 	traceProfile       string
 	disableDelta       bool
 	zstdLevel          int
+	enableTileDict     bool
 }
 
 func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, string, error) {
@@ -48,6 +49,7 @@ func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, strin
 	traceProfile := fs.String("trace", "", "write execution trace to file")
 	disableDelta := fs.Bool("disable-delta-codec", false, "force bitshuffle-only encoding; faster but produces larger files (smooth GFS vars can grow ~2×)")
 	zstdLevel := fs.Int("zstd-level", 0, "libzstd compression level (1=fastest..22=best); 0 uses the default (3)")
+	enableTileDict := fs.Bool("tile-dict", false, "train a per-block zstd dictionary; trades encode CPU for ~5-20% smaller blocks on smooth fields")
 	normalizedArgs := normalizeGribEncodeArgs(args)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return gribEncodeFlags{}, "", err
@@ -80,6 +82,7 @@ func parseGribEncodeFlags(command string, args []string) (gribEncodeFlags, strin
 		traceProfile:       *traceProfile,
 		disableDelta:       *disableDelta,
 		zstdLevel:          *zstdLevel,
+		enableTileDict:     *enableTileDict,
 	}, fs.Arg(0), nil
 }
 
@@ -1079,6 +1082,7 @@ func runEncodeGRIB(command string, args []string) error {
 		OnPixelsConsumed:    tiler.PutTileBuf,
 		DisableDeltaCodec:   flags.disableDelta,
 		ZstdLevel:           flags.zstdLevel,
+		EnableTileDict:      flags.enableTileDict,
 		SkipInternalWorkers: true,
 	}
 

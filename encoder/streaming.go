@@ -202,7 +202,7 @@ func (s *StreamingEncoder) DeclareBlock(spec BlockSpec) error {
 	if _, dup := s.blocks[k]; dup {
 		return fmt.Errorf("DeclareBlock %q t=%d: already declared", spec.Variable, spec.TimeStep)
 	}
-	bb := newBlockBuilder(id, spec.Variable, spec.TimeStep, params, defaultCodec)
+	bb := newBlockBuilder(id, spec.Variable, spec.TimeStep, params, defaultCodec, s.pixPerTile)
 	bb.vmin = spec.ValueMin
 	bb.vmax = spec.ValueMax
 	s.blocks[k] = bb
@@ -251,15 +251,24 @@ func (s *StreamingEncoder) worker() {
 		var key [32]byte
 		hasher.Sum(key[:0])
 
-		blob := tcEnc.EncodeBestSampled(quant, bb.params, s.pixPerTile, bb.variable)
-		s.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, blob: blob}
+		if s.opts.EnableTileDict {
+			tag, inner := tcEnc.EncodeInnerOnly(quant, bb.params, s.pixPerTile)
+			s.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, tag: tag, inner: inner}
+		} else {
+			blob := tcEnc.EncodeBestSampled(quant, bb.params, s.pixPerTile, bb.variable)
+			s.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, blob: blob}
+		}
 	}
 }
 
 func (s *StreamingEncoder) serializer() {
 	defer close(s.serializerDone)
 	for et := range s.resCh {
-		et.block.addEncoded(et.tid, et.key, et.blob)
+		if et.inner != nil {
+			et.block.addEncodedInner(et.tid, et.key, et.tag, et.inner)
+		} else {
+			et.block.addEncoded(et.tid, et.key, et.blob)
+		}
 	}
 }
 
@@ -311,13 +320,12 @@ func (s *StreamingEncoder) Finish() error {
 			return
 		}
 
-		for _, k := range s.declarations {
-			bb := s.blocks[k]
-			if e := bb.finishBlock(s.opts.InternalCompression); e != nil {
-				err = e
-				s.cleanupOnErr()
-				return
-			}
+		dictOpts := defaultDictOptions()
+		dictOpts.enabled = s.opts.EnableTileDict
+		if e := finishBlocksParallel(s.declarations, s.blocks, s.opts.InternalCompression, dictOpts); e != nil {
+			err = e
+			s.cleanupOnErr()
+			return
 		}
 
 		if _, e := s.out.Seek(int64(s.cursor), 0); e != nil {

@@ -63,6 +63,11 @@ type Options struct {
 	// when encode wall time matters more than file size
 	DisableDeltaCodec bool
 
+	// EnableTileDict turns on the per-block zstd dictionary pass at finishBlock.
+	// The dict is stored at the end of each block and signalled via
+	// BlockFlagHasDict so readers route through the dict-aware decode path.
+	EnableTileDict bool
+
 	// SkipInternalWorkers disables the channel-based quantize+codec pool;
 	// callers must drive the encoder via DirectWorker.SubmitDirect.
 	SkipInternalWorkers bool
@@ -95,7 +100,11 @@ type encodedTile struct {
 	block *blockBuilder
 	tid   uint64
 	key   [32]byte
+	// no-dict mode: blob is the post-zstd payload (tag/inner unused).
+	// dict mode: inner holds raw quantized bytes with tag = codec ID (blob nil).
 	blob  []byte
+	tag   byte
+	inner []byte
 }
 
 func fitParamsFor(vmin, vmax, precision float64) quantize.Params {

@@ -27,6 +27,9 @@ type AppendOptions struct {
 
 	DisableDeltaCodec bool
 
+	// EnableTileDict — see encoder.Options.EnableTileDict.
+	EnableTileDict bool
+
 	// SkipInternalWorkers disables the channel-based quantize+codec pool;
 	// callers must drive the context via NewDirectAppendWorker.
 	SkipInternalWorkers bool
@@ -45,6 +48,7 @@ type AppendCtx struct {
 	zstdLevel int
 
 	allowDelta          bool
+	enableTileDict      bool
 	skipInternalWorkers bool
 	sharedSampler       *codec.SharedSampler
 
@@ -137,6 +141,7 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 		pixPerTile:           pixPerTile,
 		zstdLevel:            opts.ZstdLevel,
 		allowDelta:           !opts.DisableDeltaCodec,
+		enableTileDict:       opts.EnableTileDict,
 		skipInternalWorkers:  opts.SkipInternalWorkers,
 		variables:            clonedVars,
 		idByName:             idByName,
@@ -364,7 +369,7 @@ func (a *AppendCtx) DeclareBlock(spec BlockSpec) error {
 	if _, exists := a.existingBlocks[k]; exists && !a.allowReplace {
 		return fmt.Errorf("DeclareBlock %q t=%d: block already exists in file (use AllowReplace)", spec.Variable, spec.TimeStep)
 	}
-	bb := newBlockBuilder(id, spec.Variable, spec.TimeStep, params, defaultCodec)
+	bb := newBlockBuilder(id, spec.Variable, spec.TimeStep, params, defaultCodec, a.pixPerTile)
 	bb.vmin = spec.ValueMin
 	bb.vmax = spec.ValueMax
 	a.blocks[k] = bb
@@ -481,13 +486,12 @@ func (a *AppendCtx) Finish() error {
 		}
 
 		comp := a.header.InternalCompression
-		for _, k := range a.declarations {
-			bb := a.blocks[k]
-			if e := bb.finishBlock(comp); e != nil {
-				err = e
-				a.cleanupOnErr()
-				return
-			}
+		dictOpts := defaultDictOptions()
+		dictOpts.enabled = a.enableTileDict
+		if e := finishBlocksParallel(a.declarations, a.blocks, comp, dictOpts); e != nil {
+			err = e
+			a.cleanupOnErr()
+			return
 		}
 
 		newEntries := make([]format.BlockTableEntry, 0, len(a.declarations))

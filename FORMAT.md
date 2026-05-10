@@ -34,7 +34,7 @@ are limited to 255 bytes.
 | Snapshot header size | `128` bytes | Fixed size |
 | Snapshot trailer size | `16` bytes | Fixed size |
 | Snapshot trailer magic | `0xC0FFEE42` | Trailer sentinel |
-| Block format version | `1` | Block-level wire format |
+| Block format version | `2` | Block-level wire format |
 | Block header size | `64` bytes | Fixed size |
 | Block magic | `0xB10CC0DE` | Block header sentinel |
 | Max block root bytes | `16384 - 64` | Compressed root directory limit |
@@ -337,10 +337,10 @@ offsets in the block table are absolute file offsets. Offsets inside a block
 header are relative to the start of that block.
 
 ```text
-+----------------+----------------+---------------------+---------------+
-| Block header   | root directory | optional leaf dirs  | tile data     |
-| 64 B           | compressed     | compressed leaves   | blobs         |
-+----------------+----------------+---------------------+---------------+
++--------------+--------------+--------------------+-----------+----------+
+| Block header | root dir     | optional leaf dirs | tile data | optional |
+| 64 B         | compressed   | compressed leaves  | blobs     | dict     |
++--------------+--------------+--------------------+-----------+----------+
 ```
 
 ### Block Header
@@ -348,11 +348,11 @@ header are relative to the start of that block.
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
 | `0` | 4 | `u32` | Block magic `0xB10CC0DE` |
-| `4` | 2 | `u16` | `block_format_version`, currently `1` |
+| `4` | 2 | `u16` | `block_format_version`, currently `2` |
 | `6` | 2 | `u16` | `block_flags` |
 | `8` | 8 | `u64` | `root_directory_offset`, block-relative |
 | `16` | 4 | `u32` | `root_directory_length`, compressed length |
-| `20` | 4 | bytes | Reserved padding, written as zero |
+| `20` | 4 | `u32` | `dict_length`, compressed-dictionary byte length; `0` if absent |
 | `24` | 8 | `u64` | `leaf_directories_offset`, block-relative; `0` if absent |
 | `32` | 8 | `u64` | `leaf_directories_length` |
 | `40` | 8 | `u64` | `tile_data_offset`, block-relative |
@@ -360,8 +360,26 @@ header are relative to the start of that block.
 | `56` | 4 | `u32` | `num_addressed_tiles` |
 | `60` | 4 | `u32` | `num_directory_entries` |
 
-Block flag bit `0` means the block has leaf directories. Other bits are
-reserved.
+Block flag bits:
+
+| Bit | Name | Meaning |
+|---:|---|---|
+| `0` | `has_leaf_directories` | The block has leaf directories |
+| `1` | `has_dict` | The block carries a per-block zstd dictionary |
+
+Other bits are reserved.
+
+### Per-Block Zstd Dictionary
+
+When `has_dict` is set, `dict_length` dictionary bytes are stored at the tail
+of the block, immediately after `tile_data`. Absolute file offset is
+`block_offset + tile_data_offset + tile_data_length`. The dictionary applies
+to every zstd-based tile codec (`raw_zstd`, `bitshuffle_zstd`, `delta_zstd`,
+`lorenzo_zstd`); only the inner zstd payload is dict-encoded — codec tags are
+unchanged. The constant codec (`0x01`) is unaffected.
+
+The dictionary may be a trained zstd dict (magic `0xEC30A437`) or a raw-content
+prefix. libzstd's `ZSTD_dct_auto` selects the format on load.
 
 The current writer places the root directory immediately after the block header,
 then leaf-directory bytes, then tile data. Readers should use the offsets rather

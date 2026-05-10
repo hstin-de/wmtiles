@@ -9,18 +9,23 @@ const BlockHeaderSize = 64
 
 const BlockMagic uint32 = 0xB10CC0DE
 
-const BlockFormatVersion uint16 = 1
+const BlockFormatVersion uint16 = 2
 
 const (
 	BlockFlagHasLeafDirectories uint16 = 1 << 0
+	BlockFlagHasDict            uint16 = 1 << 1
 )
 
+// When BlockFlagHasDict is set, DictLength bytes are stored at the tail of the
+// block (after tile data). The dict applies to every zstd-based tile codec;
+// only the inner zstd payload is dict-encoded — codec tags are unchanged.
 type BlockHeader struct {
 	BlockFormatVersion uint16
 	BlockFlags         uint16
 
 	RootDirectoryOffset   uint64
 	RootDirectoryLength   uint32
+	DictLength            uint32
 	LeafDirectoriesOffset uint64
 	LeafDirectoriesLength uint64
 	TileDataOffset        uint64
@@ -38,6 +43,7 @@ func MarshalBlockHeader(h *BlockHeader) []byte {
 	binary.LittleEndian.PutUint16(b[6:], h.BlockFlags)
 	binary.LittleEndian.PutUint64(b[8:], h.RootDirectoryOffset)
 	binary.LittleEndian.PutUint32(b[16:], h.RootDirectoryLength)
+	binary.LittleEndian.PutUint32(b[20:], h.DictLength)
 	binary.LittleEndian.PutUint64(b[24:], h.LeafDirectoriesOffset)
 	binary.LittleEndian.PutUint64(b[32:], h.LeafDirectoriesLength)
 	binary.LittleEndian.PutUint64(b[40:], h.TileDataOffset)
@@ -59,6 +65,7 @@ func UnmarshalBlockHeader(b []byte) (*BlockHeader, error) {
 		BlockFlags:            binary.LittleEndian.Uint16(b[6:]),
 		RootDirectoryOffset:   binary.LittleEndian.Uint64(b[8:]),
 		RootDirectoryLength:   binary.LittleEndian.Uint32(b[16:]),
+		DictLength:            binary.LittleEndian.Uint32(b[20:]),
 		LeafDirectoriesOffset: binary.LittleEndian.Uint64(b[24:]),
 		LeafDirectoriesLength: binary.LittleEndian.Uint64(b[32:]),
 		TileDataOffset:        binary.LittleEndian.Uint64(b[40:]),
