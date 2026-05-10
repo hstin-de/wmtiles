@@ -2,6 +2,7 @@ package quantize
 
 import (
 	"math"
+	"unsafe"
 )
 
 type DType uint8
@@ -123,14 +124,20 @@ func DequantizeU8(in []byte, p Params, out []float32) {
 }
 
 func QuantizeU16(values []float32, p Params, out []byte) {
+	n := len(values)
+	if len(out) < 2*n {
+		return
+	}
+	// Alias out as []uint16: one store per pixel. On-disk format is LE u16,
+	// which matches host endianness on all supported targets.
+	dst := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(out)))[:n:n]
 	if p.Scale == 0 {
 		for i, v := range values {
-			var q uint16
 			if isNaN32(v) {
-				q = SentinelU16
+				dst[i] = SentinelU16
+			} else {
+				dst[i] = 0
 			}
-			out[2*i] = byte(q)
-			out[2*i+1] = byte(q >> 8)
 		}
 		return
 	}
@@ -138,22 +145,19 @@ func QuantizeU16(values []float32, p Params, out []byte) {
 	inv32 := float32(1.0 / p.Scale)
 	off32 := float32(p.Offset)
 	for i, v := range values {
-		var q uint16
 		if isNaN32(v) {
-			q = SentinelU16
-		} else {
-			r := (v - off32) * inv32
-			switch {
-			case r <= 0:
-				q = 0
-			case r >= 65534:
-				q = 65534
-			default:
-				q = uint16(r + 0.5)
-			}
+			dst[i] = SentinelU16
+			continue
 		}
-		out[2*i] = byte(q)
-		out[2*i+1] = byte(q >> 8)
+		r := (v - off32) * inv32
+		switch {
+		case r <= 0:
+			dst[i] = 0
+		case r >= 65534:
+			dst[i] = 65534
+		default:
+			dst[i] = uint16(r + 0.5)
+		}
 	}
 }
 

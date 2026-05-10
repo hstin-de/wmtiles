@@ -6,6 +6,7 @@ import (
 	"github.com/hstin-de/wmtiles/codec"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tileid"
+	"github.com/hstin-de/wmtiles/tiler"
 )
 
 // DirectWorker runs quantize, hash and codec inline so a caller-owned
@@ -129,6 +130,98 @@ func (w *DirectWorker) submitToAppend(t Tile) error {
 	return nil
 }
 
+// SubmitTileFused runs the full per-tile pipeline without the float32
+// intermediate buffer: tile+quantize writes u8/u16 directly into scratch.
+// Returns (false, nil) when the tile has no data; returns errFusedNotSupported
+// for f32 blocks or non-uniform grids — caller must fall back.
+func (w *DirectWorker) SubmitTileFused(varName string, tIdx uint32, z uint8, x, y uint32, pixSize int, s *tiler.Sampler) (bool, error) {
+	if w.enc == nil {
+		return false, fmt.Errorf("SubmitTileFused requires a streaming encoder worker")
+	}
+	enc := w.enc
+	if err := enc.checkErr(); err != nil {
+		return false, err
+	}
+	id, ok := enc.idByName[varName]
+	if !ok {
+		return false, fmt.Errorf("SubmitTileFused: unknown variable %q", varName)
+	}
+	if z < enc.opts.MinZoom || z > enc.opts.MaxZoom {
+		return false, fmt.Errorf("SubmitTileFused %s/%d/(%d,%d,%d): zoom out of range [%d, %d]",
+			varName, tIdx, z, x, y, enc.opts.MinZoom, enc.opts.MaxZoom)
+	}
+	if n := uint32(1) << z; x >= n || y >= n {
+		return false, fmt.Errorf("SubmitTileFused %s/%d/(%d,%d,%d): x/y out of range [0, %d) at z=%d",
+			varName, tIdx, z, x, y, n, z)
+	}
+	enc.blockMu.RLock()
+	bb, ok := enc.blocks[blockKey{variableID: id, timeID: tIdx}]
+	enc.blockMu.RUnlock()
+	if !ok {
+		return false, fmt.Errorf("SubmitTileFused %s/%d: block was not declared", varName, tIdx)
+	}
+	if !s.Uniform() {
+		return false, errFusedNotSupported
+	}
+	stride := bb.params.DType.Bytes()
+	if stride != 1 && stride != 2 {
+		return false, errFusedNotSupported
+	}
+	quantBytes := w.pixPer * stride
+	if cap(w.scratch) < quantBytes {
+		w.scratch = make([]byte, quantBytes)
+	}
+	quant := w.scratch[:quantBytes]
+
+	var produced bool
+	switch stride {
+	case 2:
+		produced = tiler.TileQuantU16(s, z, x, y, pixSize, bb.params.Scale, bb.params.Offset, quant)
+	case 1:
+		produced = tiler.TileQuantU8(s, z, x, y, pixSize, bb.params.Scale, bb.params.Offset, quant)
+	}
+	if !produced {
+		return false, nil
+	}
+
+	tid := tileid.Encode3D(z, x, y)
+	w.runEncodeFromQuant(bb, tid, quant)
+	return true, nil
+}
+
+// errFusedNotSupported signals the caller should use the float32 fallback.
+var errFusedNotSupported = fmt.Errorf("fused tile path not supported for this block")
+
+func IsFusedNotSupported(err error) bool { return err == errFusedNotSupported }
+
+// runEncodeFromQuant runs hash + codec + store on already-quantized bytes.
+// Probes dedup first so duplicates skip the codec pass entirely.
+func (w *DirectWorker) runEncodeFromQuant(bb *blockBuilder, tid uint64, quant []byte) {
+	var key [32]byte
+	hashQuantInto(quant, &key)
+
+	if !w.dictMode && bb.dedupHit(tid, key) {
+		return
+	}
+
+	if w.dictMode {
+		tag, inner := w.tcEnc.EncodeInnerOnly(quant, bb.params, w.pixPer)
+		bb.addEncodedInner(tid, key, tag, inner)
+		return
+	}
+
+	var blob []byte
+	switch {
+	case w.enc != nil && w.enc.sharedSampler != nil:
+		blob = w.tcEnc.EncodeBestShared(quant, bb.params, w.pixPer, bb.variable, w.enc.sharedSampler)
+	case w.app != nil && w.app.sharedSampler != nil:
+		blob = w.tcEnc.EncodeBestShared(quant, bb.params, w.pixPer, bb.variable, w.app.sharedSampler)
+	default:
+		blob = w.tcEnc.EncodeBestSampled(quant, bb.params, w.pixPer, bb.variable)
+	}
+	bb.addEncoded(tid, key, blob)
+}
+
 func (w *DirectWorker) encodeAndStore(bb *blockBuilder, tid uint64, pixels []float32, onConsumed func([]float32)) {
 	stride := bb.params.DType.Bytes()
 	quantBytes := w.pixPer * stride
@@ -143,6 +236,10 @@ func (w *DirectWorker) encodeAndStore(bb *blockBuilder, tid uint64, pixels []flo
 
 	var key [32]byte
 	hashQuantInto(quant, &key)
+
+	if !w.dictMode && bb.dedupHit(tid, key) {
+		return
+	}
 
 	if w.dictMode {
 		tag, inner := w.tcEnc.EncodeInnerOnly(quant, bb.params, w.pixPer)

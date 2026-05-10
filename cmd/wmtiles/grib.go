@@ -339,6 +339,8 @@ func scanHeadersOnly(data []byte, ranges []parser.MessageRange, filterShortNames
 
 // streamParseAndTile is the pipelined encode worker pool: each worker
 // decodes values, declares the block, samples tiles and submits them.
+// Per-message parallelism (not per-tile) keeps the values buffer L2-hot
+// and avoids redundant bandit sampling on the same variable.
 func streamParseAndTile(
 	data []byte,
 	ranges []parser.MessageRange,
@@ -497,8 +499,27 @@ func streamParseAndTile(
 					setErr(fmt.Errorf("variable %q time %s: malformed grid", v.name, h.ReferenceTime))
 					continue
 				}
+				fusedOK := dw != nil && s.Uniform()
 				for z := minZoom; z <= maxZoom; z++ {
 					for _, c := range tiler.TilesIntersectingGrid(&gribFile, z) {
+						if fusedOK {
+							ok, fusedErr := dw.SubmitTileFused(v.name, tIdx, z, c.X, c.Y, pixSize, s)
+							if fusedErr != nil {
+								if encoder.IsFusedNotSupported(fusedErr) {
+									fusedOK = false
+								} else {
+									setErr(fusedErr)
+									continue
+								}
+							} else {
+								if ok {
+									submitted.Add(1)
+								} else {
+									skipped.Add(1)
+								}
+								continue
+							}
+						}
 						px := tiler.Tile(s, z, c.X, c.Y, pixSize)
 						if px == nil {
 							skipped.Add(1)

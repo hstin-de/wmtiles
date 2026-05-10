@@ -3,6 +3,7 @@ package tiler
 import (
 	"math"
 	"sync"
+	"unsafe"
 
 	"github.com/hstin-de/wmtiles/parser"
 )
@@ -183,6 +184,10 @@ type Sampler struct {
 	nLatM1   int
 	nLonM1   int
 	lonGrid0 bool
+
+	// Set at construction; enables the dense-grid fast path in the bilinear
+	// filler and fused quantize kernels (skips per-pixel missing checks).
+	hasMissing bool
 }
 
 func NewSampler(g *parser.GRIBFile) *Sampler {
@@ -219,8 +224,48 @@ func NewSampler(g *parser.GRIBFile) *Sampler {
 		}
 		s.lonGrid0 = ref >= 180 || s.lons[len(s.lons)-1] >= 180
 	}
+	s.hasMissing = scanForMissing(g.DataValues, s.missingF32)
 	return s
 }
+
+// scanForMissing reports whether any value is the GRIB missing sentinel or NaN.
+// Unrolled by 8 for ILP; runs once per message to gate the dense-grid path.
+func scanForMissing(values []float32, missing float32) bool {
+	n := len(values)
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		v0 := values[i]
+		v1 := values[i+1]
+		v2 := values[i+2]
+		v3 := values[i+3]
+		v4 := values[i+4]
+		v5 := values[i+5]
+		v6 := values[i+6]
+		v7 := values[i+7]
+		if v0 == missing || v1 == missing || v2 == missing || v3 == missing ||
+			v4 == missing || v5 == missing || v6 == missing || v7 == missing {
+			return true
+		}
+		if v0 != v0 || v1 != v1 || v2 != v2 || v3 != v3 ||
+			v4 != v4 || v5 != v5 || v6 != v6 || v7 != v7 {
+			return true
+		}
+	}
+	for ; i < n; i++ {
+		v := values[i]
+		if v == missing || v != v {
+			return true
+		}
+	}
+	return false
+}
+
+// Uniform reports whether the grid has constant lat/lon step. Required by
+// the fused tile-and-quantize kernels.
+func (s *Sampler) Uniform() bool { return s.uniform }
+
+// HasMissing reports whether the source grid contains any missing/NaN values.
+func (s *Sampler) HasMissing() bool { return s.hasMissing }
 
 func isUniform(arr []float64) bool {
 	if len(arr) < 2 {
@@ -462,6 +507,8 @@ func fillTileUniformScratch(s *Sampler, lats, lons []float64, out []float32, pix
 		}
 	}
 
+	noMissing := !s.hasMissing
+
 	for r, lat := range lats {
 		rowBase := r * pixSize
 		rowOut := out[rowBase : rowBase+pixSize]
@@ -487,6 +534,32 @@ func fillTileUniformScratch(s *Sampler, lats, lons []float64, out []float32, pix
 		}
 		for c := c1; c < pixSize; c++ {
 			rowOut[c] = nan
+		}
+
+		// Dense-grid fast path: drop per-pixel missing-value checks.
+		if noMissing {
+			// Hoist bounds checks on the column scratch slices.
+			_ = colX0[c1-1]
+			_ = colU[c1-1]
+			for c := c0; c < c1; c++ {
+				x0 := int(colX0[c])
+				if x0 < 0 {
+					rowOut[c] = nan
+					continue
+				}
+				base0 := row0 + x0
+				base1 := row1 + x0
+				v00 := data[base0]
+				v10 := data[base0+1]
+				v01 := data[base1]
+				v11 := data[base1+1]
+				u := colU[c]
+				oneU := 1 - u
+				top := oneU*v00 + u*v10
+				bot := oneU*v01 + u*v11
+				rowOut[c] = oneV*top + vF*bot
+			}
+			continue
 		}
 
 		for c := c0; c < c1; c++ {
@@ -521,6 +594,411 @@ func isqrt(n int) int {
 		x++
 	}
 	return x - 1
+}
+
+// Must match quantize.SentinelU16/U8. Duplicated to avoid importing quantize.
+const QuantU16Sentinel uint16 = 0xFFFF
+const QuantU8Sentinel uint8 = 0xFF
+
+// TileQuantU16 fuses bilinear interpolation with u16 quantization, writing
+// directly into out (LE u16 per pixel). Returns false on no-overlap or
+// all-missing tiles. Skips the float32 intermediate the two-pass path needs.
+func TileQuantU16(s *Sampler, z uint8, x, y uint32, pixSize int, scale, offset float64, out []byte) bool {
+	if !s.uniform {
+		return false
+	}
+	if len(out) < pixSize*pixSize*2 {
+		return false
+	}
+	ts := getTileScratch(pixSize)
+	defer putTileScratch(ts)
+	lats := ts.lats
+	lons := ts.lons
+	TileLats(z, y, pixSize, lats)
+	TileLons(z, x, pixSize, lons)
+
+	gw, gs, ge, gn := GridBBox(s.g)
+	r0, r1 := pixSize, 0
+	for r := range pixSize {
+		if lats[r] >= gs && lats[r] <= gn {
+			if r < r0 {
+				r0 = r
+			}
+			r1 = r + 1
+		}
+	}
+	c0Box, c1Box := pixSize, 0
+	for c := range pixSize {
+		if lons[c] >= gw && lons[c] <= ge {
+			if c < c0Box {
+				c0Box = c
+			}
+			c1Box = c + 1
+		}
+	}
+	if r0 >= r1 || c0Box >= c1Box {
+		return false
+	}
+	rArea := (r1 - r0) * (c1Box - c0Box)
+	stride := max(isqrt(rArea/256), 1)
+	allNaN := true
+	for r := r0; r < r1 && allNaN; r += stride {
+		lat := lats[r]
+		for c := c0Box; c < c1Box; c += stride {
+			if !math.IsNaN(s.At(lat, lons[c])) {
+				allNaN = false
+				break
+			}
+		}
+	}
+	if allNaN {
+		return false
+	}
+
+	colX0 := ts.colX0
+	colU := ts.colU
+
+	lon0 := s.lon0
+	lat0 := s.lat0
+	invDLat := s.invDLat
+	invDLon := s.invDLon
+	nLatM1 := s.nLatM1
+	nLonM1 := s.nLonM1
+	nLatM1F := float64(nLatM1)
+	nLonM1F := float64(nLonM1)
+	w := s.g.Header.Nx
+	missing := s.missingF32
+	data := s.g.DataValues
+	lonGrid0 := s.lonGrid0
+
+	c0, c1 := pixSize, 0
+	for c, lon := range lons {
+		if lonGrid0 {
+			if lon < 0 {
+				lon += 360
+			}
+		} else if lon > 180 {
+			lon -= 360
+		}
+		xFrac := (lon - lon0) * invDLon
+		if xFrac < 0 || xFrac > nLonM1F {
+			colX0[c] = -1
+			continue
+		}
+		x0 := int(xFrac)
+		if x0 >= nLonM1 {
+			x0 = nLonM1 - 1
+		}
+		colX0[c] = int32(x0)
+		colU[c] = float32(xFrac - float64(x0))
+		if c < c0 {
+			c0 = c
+		}
+		if c+1 > c1 {
+			c1 = c + 1
+		}
+	}
+
+	// Alias out as []uint16: one store per pixel.
+	dst := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(out)))[: pixSize*pixSize : pixSize*pixSize]
+
+	inv32 := float32(1.0 / scale)
+	off32 := float32(offset)
+	noMissing := !s.hasMissing
+
+	// Narrow scratch slices to drop per-pixel bounds checks; c0..c1 is
+	// contiguous-valid so the inner loop omits the x0<0 guard.
+	colU2 := colU[:pixSize]
+	colX02 := colX0[:pixSize]
+
+	for r, lat := range lats {
+		rowBase := r * pixSize
+		rowOut := dst[rowBase : rowBase+pixSize : rowBase+pixSize]
+		yFrac := (lat - lat0) * invDLat
+		if yFrac < 0 || yFrac > nLatM1F {
+			for c := 0; c < pixSize; c++ {
+				rowOut[c] = QuantU16Sentinel
+			}
+			continue
+		}
+		y0 := int(yFrac)
+		if y0 >= nLatM1 {
+			y0 = nLatM1 - 1
+		}
+		vF := float32(yFrac - float64(y0))
+		oneV := 1 - vF
+		row0 := y0 * w
+		row1 := row0 + w
+
+		for c := 0; c < c0; c++ {
+			rowOut[c] = QuantU16Sentinel
+		}
+		for c := c1; c < pixSize; c++ {
+			rowOut[c] = QuantU16Sentinel
+		}
+
+		if noMissing {
+			// Row subslices hoist bounds checks out of the inner loop.
+			row0Slice := data[row0 : row0+w]
+			row1Slice := data[row1 : row1+w]
+			for c := c0; c < c1; c++ {
+				x0 := int(colX02[c])
+				v00 := row0Slice[x0]
+				v10 := row0Slice[x0+1]
+				v01 := row1Slice[x0]
+				v11 := row1Slice[x0+1]
+				u := colU2[c]
+				oneU := 1 - u
+				top := oneU*v00 + u*v10
+				bot := oneU*v01 + u*v11
+				v := oneV*top + vF*bot
+				rq := (v - off32) * inv32
+				var q uint16
+				switch {
+				case rq <= 0:
+					q = 0
+				case rq >= 65534:
+					q = 65534
+				default:
+					q = uint16(rq + 0.5)
+				}
+				rowOut[c] = q
+			}
+			continue
+		}
+
+		row0Slice := data[row0 : row0+w]
+		row1Slice := data[row1 : row1+w]
+		for c := c0; c < c1; c++ {
+			x0 := int(colX02[c])
+			if x0 < 0 {
+				rowOut[c] = QuantU16Sentinel
+				continue
+			}
+			v00 := row0Slice[x0]
+			v10 := row0Slice[x0+1]
+			v01 := row1Slice[x0]
+			v11 := row1Slice[x0+1]
+			if v00 == missing || v10 == missing || v01 == missing || v11 == missing ||
+				v00 != v00 || v10 != v10 || v01 != v01 || v11 != v11 {
+				rowOut[c] = QuantU16Sentinel
+				continue
+			}
+			u := colU2[c]
+			oneU := 1 - u
+			top := oneU*v00 + u*v10
+			bot := oneU*v01 + u*v11
+			v := oneV*top + vF*bot
+			rq := (v - off32) * inv32
+			var q uint16
+			switch {
+			case rq <= 0:
+				q = 0
+			case rq >= 65534:
+				q = 65534
+			default:
+				q = uint16(rq + 0.5)
+			}
+			rowOut[c] = q
+		}
+	}
+	return true
+}
+
+// TileQuantU8 is the u8 counterpart of TileQuantU16. Pixels are written as one
+// byte each. Returns false on no-overlap / all-missing tiles.
+func TileQuantU8(s *Sampler, z uint8, x, y uint32, pixSize int, scale, offset float64, out []byte) bool {
+	if !s.uniform {
+		return false
+	}
+	if len(out) < pixSize*pixSize {
+		return false
+	}
+	ts := getTileScratch(pixSize)
+	defer putTileScratch(ts)
+	lats := ts.lats
+	lons := ts.lons
+	TileLats(z, y, pixSize, lats)
+	TileLons(z, x, pixSize, lons)
+
+	gw, gs, ge, gn := GridBBox(s.g)
+	r0, r1 := pixSize, 0
+	for r := range pixSize {
+		if lats[r] >= gs && lats[r] <= gn {
+			if r < r0 {
+				r0 = r
+			}
+			r1 = r + 1
+		}
+	}
+	c0Box, c1Box := pixSize, 0
+	for c := range pixSize {
+		if lons[c] >= gw && lons[c] <= ge {
+			if c < c0Box {
+				c0Box = c
+			}
+			c1Box = c + 1
+		}
+	}
+	if r0 >= r1 || c0Box >= c1Box {
+		return false
+	}
+	rArea := (r1 - r0) * (c1Box - c0Box)
+	stride := max(isqrt(rArea/256), 1)
+	allNaN := true
+	for r := r0; r < r1 && allNaN; r += stride {
+		lat := lats[r]
+		for c := c0Box; c < c1Box; c += stride {
+			if !math.IsNaN(s.At(lat, lons[c])) {
+				allNaN = false
+				break
+			}
+		}
+	}
+	if allNaN {
+		return false
+	}
+
+	colX0 := ts.colX0
+	colU := ts.colU
+
+	lon0 := s.lon0
+	lat0 := s.lat0
+	invDLat := s.invDLat
+	invDLon := s.invDLon
+	nLatM1 := s.nLatM1
+	nLonM1 := s.nLonM1
+	nLatM1F := float64(nLatM1)
+	nLonM1F := float64(nLonM1)
+	w := s.g.Header.Nx
+	missing := s.missingF32
+	data := s.g.DataValues
+	lonGrid0 := s.lonGrid0
+
+	c0, c1 := pixSize, 0
+	for c, lon := range lons {
+		if lonGrid0 {
+			if lon < 0 {
+				lon += 360
+			}
+		} else if lon > 180 {
+			lon -= 360
+		}
+		xFrac := (lon - lon0) * invDLon
+		if xFrac < 0 || xFrac > nLonM1F {
+			colX0[c] = -1
+			continue
+		}
+		x0 := int(xFrac)
+		if x0 >= nLonM1 {
+			x0 = nLonM1 - 1
+		}
+		colX0[c] = int32(x0)
+		colU[c] = float32(xFrac - float64(x0))
+		if c < c0 {
+			c0 = c
+		}
+		if c+1 > c1 {
+			c1 = c + 1
+		}
+	}
+
+	inv32 := float32(1.0 / scale)
+	off32 := float32(offset)
+	noMissing := !s.hasMissing
+
+	for r, lat := range lats {
+		rowBase := r * pixSize
+		yFrac := (lat - lat0) * invDLat
+		if yFrac < 0 || yFrac > nLatM1F {
+			for c := 0; c < pixSize; c++ {
+				out[rowBase+c] = QuantU8Sentinel
+			}
+			continue
+		}
+		y0 := int(yFrac)
+		if y0 >= nLatM1 {
+			y0 = nLatM1 - 1
+		}
+		vF := float32(yFrac - float64(y0))
+		oneV := 1 - vF
+		row0 := y0 * w
+		row1 := row0 + w
+
+		for c := 0; c < c0; c++ {
+			out[rowBase+c] = QuantU8Sentinel
+		}
+		for c := c1; c < pixSize; c++ {
+			out[rowBase+c] = QuantU8Sentinel
+		}
+
+		if noMissing {
+			for c := c0; c < c1; c++ {
+				x0 := int(colX0[c])
+				if x0 < 0 {
+					out[rowBase+c] = QuantU8Sentinel
+					continue
+				}
+				base0 := row0 + x0
+				base1 := row1 + x0
+				v00 := data[base0]
+				v10 := data[base0+1]
+				v01 := data[base1]
+				v11 := data[base1+1]
+				u := colU[c]
+				oneU := 1 - u
+				top := oneU*v00 + u*v10
+				bot := oneU*v01 + u*v11
+				v := oneV*top + vF*bot
+				rq := (v - off32) * inv32
+				var q uint8
+				switch {
+				case rq <= 0:
+					q = 0
+				case rq >= 254:
+					q = 254
+				default:
+					q = uint8(rq + 0.5)
+				}
+				out[rowBase+c] = q
+			}
+			continue
+		}
+
+		for c := c0; c < c1; c++ {
+			x0 := int(colX0[c])
+			if x0 < 0 {
+				out[rowBase+c] = QuantU8Sentinel
+				continue
+			}
+			v00 := data[row0+x0]
+			v10 := data[row0+x0+1]
+			v01 := data[row1+x0]
+			v11 := data[row1+x0+1]
+			if v00 == missing || v10 == missing || v01 == missing || v11 == missing ||
+				v00 != v00 || v10 != v10 || v01 != v01 || v11 != v11 {
+				out[rowBase+c] = QuantU8Sentinel
+				continue
+			}
+			u := colU[c]
+			oneU := 1 - u
+			top := oneU*v00 + u*v10
+			bot := oneU*v01 + u*v11
+			v := oneV*top + vF*bot
+			rq := (v - off32) * inv32
+			var q uint8
+			switch {
+			case rq <= 0:
+				q = 0
+			case rq >= 254:
+				q = 254
+			default:
+				q = uint8(rq + 0.5)
+			}
+			out[rowBase+c] = q
+		}
+	}
+	return true
 }
 
 func TileLats(z uint8, y uint32, pixSize int, out []float64) {

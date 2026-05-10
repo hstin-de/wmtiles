@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"github.com/DataDog/zstd"
 	"github.com/hstin-de/wmtiles/bitshuffle"
@@ -508,20 +509,24 @@ func (d *Decoder) decodeLorenzoZstd(payload []byte, p quantize.Params, nPixels i
 func deltaEncode(src, dst []byte, w, stride int) {
 	rowBytes := w * stride
 	copy(dst[:rowBytes], src[:rowBytes])
-	for r := 1; r < w; r++ {
-		base := r * rowBytes
-		switch stride {
-		case 1:
-			for c := range w {
-				dst[base+c] = src[base+c] - src[base-rowBytes+c]
+	switch stride {
+	case 1:
+		for r := 1; r < w; r++ {
+			base := r * rowBytes
+			prev := base - rowBytes
+			for c := 0; c < w; c++ {
+				dst[base+c] = src[base+c] - src[prev+c]
 			}
-		case 2:
-			for c := range w {
-				cur := uint16(src[base+2*c]) | uint16(src[base+2*c+1])<<8
-				prev := uint16(src[base-rowBytes+2*c]) | uint16(src[base-rowBytes+2*c+1])<<8
-				d := cur - prev
-				dst[base+2*c] = byte(d)
-				dst[base+2*c+1] = byte(d >> 8)
+		}
+	case 2:
+		n := w * w
+		s16 := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(src)))[:n:n]
+		d16 := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(dst)))[:n:n]
+		for r := 1; r < w; r++ {
+			base := r * w
+			prev := base - w
+			for c := 0; c < w; c++ {
+				d16[base+c] = s16[base+c] - s16[prev+c]
 			}
 		}
 	}
@@ -551,21 +556,19 @@ func deltaDecode(src, dst []byte, w, stride int) {
 
 // 2D residual against q(x-1,y)+q(x,y-1)-q(x-1,y-1); top row falls back to 1D
 // x-delta, left column to 1D y-delta. Arithmetic wraps mod 2^(stride*8) so the
-// inverse is exact
+// inverse is exact. stride=2 aliases src/dst as []uint16 to avoid byte-wise
+// load/store in the hot loop.
 func lorenzoEncode(src, dst []byte, w, stride int) {
 	rowBytes := w * stride
 	switch stride {
 	case 1:
-		// top-left stays as-is
 		dst[0] = src[0]
-		// top row: 1D x-delta
 		for c := 1; c < w; c++ {
 			dst[c] = src[c] - src[c-1]
 		}
 		for r := 1; r < w; r++ {
 			base := r * rowBytes
 			prevRow := base - rowBytes
-			// left column: 1D y-delta
 			dst[base] = src[base] - src[prevRow]
 			for c := 1; c < w; c++ {
 				pred := src[base+c-1] + src[prevRow+c] - src[prevRow+c-1]
@@ -573,22 +576,20 @@ func lorenzoEncode(src, dst []byte, w, stride int) {
 			}
 		}
 	case 2:
-		ld := func(p int) uint16 { return uint16(src[p]) | uint16(src[p+1])<<8 }
-		st := func(p int, v uint16) {
-			dst[p] = byte(v)
-			dst[p+1] = byte(v >> 8)
-		}
-		st(0, ld(0))
+		n := w * w
+		s16 := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(src)))[:n:n]
+		d16 := (*[1 << 30]uint16)(unsafe.Pointer(unsafe.SliceData(dst)))[:n:n]
+		d16[0] = s16[0]
 		for c := 1; c < w; c++ {
-			st(2*c, ld(2*c)-ld(2*(c-1)))
+			d16[c] = s16[c] - s16[c-1]
 		}
 		for r := 1; r < w; r++ {
-			base := r * rowBytes
-			prevRow := base - rowBytes
-			st(base, ld(base)-ld(prevRow))
+			base := r * w
+			prev := base - w
+			d16[base] = s16[base] - s16[prev]
 			for c := 1; c < w; c++ {
-				pred := ld(base+2*(c-1)) + ld(prevRow+2*c) - ld(prevRow+2*(c-1))
-				st(base+2*c, ld(base+2*c)-pred)
+				pred := s16[base+c-1] + s16[prev+c] - s16[prev+c-1]
+				d16[base+c] = s16[base+c] - pred
 			}
 		}
 	}

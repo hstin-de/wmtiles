@@ -88,6 +88,19 @@ func (b *blockBuilder) addEncoded(tid uint64, key [32]byte, blob []byte) {
 	b.records = append(b.records, recordVal{tid: tid, offset: off, length: ln})
 }
 
+// dedupHit registers a record for a known content hash and returns true,
+// letting the caller skip the codec pass entirely on duplicate payloads.
+func (b *blockBuilder) dedupHit(tid uint64, key [32]byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	v, ok := b.dedup[key]
+	if !ok {
+		return false
+	}
+	b.records = append(b.records, recordVal{tid: tid, offset: v.offset, length: v.length})
+	return true
+}
+
 // addEncodedInner is the dict-mode counterpart to addEncoded: it stores
 // post-transform bytes in b.uniques and lets finishBlockDict compress later.
 // dedup offsets index into b.uniques until that pass rewrites them.
