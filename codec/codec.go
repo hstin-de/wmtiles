@@ -29,6 +29,7 @@ type Encoder struct {
 	scratch    []byte
 	scratch2   []byte
 	scratch3   []byte
+	zbuf       []byte // CompressBound scratch reused across tiles
 	samplers   map[string]*samplerState
 	allowDelta bool
 }
@@ -416,10 +417,14 @@ func decodeConstant(payload []byte, p quantize.Params, nPixels int, out []byte) 
 	return nil
 }
 
-// Returned slice is a fresh allocation; blobs travel across goroutines
-// via resCh and must not alias per-encoder scratch.
+// Returned blob is a fresh, exact-sized allocation: it crosses goroutines
+// via resCh and must not retain per-encoder scratch capacity.
 func (e *Encoder) compressWithTag(tag byte, src []byte) []byte {
-	body, err := e.zw.CompressLevel(nil, src, e.level)
+	bound := zstd.CompressBound(len(src))
+	if cap(e.zbuf) < bound {
+		e.zbuf = make([]byte, bound)
+	}
+	body, err := e.zw.CompressLevel(e.zbuf[:0], src, e.level)
 	if err != nil {
 		panic(fmt.Sprintf("codec: zstd compress: %v", err))
 	}

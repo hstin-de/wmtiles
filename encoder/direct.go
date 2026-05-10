@@ -6,7 +6,6 @@ import (
 	"github.com/hstin-de/wmtiles/codec"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tileid"
-	"github.com/zeebo/blake3"
 )
 
 // DirectWorker runs quantize, hash and codec inline so a caller-owned
@@ -16,7 +15,6 @@ type DirectWorker struct {
 	enc      *StreamingEncoder
 	app      *AppendCtx
 	tcEnc    *codec.Encoder
-	hasher   *blake3.Hasher
 	scratch  []byte
 	pixPer   int
 	zstdLvl  int
@@ -32,7 +30,6 @@ func (s *StreamingEncoder) NewDirectWorker() (*DirectWorker, error) {
 	return &DirectWorker{
 		enc:      s,
 		tcEnc:    tcEnc,
-		hasher:   blake3.New(),
 		pixPer:   s.pixPerTile,
 		dictMode: s.opts.EnableTileDict,
 	}, nil
@@ -46,7 +43,6 @@ func (a *AppendCtx) NewDirectAppendWorker() (*DirectWorker, error) {
 	return &DirectWorker{
 		app:      a,
 		tcEnc:    tcEnc,
-		hasher:   blake3.New(),
 		pixPer:   a.pixPerTile,
 		dictMode: a.enableTileDict,
 	}, nil
@@ -145,10 +141,8 @@ func (w *DirectWorker) encodeAndStore(bb *blockBuilder, tid uint64, pixels []flo
 		onConsumed(pixels)
 	}
 
-	w.hasher.Reset()
-	w.hasher.Write(quant)
 	var key [32]byte
-	w.hasher.Sum(key[:0])
+	hashQuantInto(quant, &key)
 
 	if w.dictMode {
 		tag, inner := w.tcEnc.EncodeInnerOnly(quant, bb.params, w.pixPer)

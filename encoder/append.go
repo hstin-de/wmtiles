@@ -15,7 +15,6 @@ import (
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tileid"
-	"github.com/zeebo/blake3"
 )
 
 type AppendOptions struct {
@@ -161,6 +160,7 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 		ctx.jobCh = make(chan submitMsg, numWorkers*4)
 		ctx.resCh = make(chan encodedTile, numWorkers*4)
 
+		ctx.sharedSampler = codec.NewSharedSampler()
 		ctx.workerWg.Add(numWorkers)
 		for range numWorkers {
 			go ctx.worker()
@@ -433,7 +433,6 @@ func (a *AppendCtx) worker() {
 	}
 	defer tcEnc.Close()
 
-	hasher := blake3.New()
 	var scratch []byte
 	for msg := range a.jobCh {
 		bb := msg.block
@@ -445,12 +444,10 @@ func (a *AppendCtx) worker() {
 		quant := scratch[:quantBytes]
 		quantize.Encode(msg.pixels, bb.params, quant)
 
-		hasher.Reset()
-		hasher.Write(quant)
 		var key [32]byte
-		hasher.Sum(key[:0])
+		hashQuantInto(quant, &key)
 
-		blob := tcEnc.EncodeBestSampled(quant, bb.params, a.pixPerTile, bb.variable)
+		blob := tcEnc.EncodeBestShared(quant, bb.params, a.pixPerTile, bb.variable, a.sharedSampler)
 		a.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, blob: blob}
 	}
 }

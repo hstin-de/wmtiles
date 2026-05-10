@@ -14,7 +14,6 @@ import (
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tileid"
-	"github.com/zeebo/blake3"
 )
 
 const initialColdStartReserve = format.ColdStartBudget
@@ -133,8 +132,8 @@ func NewStreamingEncoder(opts Options, outPath string) (*StreamingEncoder, error
 		serializerDone: make(chan struct{}),
 	}
 
+	se.sharedSampler = codec.NewSharedSampler()
 	if opts.SkipInternalWorkers {
-		se.sharedSampler = codec.NewSharedSampler()
 		close(se.serializerDone)
 	} else {
 		numWorkers := max(runtime.GOMAXPROCS(0), 1)
@@ -231,7 +230,6 @@ func (s *StreamingEncoder) worker() {
 	}
 	defer tcEnc.Close()
 
-	hasher := blake3.New()
 	var scratch []byte
 	for msg := range s.jobCh {
 		bb := msg.block
@@ -246,16 +244,14 @@ func (s *StreamingEncoder) worker() {
 			s.opts.OnPixelsConsumed(msg.pixels)
 		}
 
-		hasher.Reset()
-		hasher.Write(quant)
 		var key [32]byte
-		hasher.Sum(key[:0])
+		hashQuantInto(quant, &key)
 
 		if s.opts.EnableTileDict {
 			tag, inner := tcEnc.EncodeInnerOnly(quant, bb.params, s.pixPerTile)
 			s.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, tag: tag, inner: inner}
 		} else {
-			blob := tcEnc.EncodeBestSampled(quant, bb.params, s.pixPerTile, bb.variable)
+			blob := tcEnc.EncodeBestShared(quant, bb.params, s.pixPerTile, bb.variable, s.sharedSampler)
 			s.resCh <- encodedTile{block: bb, tid: msg.tid, key: key, blob: blob}
 		}
 	}
@@ -322,6 +318,7 @@ func (s *StreamingEncoder) Finish() error {
 
 		dictOpts := defaultDictOptions()
 		dictOpts.enabled = s.opts.EnableTileDict
+		dictOpts.level = s.opts.ZstdLevel
 		if e := finishBlocksParallel(s.declarations, s.blocks, s.opts.InternalCompression, dictOpts); e != nil {
 			err = e
 			s.cleanupOnErr()

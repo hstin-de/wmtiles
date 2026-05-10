@@ -11,11 +11,12 @@ import (
 	"github.com/hstin-de/wmtiles/quantize"
 )
 
-// finishBlockDict picks a single per-block transform, trains a zstd dict over
-// a stride sample of transformed tiles, then dict-compresses every unique tile.
-// The transform is chosen per-block (not per-tile) because the dict can only be
-// tuned for one byte distribution. Falls back to plain zstd when the trainer
-// rejects the input.
+// finishBlockDict picks one per-block transform, builds a zstd dict over a
+// sample of transformed tiles, and compresses every unique tile against it.
+// The dict is dropped if it doesn't beat its own per-block storage cost; in
+// that case (or when too few uniques) tiles are compressed without a dict.
+// The transform is per-block — a dict can only be tuned for one byte
+// distribution.
 func (b *blockBuilder) finishBlockDict(opts dictOptions) error {
 	if len(b.uniques) == 0 {
 		return nil
@@ -44,57 +45,49 @@ func (b *blockBuilder) finishBlockDict(opts dictOptions) error {
 		transformed[i] = buf
 	}
 
-	// Each training pick is truncated: ZDICT's d=8 matcher only needs a few KB
-	// per sample, full 131 KB tiles slow training without improving the dict.
-	trainTiles := opts.trainSampleTiles
-	if trainTiles <= 0 {
-		trainTiles = 128
-	}
-	const perPickBytes = 4 * 1024
-	stride := len(nonConstIdx) / trainTiles
-	if stride < 1 {
-		stride = 1
-	}
-	picks := make([][]byte, 0, trainTiles)
-	for i := 0; i < len(nonConstIdx) && len(picks) < trainTiles; i += stride {
-		t := transformed[nonConstIdx[i]]
-		if len(t) > perPickBytes {
-			t = t[:perPickBytes]
-		}
-		picks = append(picks, t)
-	}
-
 	maxDictBytes := opts.maxDictBytes
 	if maxDictBytes <= 0 {
 		maxDictBytes = 64 * 1024
 	}
 	level := defaultZstdLevel(opts.level)
 
-	var dict *codec.Dict
-	if uint64(len(nonConstIdx)) >= uint64(opts.minTiles) && len(picks) >= 2 {
-		if trained, err := codec.TrainDict(picks, maxDictBytes); err == nil && len(trained) > 0 {
-			if d, err := codec.NewDict(trained, level); err == nil {
-				dict = d
-			}
-		}
-	}
+	dict := buildAndEvaluateDict(opts, transformed, nonConstIdx, maxDictBytes, level)
 
 	tileData := make([]byte, 0, len(b.uniques)*8192)
 	offsets := make([]uint64, len(b.uniques))
 	lengths := make([]uint32, len(b.uniques))
+
+	// Reuse one CCtx across this block's tiles instead of going through
+	// DataDog/zstd's BulkProcessor, which allocs a fresh CCtx per call.
+	var dctx *codec.DictCCtx
+	if dict != nil {
+		d, err := codec.NewDictCCtx(dict.Bytes, level)
+		if err != nil {
+			dict = nil
+		} else {
+			dctx = d
+			defer dctx.Free()
+		}
+	}
 	zr := zstd.NewCtx()
+	var dictScratch []byte
 	for i := range b.uniques {
 		u := b.uniques[i]
 		var blob []byte
 		switch {
 		case u.tag == codec.IDConstant:
 			blob = codec.PackConstantBlob(u.inner)
-		case dict != nil:
-			b2, err := codec.RepackWithDict(chosenTag, transformed[i], dict)
+		case dctx != nil:
+			body, err := dctx.Compress(dictScratch[:0], transformed[i])
 			if err != nil {
 				return err
 			}
-			blob = b2
+			if cap(body) > cap(dictScratch) {
+				dictScratch = body[:cap(body)]
+			}
+			blob = make([]byte, 1+len(body))
+			blob[0] = chosenTag
+			copy(blob[1:], body)
 		default:
 			body, err := zr.CompressLevel(nil, transformed[i], level)
 			if err != nil {
@@ -283,6 +276,10 @@ type dictOptions struct {
 	trainSampleTiles int
 	// level is the zstd level for dict-aware recompression; 0 = library default.
 	level int
+	// useTrainedDict picks ZDICT_trainFromBuffer over a raw-content prefix.
+	// Trained wins on bitshuffle planes; the prefix variant is cheaper but
+	// rarely clears its own per-block storage cost there.
+	useTrainedDict bool
 }
 
 func defaultDictOptions() dictOptions {
@@ -293,7 +290,135 @@ func defaultDictOptions() dictOptions {
 		sampleTiles:      16,
 		trainSampleTiles: 16,
 		level:            0,
+		useTrainedDict:   true,
 	}
+}
+
+// buildAndEvaluateDict trains or samples a per-block dict, then drops it
+// unless the projected compression win clears the dict-bytes overhead.
+// Always go through this rather than codec.NewDict directly.
+func buildAndEvaluateDict(opts dictOptions, transformed [][]byte, nonConstIdx []int, maxDictBytes, level int) *codec.Dict {
+	if uint64(len(nonConstIdx)) < uint64(opts.minTiles) {
+		return nil
+	}
+	var dict *codec.Dict
+	if opts.useTrainedDict {
+		// Truncate each pick: ZDICT's d=8 matcher needs only a few KB
+		// per sample.
+		trainTiles := opts.trainSampleTiles
+		if trainTiles <= 0 {
+			trainTiles = 128
+		}
+		const perPickBytes = 4 * 1024
+		stride := len(nonConstIdx) / trainTiles
+		if stride < 1 {
+			stride = 1
+		}
+		picks := make([][]byte, 0, trainTiles)
+		for i := 0; i < len(nonConstIdx) && len(picks) < trainTiles; i += stride {
+			t := transformed[nonConstIdx[i]]
+			if len(t) > perPickBytes {
+				t = t[:perPickBytes]
+			}
+			picks = append(picks, t)
+		}
+		if len(picks) >= 2 {
+			if trained, err := codec.TrainDict(picks, maxDictBytes); err == nil && len(trained) > 0 {
+				if d, err := codec.NewDict(trained, level); err == nil {
+					dict = d
+				}
+			}
+		}
+	} else {
+		// Raw-content prefix: cheaper than ZDICT but typically loses
+		// on bitshuffle planes; only kept if evaluateDict approves.
+		prefix := buildPrefixDict(transformed, nonConstIdx, maxDictBytes)
+		if len(prefix) > 0 {
+			if d, err := codec.NewDict(prefix, level); err == nil {
+				dict = d
+			}
+		}
+	}
+	if dict == nil {
+		return nil
+	}
+	// Drop the dict unless the projected win clears its on-disk cost
+	// plus a small margin to keep noise out of the decision.
+	win, ok := evaluateDict(dict, transformed, nonConstIdx, level)
+	threshold := len(dict.Bytes) + len(dict.Bytes)/8
+	if !ok || win <= threshold {
+		return nil
+	}
+	return dict
+}
+
+// evaluateDict compresses sampleN transformed tiles with and without dict
+// and returns the per-block savings projection (avg byte delta × tile
+// count). ok is false if the sample yielded nothing usable.
+func evaluateDict(dict *codec.Dict, transformed [][]byte, nonConstIdx []int, level int) (win int, ok bool) {
+	if len(nonConstIdx) == 0 {
+		return 0, false
+	}
+	const sampleN = 4
+	stride := len(nonConstIdx) / sampleN
+	if stride < 1 {
+		stride = 1
+	}
+	zr := zstd.NewCtx()
+	withDict := 0
+	withoutDict := 0
+	count := 0
+	for i := 0; i < len(nonConstIdx) && count < sampleN; i += stride {
+		t := transformed[nonConstIdx[i]]
+		if len(t) == 0 {
+			continue
+		}
+		bd, err := dict.Bp.Compress(nil, t)
+		if err != nil {
+			return 0, false
+		}
+		bn, err := zr.CompressLevel(nil, t, level)
+		if err != nil {
+			return 0, false
+		}
+		withDict += len(bd)
+		withoutDict += len(bn)
+		count++
+	}
+	if count == 0 {
+		return 0, false
+	}
+	avgDelta := (withoutDict - withDict) / count
+	return avgDelta * len(nonConstIdx), true
+}
+
+// buildPrefixDict concatenates a stride-sample of transformed tiles into a
+// raw-content dict, capped at maxBytes.
+func buildPrefixDict(transformed [][]byte, nonConstIdx []int, maxBytes int) []byte {
+	if maxBytes <= 0 || len(nonConstIdx) == 0 {
+		return nil
+	}
+	// 128 KB tiles exceed the 64 KB dict cap; stride to fit several
+	// representatives instead of one truncated tile.
+	const targetSamples = 16
+	stride := len(nonConstIdx) / targetSamples
+	if stride < 1 {
+		stride = 1
+	}
+	out := make([]byte, 0, maxBytes)
+	for i := 0; i < len(nonConstIdx) && len(out) < maxBytes; i += stride {
+		t := transformed[nonConstIdx[i]]
+		room := maxBytes - len(out)
+		if len(t) > room {
+			t = t[:room]
+		}
+		out = append(out, t...)
+	}
+	if len(out) < 64 {
+		// libzstd ignores trivially small dicts.
+		return nil
+	}
+	return out
 }
 
 type uniqueTile struct {

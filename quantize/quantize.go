@@ -88,7 +88,11 @@ func QuantizeU8(values []float32, p Params, out []byte) {
 		}
 		return
 	}
-	inv := 1.0 / p.Scale
+	// Stay in float32 throughout. The per-pixel float64 promotion was
+	// the bulk of the cost and float32 precision dominates the
+	// quantization budget anyway.
+	inv32 := float32(1.0 / p.Scale)
+	off32 := float32(p.Offset)
 	for i, v := range values {
 		if isNaN32(v) {
 			out[i] = SentinelU8
@@ -97,7 +101,7 @@ func QuantizeU8(values []float32, p Params, out []byte) {
 		// math.Round is banker's-rounding via a function call; for quantization
 		// the half-to-even vs half-up distinction is well below 1 LSB and dwarfed
 		// by the precision budget, so use the cheap +0.5 trick after clamping
-		r := (float64(v) - p.Offset) * inv
+		r := (v - off32) * inv32
 		if r <= 0 {
 			out[i] = 0
 		} else if r >= 254 {
@@ -130,13 +134,15 @@ func QuantizeU16(values []float32, p Params, out []byte) {
 		}
 		return
 	}
-	inv := 1.0 / p.Scale
+	// Same float32-throughout rationale as QuantizeU8.
+	inv32 := float32(1.0 / p.Scale)
+	off32 := float32(p.Offset)
 	for i, v := range values {
 		var q uint16
 		if isNaN32(v) {
 			q = SentinelU16
 		} else {
-			r := (float64(v) - p.Offset) * inv
+			r := (v - off32) * inv32
 			switch {
 			case r <= 0:
 				q = 0

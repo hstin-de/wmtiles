@@ -1,6 +1,7 @@
 package encoder
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"sort"
@@ -8,7 +9,17 @@ import (
 
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/quantize"
+	"github.com/zeebo/xxh3"
 )
+
+// hashQuantInto writes xxh3-128 of quant into the first 16 bytes of key;
+// trailing bytes stay zero so the [32]byte dedup-map key shape doesn't
+// churn when the hash is swapped.
+func hashQuantInto(quant []byte, key *[32]byte) {
+	h := xxh3.Hash128(quant)
+	binary.LittleEndian.PutUint64(key[0:8], h.Lo)
+	binary.LittleEndian.PutUint64(key[8:16], h.Hi)
+}
 
 type VariableSpec struct {
 	Name         string
