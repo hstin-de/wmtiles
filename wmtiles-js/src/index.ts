@@ -18,6 +18,8 @@ export {
   type TileRequest,
   type TilesRequest,
   type SampleRequest,
+  type ForecastRequest,
+  type ForecastResult,
 } from "./reader.js";
 
 // Typed errors.
@@ -31,3 +33,15 @@ export {
 
 // Geo helper for point sampling UIs.
 export { latLonToTilePixel, type TilePixel } from "./tileid.js";
+
+// Opt-in instrumentation. setDebugSink(fn) starts receiving phase-timed
+// events; setDebugSink(null) disables.
+export {
+  setDebugSink,
+  type DebugEvent,
+  type DebugSink,
+  type ReadEvent,
+  type TileEvent,
+  type TilesEvent,
+  type OpenEvent,
+} from "./debug.js";

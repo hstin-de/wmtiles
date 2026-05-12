@@ -73,6 +73,41 @@ You can tune coalescing with the `coalesce` option:
 await t2m.tiles({ time: 12, coords, coalesce: { maxGapBytes: 32_000 } });
 ```
 
+### Forecast / time-series at a point
+
+Sample one or more variables at a (lat, lon) point across the whole time axis:
+
+```ts
+const fc = await wmt.forecast({
+  lat: 52.52,
+  lon: 13.405,
+  variables: ["dbzh", "temperature_2m"],
+});
+
+fc.times;            // Date[] — one per step, aligned with all series
+fc.values.dbzh;      // Float32Array — fc.values.dbzh[i] is at fc.times[i]
+fc.values.dbzh[0];   // NaN if missing/NoData
+```
+
+Optional `z` (defaults to `maxZoom`) and `timeRange` to restrict the window:
+
+```ts
+await wmt.forecast({
+  lat: 52.52,
+  lon: 13.405,
+  variables: ["dbzh"],
+  z: 7,
+  timeRange: {
+    start: new Date("2026-05-12T00:00:00Z"),
+    end: new Date("2026-05-13T00:00:00Z"),
+  },
+});
+```
+
+`forecast()` fans out one parallel request per `(variable, time step)` — there is
+no cross-step coalescing, because different time steps live in different blocks.
+Units for each series stay on the variable handle (`wmt.variable("dbzh").unit`).
+
 ### Loading from a buffer
 
 ```ts

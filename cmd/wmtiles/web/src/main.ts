@@ -1,5 +1,6 @@
 import { open, latLonToTilePixel, type Variable, type WMT } from "wmtiles";
 import { makeWMTLayer, type WMTLayer } from "./layer";
+import { installDebugHud } from "./debug";
 
 declare const L: typeof import("leaflet");
 
@@ -71,6 +72,9 @@ interface VarGroup {
 async function boot(): Promise<void> {
   const status = $("status");
   status.textContent = "fetching header…";
+
+  // installs sink before open() so the open event is captured
+  installDebugHud();
 
   const wmt = await open("/wmt");
 
@@ -178,11 +182,14 @@ async function boot(): Promise<void> {
     const vmin = +vminEl.value;
     const vmax = +vmaxEl.value;
     layer.setState({ variable: v, t, vmin, vmax });
-    const ts =
-      wmt.timeAt(t).toISOString().replace("T", " ").slice(0, 16) +
-      "Z";
+    const maxStep = wmt.timeStepCount - 1;
+    const tF = Math.max(0, Math.min(maxStep, Math.floor(t)));
+    const tC = Math.min(maxStep, tF + 1);
+    const ms = wmt.timeAt(tF).getTime() +
+      (wmt.timeAt(tC).getTime() - wmt.timeAt(tF).getTime()) * (t - tF);
+    const ts = new Date(ms).toISOString().replace("T", " ").slice(0, 16) + "Z";
     $("timeLabel").textContent =
-      `step ${t} / ${wmt.timeStepCount - 1}  ·  ${ts}`;
+      `step ${t.toFixed(2)} / ${maxStep}  ·  ${ts}`;
     $("legTitle").textContent =
       v.name + (v.unit ? ` (${v.unit})` : "");
     $("legMin").textContent = (+vminEl.value).toPrecision(5);

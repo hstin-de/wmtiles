@@ -147,6 +147,72 @@ test("Variable.sample rejects invalid coords / out-of-range zoom", async () => {
   ).toBeNull();
 });
 
+test("WMT.forecast returns one series per variable across all steps", async () => {
+  const r = await WMT.open(bytesSource(load("multistep.wmt")));
+  const fc = await r.forecast({
+    lat: 0,
+    lon: 0,
+    variables: ["temp", "wind"],
+  });
+  expect(fc.times.length).toBe(4);
+  expect(fc.times[0].toISOString()).toBe("2026-05-03T00:00:00.000Z");
+  expect(fc.times[3].toISOString()).toBe("2026-05-03T03:00:00.000Z");
+  // fixture encodes pixel = offset + step: temp offset 100, wind offset 200
+  expect(Array.from(fc.values.temp)).toEqual([100, 101, 102, 103]);
+  expect(Array.from(fc.values.wind)).toEqual([200, 201, 202, 203]);
+});
+
+test("WMT.forecast slices via timeRange with indices and Dates", async () => {
+  const r = await WMT.open(bytesSource(load("multistep.wmt")));
+
+  const byIndex = await r.forecast({
+    lat: 0, lon: 0, variables: ["temp"],
+    timeRange: { start: 1, end: 2 },
+  });
+  expect(byIndex.times.length).toBe(2);
+  expect(Array.from(byIndex.values.temp)).toEqual([101, 102]);
+
+  const byDate = await r.forecast({
+    lat: 0, lon: 0, variables: ["temp"],
+    timeRange: {
+      start: new Date("2026-05-03T01:00:00Z"),
+      end: new Date("2026-05-03T02:00:00Z"),
+    },
+  });
+  expect(Array.from(byDate.values.temp)).toEqual([101, 102]);
+
+  // Open-ended range: only start → runs to last step.
+  const tail = await r.forecast({
+    lat: 0, lon: 0, variables: ["temp"],
+    timeRange: { start: 2 },
+  });
+  expect(Array.from(tail.values.temp)).toEqual([102, 103]);
+});
+
+test("WMT.forecast validates inputs and signals missing data with NaN", async () => {
+  const r = await WMT.open(bytesSource(load("multistep.wmt")));
+
+  // Unknown variable name must fail before any I/O.
+  await expect(
+    r.forecast({ lat: 0, lon: 0, variables: ["nope"] }),
+  ).rejects.toBeInstanceOf(UnknownVariableError);
+
+  // start > end → TimeOutOfRangeError.
+  await expect(
+    r.forecast({
+      lat: 0, lon: 0, variables: ["temp"],
+      timeRange: { start: 3, end: 1 },
+    }),
+  ).rejects.toBeInstanceOf(TimeOutOfRangeError);
+
+  // Invalid coords → series stays NaN-filled at every slot.
+  const fc = await r.forecast({
+    lat: 91, lon: 0, variables: ["temp"],
+  });
+  expect(fc.values.temp.length).toBe(4);
+  for (const v of fc.values.temp) expect(Number.isNaN(v)).toBe(true);
+});
+
 test("crc_corrupted.wmt falls back to previous snapshot", async () => {
   const r = await WMT.open(bytesSource(load("crc_corrupted.wmt")));
   const names = r.variables.map((v) => v.name).sort();

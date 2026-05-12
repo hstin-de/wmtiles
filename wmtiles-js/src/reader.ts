@@ -28,6 +28,7 @@ import {
 } from "./format.js";
 import { decodeCodec, dequantize } from "./decoder.js";
 import { encode3D, latLonToTilePixel } from "./tileid.js";
+import { debugSink, emitDebug } from "./debug.js";
 import {
   FormatError,
   SourceError,
@@ -102,6 +103,22 @@ export interface SampleRequest {
   lon: number;
   /** Defaults to maxZoom of the file. */
   z?: number;
+}
+
+export interface ForecastRequest {
+  lat: number;
+  lon: number;
+  variables: readonly string[];
+  /** Defaults to maxZoom of the file. */
+  z?: number;
+  /** Subset of time steps to include. Defaults to the full time axis. */
+  timeRange?: { start?: TimeRef; end?: TimeRef };
+}
+
+export interface ForecastResult {
+  readonly times: readonly Date[];
+  /** One Float32Array per variable name; NaN marks missing/NoData. */
+  readonly values: Readonly<Record<string, Float32Array>>;
 }
 
 // ---------- Sources ----------
@@ -305,7 +322,23 @@ export class WMT {
   private _coldBuf: Uint8Array | null = null;
 
   private constructor(src: ByteSource) {
-    this._src = src;
+    // Wrap once: when a debug sink is registered, each uncached read emits a
+    // timed event. The wrapper itself is one async hop; if the sink is null
+    // we skip the performance.now() calls entirely.
+    this._src = {
+      async read(offset, length) {
+        if (!debugSink()) return src.read(offset, length);
+        const t0 = performance.now();
+        const buf = await src.read(offset, length);
+        emitDebug({
+          kind: "read",
+          offset,
+          length: buf.length,
+          ms: performance.now() - t0,
+        });
+        return buf;
+      },
+    };
   }
 
   /** Open and parse a WMTiles file from a URL, bytes, or custom byte source. */
@@ -444,6 +477,53 @@ export class WMT {
     );
   }
 
+  /**
+   * Sample one or more variables at a point across the time axis. Returns a
+   * Float32Array per variable; NaN marks slots where the point falls outside
+   * the file, the tile is missing, or the pixel is NoData.
+   */
+  async forecast(req: ForecastRequest): Promise<ForecastResult> {
+    // Resolve names eagerly so UnknownVariableError fires before any I/O.
+    const vars = req.variables.map((name) => this.variable(name));
+
+    const startIdx = req.timeRange?.start !== undefined
+      ? this.timeIndexOf(req.timeRange.start)
+      : 0;
+    const endIdx = req.timeRange?.end !== undefined
+      ? this.timeIndexOf(req.timeRange.end)
+      : this._timeCatalog.count - 1;
+    if (startIdx > endIdx) {
+      throw new TimeOutOfRangeError(
+        `forecast start index ${startIdx} is after end index ${endIdx}`,
+      );
+    }
+    const T = endIdx - startIdx + 1;
+    const z = req.z ?? this._header.maxZoom;
+
+    const times: Date[] = new Array(T);
+    for (let i = 0; i < T; i++) times[i] = this.timeAt(startIdx + i);
+
+    const values: Record<string, Float32Array> = {};
+    for (const v of vars) values[v.name] = nanArray(T);
+
+    const jobs: Promise<void>[] = [];
+    for (const v of vars) {
+      const series = values[v.name];
+      for (let i = 0; i < T; i++) {
+        const slot = i;
+        jobs.push(
+          this._sample(v.id, startIdx + slot, req.lat, req.lon, z).then((val) => {
+            // null = out-of-range/missing → keep the pre-filled NaN.
+            if (val !== null) series[slot] = val;
+          }),
+        );
+      }
+    }
+    await Promise.all(jobs);
+
+    return { times, values };
+  }
+
   // ---- Internal: fetch helpers (called by Variable) ----
 
   private async _fetchTile(
@@ -478,12 +558,35 @@ export class WMT {
       entry = findTile(leaf, tid);
       if (!entry || entry.isLeaf) return null;
     }
+    const log = debugSink();
+    const tStart = log ? performance.now() : 0;
     const blob = await this._src.read(
       blk.blockOffset + blkHdr.tileDataOffset + entry.offset,
       entry.length,
     );
+    const tDecode = log ? performance.now() : 0;
     const decoded = decodeCodec(blob, blk.dtype, this._nPixels);
-    return dequantize(decoded, blk, this._nPixels);
+    const tDequant = log ? performance.now() : 0;
+    const result = dequantize(decoded, blk, this._nPixels);
+    if (log) {
+      const tEnd = performance.now();
+      emitDebug({
+        kind: "tile",
+        varId,
+        t,
+        z,
+        x,
+        y,
+        codec: blob[0],
+        dtype: blk.dtype,
+        compressedBytes: blob.length,
+        networkMs: tDecode - tStart,
+        decodeMs: tDequant - tDecode,
+        dequantizeMs: tEnd - tDequant,
+        totalMs: tEnd - tStart,
+      });
+    }
+    return result;
   }
 
   private async _fetchTiles(
@@ -492,6 +595,8 @@ export class WMT {
     coords: readonly TileCoord[],
     opts: CoalesceOptions = {},
   ): Promise<Float32Array[]> {
+    const log = debugSink();
+    const tStart = log ? performance.now() : 0;
     const maxGap = opts.maxGapBytes ?? 64 * 1024;
     const maxReq = opts.maxRequestBytes ?? 4 * 1024 * 1024;
 
@@ -502,6 +607,19 @@ export class WMT {
     if (!blk) {
       for (let i = 0; i < coords.length; i++) {
         out[i] = nanArray(this._nPixels);
+      }
+      if (log) {
+        emitDebug({
+          kind: "tiles",
+          varId,
+          t,
+          coordCount: coords.length,
+          hitCount: 0,
+          groupCount: 0,
+          bytesFetched: 0,
+          cpuMs: 0,
+          totalMs: performance.now() - tStart,
+        });
       }
       return out;
     }
@@ -548,7 +666,22 @@ export class WMT {
         length: entry.length,
       });
     }
-    if (needs.length === 0) return out;
+    if (needs.length === 0) {
+      if (log) {
+        emitDebug({
+          kind: "tiles",
+          varId,
+          t,
+          coordCount: coords.length,
+          hitCount: 0,
+          groupCount: 0,
+          bytesFetched: 0,
+          cpuMs: 0,
+          totalMs: performance.now() - tStart,
+        });
+      }
+      return out;
+    }
 
     needs.sort((a, b) => a.fileOff - b.fileOff);
 
@@ -573,14 +706,60 @@ export class WMT {
       groups.push({ start: n.fileOff, end, members: [n] });
     }
 
+    let bytesFetched = 0;
+    let cpuMs = 0;
     for (const g of groups) {
+      const tFetch0 = log ? performance.now() : 0;
       const buf = await this._src.read(g.start, g.end - g.start);
+      const fetchMs = log ? performance.now() - tFetch0 : 0;
+      bytesFetched += buf.length;
+      // attribute network time to each tile proportionally by bytes
+      let groupBytes = 0;
+      if (log) for (const m of g.members) groupBytes += m.length;
+      const tCpu0 = log ? performance.now() : 0;
       for (const m of g.members) {
         const localOff = m.fileOff - g.start;
         const blob = buf.subarray(localOff, localOff + m.length);
+        const tDecode0 = log ? performance.now() : 0;
         const decoded = decodeCodec(blob, blk.dtype, this._nPixels);
+        const tDequant0 = log ? performance.now() : 0;
         out[m.i] = dequantize(decoded, blk, this._nPixels);
+        if (log) {
+          const tDequant1 = performance.now();
+          const c = coords[m.i];
+          emitDebug({
+            kind: "tile",
+            varId,
+            t,
+            z: c.z,
+            x: c.x,
+            y: c.y,
+            codec: blob[0],
+            dtype: blk.dtype,
+            compressedBytes: m.length,
+            networkMs: groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0,
+            decodeMs: tDequant0 - tDecode0,
+            dequantizeMs: tDequant1 - tDequant0,
+            totalMs:
+              (groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0) +
+              (tDequant1 - tDecode0),
+          });
+        }
       }
+      if (log) cpuMs += performance.now() - tCpu0;
+    }
+    if (log) {
+      emitDebug({
+        kind: "tiles",
+        varId,
+        t,
+        coordCount: coords.length,
+        hitCount: needs.length,
+        groupCount: groups.length,
+        bytesFetched,
+        cpuMs,
+        totalMs: performance.now() - tStart,
+      });
     }
     return out;
   }
@@ -603,6 +782,8 @@ export class WMT {
   // ---- Internal: open / loaders ----
 
   private async _open(): Promise<void> {
+    const log = debugSink();
+    const tStart = log ? performance.now() : 0;
     this._coldBuf = await this._src.read(0, COLD_START_BYTES);
     if (this._coldBuf.length < HEADER_SIZE) {
       throw new FormatError(
@@ -636,6 +817,10 @@ export class WMT {
       } else {
         throw err;
       }
+    }
+
+    if (log) {
+      emitDebug({ kind: "open", totalMs: performance.now() - tStart });
     }
   }
 
@@ -812,7 +997,5 @@ export class WMT {
 }
 
 function nanArray(n: number): Float32Array {
-  const a = new Float32Array(n);
-  for (let i = 0; i < n; i++) a[i] = NaN;
-  return a;
+  return new Float32Array(n).fill(NaN);
 }

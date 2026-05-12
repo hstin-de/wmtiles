@@ -45,7 +45,8 @@ deps: node_modules/.stamp
 
 # testdata is regenerated whenever cmd/gen-testdata changes.
 TESTDATA_FILES := format/testdata/minimal.wmt format/testdata/extended.wmt \
-                  format/testdata/compacted.wmt format/testdata/crc_corrupted.wmt
+                  format/testdata/compacted.wmt format/testdata/crc_corrupted.wmt \
+                  format/testdata/multistep.wmt
 
 $(TESTDATA_FILES): cmd/gen-testdata/main.go
 	mkdir -p format/testdata

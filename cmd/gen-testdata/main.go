@@ -35,6 +35,57 @@ func main() {
 	crcPath := filepath.Join(outDir, "crc_corrupted.wmt")
 	makeCRCCorrupted(extendedPath, crcPath)
 	fmt.Printf("wrote %s\n", crcPath)
+
+	multistepPath := filepath.Join(outDir, "multistep.wmt")
+	makeMultistep(multistepPath, pixSize, refTime, fixedNow)
+	fmt.Printf("wrote %s\n", multistepPath)
+}
+
+// 4 hourly steps × 2 variables. Pixel values encode (timeStep, variable) so a
+// reader can verify both slicing and per-variable routing.
+func makeMultistep(path string, pixSize int, refTime time.Time, now time.Time) {
+	const steps = 4
+	const hourMs = int64(3600 * 1000)
+	vars := []struct {
+		Name   string
+		Offset float32
+	}{
+		{"temp", 100},
+		{"wind", 200},
+	}
+
+	tiles := make([]encoder.Tile, 0, steps*len(vars))
+	for _, v := range vars {
+		for t := uint32(0); t < steps; t++ {
+			px := make([]float32, pixSize*pixSize)
+			for i := range px {
+				px[i] = v.Offset + float32(t)
+			}
+			tiles = append(tiles, encoder.Tile{
+				Variable: v.Name, TimeStep: t, Z: 0, X: 0, Y: 0, Pixels: px,
+			})
+		}
+	}
+
+	specs := make([]encoder.VariableSpec, 0, len(vars))
+	for _, v := range vars {
+		specs = append(specs, encoder.VariableSpec{Name: v.Name, Unit: "u"})
+	}
+	opts := encoder.Options{
+		TilePixelSizeLog2:     7,
+		MinZoom:               0,
+		MaxZoom:               0,
+		ReferenceForecastTime: refTime,
+		TimeCatalog: format.TimeCatalog{
+			Regular: true, StartMs: refTime.UnixMilli(), IntervalMs: hourMs, Count: steps,
+		},
+		BBox:         [4]float64{-180, -85, 180, 85},
+		Variables:    specs,
+		CreationTime: now,
+	}
+	if err := encoder.Encode(tiles, opts, path); err != nil {
+		die(err)
+	}
 }
 
 func makeMinimal(path string, pixSize int, refTime time.Time, now time.Time) {

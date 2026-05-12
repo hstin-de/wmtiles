@@ -1,10 +1,41 @@
 // (4^z - 1)/3: see Go tileid.ZoomOffset; bigint because high zooms overflow Number
+const ZOOM_OFFSET_CACHE = new Map<number, bigint>();
 export function zoomOffset(z: number): bigint {
-  return ((1n << BigInt(2 * z)) - 1n) / 3n;
+  let v = ZOOM_OFFSET_CACHE.get(z);
+  if (v === undefined) {
+    v = ((1n << BigInt(2 * z)) - 1n) / 3n;
+    ZOOM_OFFSET_CACHE.set(z, v);
+  }
+  return v;
 }
 
-// mirror of Go hilbert.XY2D: must match exactly or tile lookup breaks
+// mirror of Go hilbert.XY2D: must match exactly or tile lookup breaks.
+// At z=26 the accumulator reaches 4^26 ≈ 6.7e15, still under Number.MAX_SAFE_INTEGER (2^53).
+// Web Mercator z is bounded by `1<<z` (int32) elsewhere, so z ≤ 30; fall back to bigint
+// past the safe range to keep the contract exact.
 export function hilbertXY2D(z: number, x: number, y: number): bigint {
+  if (z > 26) return hilbertXY2DBig(z, x, y);
+  let d = 0;
+  let xi = x | 0;
+  let yi = y | 0;
+  for (let s = (1 << z) >>> 1; s > 0; s >>>= 1) {
+    const rx = xi & s ? 1 : 0;
+    const ry = yi & s ? 1 : 0;
+    d += s * s * ((3 * rx) ^ ry);
+    if (ry === 0) {
+      if (rx === 1) {
+        xi = s - 1 - xi;
+        yi = s - 1 - yi;
+      }
+      const tmp = xi;
+      xi = yi;
+      yi = tmp;
+    }
+  }
+  return BigInt(d);
+}
+
+function hilbertXY2DBig(z: number, x: number, y: number): bigint {
   let d = 0n;
   let xi = x | 0;
   let yi = y | 0;
