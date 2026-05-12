@@ -106,10 +106,10 @@ func GridBBox(g *parser.GRIBFile) (west, south, east, north float64) {
 		}
 	}
 
-	if lo1 > 180 {
+	if lo1 >= 180 {
 		lo1 -= 360
 	}
-	if lo2 > 180 {
+	if lo2 >= 180 {
 		lo2 -= 360
 	}
 	west = math.Min(lo1, lo2)
