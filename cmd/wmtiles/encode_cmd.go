@@ -73,40 +73,68 @@ var (
 )
 
 func runEncode(c *encodeCmd) error {
-	format := encode.Format(c.Format)
-	if c.Format == "auto" {
-		if len(c.Inputs) == 0 {
-			return fmt.Errorf("no inputs supplied")
-		}
-		detected, err := detectFormatFromPath(c.Inputs[0])
-		if err != nil {
-			return err
-		}
-		format = detected
-		// Mixed formats would otherwise feed an HDF5 file into the GRIB
-		// parser (or vice versa) and fail mid-stream with a cryptic error.
-		for _, p := range c.Inputs[1:] {
-			if other, err := detectFormatFromPath(p); err == nil && other != format {
-				return fmt.Errorf("input %s is %s but %s is %s; pass --format explicitly or split the call", p, other, c.Inputs[0], format)
-			}
-		}
+	if len(c.Inputs) == 0 {
+		return fmt.Errorf("no inputs supplied")
+	}
+	var forced encode.Format
+	switch c.Format {
+	case "auto":
+		forced = ""
+	case "grib2":
+		forced = encode.FormatGRIB2
+	case "hdf5":
+		forced = encode.FormatHDF5
 	}
 
-	exts := gribExtensions
-	if format == encode.FormatHDF5 {
+	exts := append(append([]string{}, gribExtensions...), hdf5Extensions...)
+	if forced == encode.FormatGRIB2 {
+		exts = gribExtensions
+	} else if forced == encode.FormatHDF5 {
 		exts = hdf5Extensions
 	}
-	inputs, err := expandEncodeInputs(c.Inputs, exts)
+	paths, err := expandEncodeInputs(c.Inputs, exts)
 	if err != nil {
 		return err
 	}
-	if len(inputs) == 0 {
-		return fmt.Errorf("no %s inputs found", string(format))
+	if len(paths) == 0 {
+		return fmt.Errorf("no inputs found")
 	}
-	for _, p := range inputs {
+
+	type inputFile struct {
+		path   string
+		format encode.Format
+	}
+	inputs := make([]inputFile, 0, len(paths))
+	var gribCount, hdf5Count int
+	for _, p := range paths {
 		if _, err := os.Stat(p); err != nil {
 			return err
 		}
+		f := forced
+		if f == "" {
+			detected, err := detectFormatFromPath(p)
+			if err != nil {
+				return err
+			}
+			f = detected
+		}
+		switch f {
+		case encode.FormatGRIB2:
+			gribCount++
+		case encode.FormatHDF5:
+			hdf5Count++
+		}
+		inputs = append(inputs, inputFile{path: p, format: f})
+	}
+
+	var formatLabel string
+	switch {
+	case gribCount > 0 && hdf5Count > 0:
+		formatLabel = fmt.Sprintf("mixed (%d grib2, %d hdf5)", gribCount, hdf5Count)
+	case hdf5Count > 0:
+		formatLabel = "hdf5"
+	default:
+		formatLabel = "grib2"
 	}
 
 	overrides, err := scan.ParsePrecisionOverrides(c.Precision)
@@ -153,12 +181,12 @@ func runEncode(c *encodeCmd) error {
 
 	banner := fmt.Sprintf("%d files -> %s   %d cores", len(inputs), c.Output, runtime.GOMAXPROCS(0))
 	if len(inputs) == 1 {
-		banner = fmt.Sprintf("%s -> %s   %d cores", inputs[0], c.Output, runtime.GOMAXPROCS(0))
+		banner = fmt.Sprintf("%s -> %s   %d cores", inputs[0].path, c.Output, runtime.GOMAXPROCS(0))
 	}
 	ui.Banner("encode", banner)
 
 	ui.Section("Settings")
-	ui.KV("source format", string(format))
+	ui.KV("source format", formatLabel)
 	ui.KVf("zoom range", "%d..%d", c.MinZoom, c.MaxZoom)
 	ui.KVf("tile size", "%d px", 1<<c.TileSizeLog2)
 	if c.Filter == "" {
@@ -175,8 +203,8 @@ func runEncode(c *encodeCmd) error {
 	}
 	if len(inputs) > 1 {
 		ui.KVf("inputs", "%d files", len(inputs))
-		ui.KV("first", inputs[0])
-		ui.KV("last", inputs[len(inputs)-1])
+		ui.KV("first", inputs[0].path)
+		ui.KV("last", inputs[len(inputs)-1].path)
 	}
 
 	ui.Section("Encode")
@@ -208,7 +236,7 @@ func runEncode(c *encodeCmd) error {
 		MinZoom:           c.MinZoom,
 		MaxZoom:           c.MaxZoom,
 		Precision:         overrides,
-		Metadata:          map[string]any{"sourceFormat": string(format), "sourceCount": len(inputs)},
+		Metadata:          map[string]any{"sourceFormat": formatLabel, "sourceCount": len(inputs)},
 		DisableDeltaCodec: c.DisableDeltaCodec,
 		ZstdLevel:         c.ZstdLevel,
 		EnableTileDict:    c.TileDict,
@@ -297,8 +325,8 @@ func runEncode(c *encodeCmd) error {
 	}
 	enc = created
 	for _, in := range inputs {
-		if err := enc.AddFile(in, format); err != nil {
-			return fmt.Errorf("add %s: %w", in, err)
+		if err := enc.AddFile(in.path, in.format); err != nil {
+			return fmt.Errorf("add %s: %w", in.path, err)
 		}
 	}
 
@@ -361,7 +389,7 @@ func runEncode(c *encodeCmd) error {
 		rows = append(rows, [2]string{"size", humanBytes(st.Size())})
 		var totalInput int64
 		for _, in := range inputs {
-			if inSt, err := os.Stat(in); err == nil {
+			if inSt, err := os.Stat(in.path); err == nil {
 				totalInput += inSt.Size()
 			}
 		}
