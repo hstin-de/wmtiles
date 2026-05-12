@@ -103,33 +103,37 @@ func runCompare(args []string) error {
 
 	timeToIdx := buildTimeToIdx(r)
 
-	cliSection("WMTiles compare")
-	cliKV("source", flags.srcPath)
-	cliKV("source format", flags.srcFormat.String())
-	cliKV("wmtiles file", flags.wmtPath)
+	ui.Banner("compare", fmt.Sprintf("%s vs %s", flags.srcPath, flags.wmtPath))
+
+	ui.Section("Settings")
+	ui.KV("source format", flags.srcFormat.String())
 	if flags.varFilter == "" {
-		cliKV("variables", fmt.Sprintf("%d selected", len(wantNames)))
+		ui.KV("variables", fmt.Sprintf("%d selected", len(wantNames)))
 	} else {
-		cliKV("variable", flags.varFilter)
+		ui.KV("variable", flags.varFilter)
 	}
 	if flags.zoomFilter >= 0 {
-		cliKVf("zoom", "%d", flags.zoomFilter)
+		ui.KVf("zoom", "%d", flags.zoomFilter)
 	} else {
-		cliKV("zoom", "all")
+		ui.KV("zoom", "all")
 	}
 	if flags.tolOverride > 0 {
-		cliKV("tolerance", formatFloat(flags.tolOverride))
+		ui.KV("tolerance", formatFloat(flags.tolOverride))
 	} else {
-		cliKV("tolerance", "per block scale/2 plus f32 slack")
+		ui.KV("tolerance", "per block scale/2 plus f32 slack")
 	}
 
-	cliSection("Scan source")
+	ui.Section("Compare")
+	scanPhase := ui.StartPhase("scan source", 0)
 	samplers, err := buildSamplersForVariables(flags.srcPath, flags.srcFormat, wantNames, timeToIdx)
 	if err != nil {
+		scanPhase.Done("failed")
 		return err
 	}
+	matched := matchedAny(samplers)
+	scanPhase.Done(fmt.Sprintf("%d variables matched", matched))
 	reportSamplerCoverage(samplers, wantNames, r)
-	if matchedAny(samplers) == 0 {
+	if matched == 0 {
 		return fmt.Errorf("no .wmt variables found in source; nothing to compare")
 	}
 
@@ -143,26 +147,29 @@ func runCompare(args []string) error {
 
 	stats := initStats(r, flags.tolOverride)
 
+	comparePhase := ui.StartPhase("compare tiles", int64(totalAddressed))
 	startTime := time.Now()
 	enqueued, err := runCompareWorkers(r, samplers, stats, flags.zoomFilter)
 	if err != nil {
+		comparePhase.Done("failed")
 		return err
 	}
 	compareDuration := time.Since(startTime)
-	cliSection("Tile comparison")
-	cliKVf("tiles scanned", "%s of %s", commaInt(enqueued), commaUint(totalAddressed))
-	cliKV("duration", formatDuration(compareDuration))
-	cliKV("throughput", formatThroughput(enqueued, compareDuration, "tiles"))
-	cliKVf("workers", "%d", runtime.GOMAXPROCS(0))
+	comparePhase.SetCurrent(enqueued)
+	comparePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(enqueued), formatTileRateString(enqueued, compareDuration)))
 
 	if anyFail := printCompareResults(stats); anyFail {
-		cliSection("Result")
-		cliKV("status", "FAIL")
-		cliKV("reason", "at least one variable exceeded tolerance or had NaN mismatches")
+		ui.Section("Result")
+		ui.Summary([][2]string{
+			{"status", ui.styled("FAIL", ansiRed, ansiBold)},
+			{"reason", "at least one variable exceeded tolerance or had NaN mismatches"},
+		})
 		os.Exit(1)
 	}
-	cliSection("Result")
-	cliKV("status", "ok")
+	ui.Section("Result")
+	ui.Summary([][2]string{
+		{"status", ui.styled("ok", ansiGreen, ansiBold)},
+	})
 	return nil
 }
 
@@ -590,25 +597,5 @@ func truncName(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-func commaInt(n int64) string {
-	if n < 0 {
-		return "-" + commaInt(-n)
-	}
-	s := fmt.Sprintf("%d", n)
-	if len(s) <= 3 {
-		return s
-	}
-	var b strings.Builder
-	first := len(s) % 3
-	if first == 0 {
-		first = 3
-	}
-	b.WriteString(s[:first])
-	for i := first; i < len(s); i += 3 {
-		b.WriteByte(',')
-		b.WriteString(s[i : i+3])
-	}
-	return b.String()
-}
 
 var _ = quantize.MaxAbsError

@@ -341,7 +341,7 @@ func scanHeadersOnly(data []byte, ranges []parser.MessageRange, filterShortNames
 // decodes values, declares the block, samples tiles and submits them.
 // Per-message parallelism (not per-tile) keeps the values buffer L2-hot
 // and avoids redundant bandit sampling on the same variable.
-func streamParseAndTile(
+func streamParseAndTileWithProgress(
 	data []byte,
 	ranges []parser.MessageRange,
 	headers []parser.GribHeader,
@@ -353,10 +353,21 @@ func streamParseAndTile(
 	minZoom, maxZoom uint8,
 	pixSize int,
 	onDuplicate func(string, time.Time) error,
+	submittedOut, skippedOut *atomic.Int64,
 ) (int64, int64, error) {
 	numWorkers := max(runtime.GOMAXPROCS(0), 1)
 
-	var submitted, skipped atomic.Int64
+	var submitted, skipped *atomic.Int64
+	if submittedOut != nil {
+		submitted = submittedOut
+	} else {
+		submitted = new(atomic.Int64)
+	}
+	if skippedOut != nil {
+		skipped = skippedOut
+	} else {
+		skipped = new(atomic.Int64)
+	}
 	var firstErr atomic.Value
 	setErr := func(e error) {
 		if e == nil {
@@ -1039,18 +1050,24 @@ func runEncodeGRIB(command string, args []string) error {
 		}()
 	}
 
-	cliSection("WMTiles encode")
-	cliKV("input", in)
-	cliKV("output", flags.output)
-	cliKVf("zoom range", "%d..%d", flags.minZoom, flags.maxZoom)
-	cliKVf("tile size", "%d px", 1<<flags.tileSizeLog2)
+	ui.Banner(command, fmt.Sprintf("%s -> %s   %d cores", in, flags.output, runtime.GOMAXPROCS(0)))
+
+	ui.Section("Settings")
+	ui.KVf("zoom range", "%d..%d", flags.minZoom, flags.maxZoom)
+	ui.KVf("tile size", "%d px", 1<<flags.tileSizeLog2)
 	if flags.filterShortNames == "" {
-		cliKV("filter", "all GRIB shortNames")
+		ui.KV("filter", "all GRIB shortNames")
 	} else {
-		cliKV("filter", flags.filterShortNames)
+		ui.KV("filter", flags.filterShortNames)
+	}
+	ui.KVf("delta codec", "%s", boolWord(!flags.disableDelta))
+	if flags.zstdLevel > 0 {
+		ui.KVf("zstd level", "%d", flags.zstdLevel)
+	}
+	if flags.enableTileDict {
+		ui.KV("tile dict", "on")
 	}
 
-	cliSection("Scan GRIB")
 	data, err := os.ReadFile(in)
 	if err != nil {
 		return fmt.Errorf("read grib: %w", err)
@@ -1059,12 +1076,21 @@ func runEncodeGRIB(command string, args []string) error {
 	if err != nil {
 		return fmt.Errorf("scan grib: %w", err)
 	}
+
+	ui.Section("Encode")
+	scanPhase := ui.StartPhase("scan grib", int64(len(ranges)))
+	scanPhase.SetExtra(fmt.Sprintf("%s messages", commaInt(int64(len(ranges)))))
+
 	tParse := time.Now()
 	headers, skipMsg, bySig, allTimes, bbox, totalSeen, keptSeen, err := scanHeadersOnly(data, ranges, flags.filterShortNames)
 	if err != nil {
+		scanPhase.Done("failed")
 		return fmt.Errorf("scan headers: %w", err)
 	}
 	parseDuration := time.Since(tParse)
+	scanPhase.SetCurrent(int64(len(ranges)))
+	scanPhase.Done(fmt.Sprintf("%s msgs kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen))))
+
 	if keptSeen == 0 {
 		if flags.filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", flags.filterShortNames, totalSeen)
@@ -1083,11 +1109,18 @@ func runEncodeGRIB(command string, args []string) error {
 	}
 
 	specs := buildPreliminaryVariableSpecs(bySig, flags.precisionOverrides)
-	cliKVf("messages", "%s kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen)))
-	cliKVf("variables", "%d", len(specs))
-	cliKV("time axis", describeTimeCatalog(timeCatalog))
-	cliKV("grid bbox", formatBBox(bbox))
+	ui.KVf("variables", "%d", len(specs))
+	ui.KV("time axis", describeTimeCatalog(timeCatalog))
+	ui.KV("grid bbox", formatBBox(bbox))
 
+	expectedTiles := countExpectedTiles(headers, skipMsg, uint8(flags.minZoom), uint8(flags.maxZoom))
+
+	pixSize := 1 << flags.tileSizeLog2
+
+	var (
+		compressPhase, writePhase, snapPhase *Phase
+		bytesWritten                         atomic.Uint64
+	)
 	opts := encoder.Options{
 		TilePixelSizeLog2:     uint8(flags.tileSizeLog2),
 		MinZoom:               uint8(flags.minZoom),
@@ -1105,6 +1138,38 @@ func runEncodeGRIB(command string, args []string) error {
 		ZstdLevel:           flags.zstdLevel,
 		EnableTileDict:      flags.enableTileDict,
 		SkipInternalWorkers: true,
+		OnPhase: func(stage string) {
+			switch stage {
+			case "compress_blocks":
+				compressPhase = ui.StartPhase("compress blocks", 0)
+			case "write_blocks":
+				if compressPhase != nil {
+					compressPhase.Done("")
+				}
+				writePhase = ui.StartPhase("write blocks", 0)
+			case "write_snapshot":
+				if writePhase != nil {
+					writePhase.Done(humanBytes(int64(bytesWritten.Load())) + " on disk")
+				}
+				snapPhase = ui.StartPhase("write snapshot", 0)
+			}
+		},
+		OnBlockCompressed: func(idx, total int, bytes uint64) {
+			if compressPhase == nil {
+				return
+			}
+			compressPhase.SetTotal(int64(total))
+			compressPhase.AddCurrent(1)
+		},
+		OnBlockWritten: func(idx, total int, bytes uint64) {
+			if writePhase == nil {
+				return
+			}
+			writePhase.SetTotal(int64(total))
+			writePhase.AddCurrent(1)
+			n := bytesWritten.Add(bytes)
+			writePhase.SetExtra(humanBytes(int64(n)))
+		},
 	}
 
 	enc, err := encoder.NewStreamingEncoder(opts, flags.output)
@@ -1112,59 +1177,112 @@ func runEncodeGRIB(command string, args []string) error {
 		return fmt.Errorf("encoder init: %w", err)
 	}
 
-	pixSize := 1 << flags.tileSizeLog2
+	encodePhase := ui.StartPhase("decode + tile", expectedTiles)
+	var submittedAt, skippedAt atomic.Int64
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
 	t0 := time.Now()
-	submitted, skipped, err := streamParseAndTile(data, ranges, headers, skipMsg,
+	go func() {
+		defer close(pollDone)
+		t := time.NewTicker(120 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-t.C:
+				sub := submittedAt.Load()
+				sk := skippedAt.Load()
+				encodePhase.SetCurrent(sub + sk)
+				if elapsed := time.Since(t0); elapsed > 200*time.Millisecond {
+					rate := float64(sub) / elapsed.Seconds()
+					encodePhase.SetExtra(formatTileRate(rate) + "  " + commaInt(sub) + " written")
+				}
+			}
+		}
+	}()
+
+	submitted, skipped, err := streamParseAndTileWithProgress(data, ranges, headers, skipMsg,
 		bySig, timeIdxByTime, flags.precisionOverrides, enc,
-		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize, nil)
+		uint8(flags.minZoom), uint8(flags.maxZoom), pixSize, nil,
+		&submittedAt, &skippedAt)
+	close(stopPoll)
+	<-pollDone
 	if err != nil {
 		enc.Close()
+		encodePhase.Done("failed")
 		return fmt.Errorf("tile stream: %w", err)
 	}
 	encodeDuration := time.Since(t0)
+	encodePhase.SetCurrent(submitted + skipped)
+	encodePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(submitted), formatTileRateString(submitted, encodeDuration)))
 	data = nil
-	cliSection("Tile encoding")
-	cliKV("tiles written", commaInt(submitted))
-	cliKV("tiles skipped", commaInt(skipped))
-	cliKV("parse", formatDuration(parseDuration))
-	cliKV("tile+encode", formatDuration(encodeDuration))
-	cliKV("duration", formatDuration(parseDuration+encodeDuration))
-	cliKV("throughput", formatThroughput(submitted, parseDuration+encodeDuration, "tiles"))
-	cliKVf("workers", "%d", runtime.GOMAXPROCS(0))
+
+	if err := enc.Finish(); err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+	if snapPhase != nil {
+		snapPhase.Done("")
+	}
 
 	plans := finalVariablePlans(bySig, flags.precisionOverrides)
 	printVariablePlans(plans)
 
-	tFinish := time.Now()
-	if err := enc.Finish(); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-	cliKV("finish", formatDuration(time.Since(tFinish)))
+	ui.Section("Done")
 	st, _ := os.Stat(flags.output)
-	cliSection("Done")
+	rows := [][2]string{{"output", flags.output}}
 	if st != nil {
-		cliKV("file", flags.output)
-		cliKV("size", humanBytes(st.Size()))
+		rows = append(rows, [2]string{"size", humanBytes(st.Size())})
+		if origSize := int64(len(ranges)); origSize > 0 {
+			_ = origSize
+		}
+		if inSt, _ := os.Stat(in); inSt != nil && inSt.Size() > 0 {
+			ratio := float64(inSt.Size()) / float64(st.Size())
+			rows = append(rows, [2]string{"input -> output", fmt.Sprintf("%s -> %s  (%.2fx)", humanBytes(inSt.Size()), humanBytes(st.Size()), ratio)})
+		}
 	}
+	rows = append(rows,
+		[2]string{"tiles written", commaInt(submitted)},
+		[2]string{"tiles skipped", commaInt(skipped)},
+		[2]string{"scan", formatDuration(parseDuration)},
+		[2]string{"encode", formatDuration(encodeDuration)},
+		[2]string{"total", formatDuration(time.Since(tParse))},
+	)
+	ui.Summary(rows)
 	return nil
 }
 
 func printVariablePlans(plans []variablePlan) {
+	if len(plans) == 0 {
+		return
+	}
 	sort.Slice(plans, func(i, j int) bool { return plans[i].name < plans[j].name })
-	rows := make([][]string, 0, len(plans))
-	for _, p := range plans {
+	const maxRows = 20
+	visible := plans
+	hidden := 0
+	if len(plans) > maxRows {
+		sort.SliceStable(plans, func(i, j int) bool { return plans[i].messages > plans[j].messages })
+		visible = plans[:maxRows]
+		hidden = len(plans) - maxRows
+		sort.Slice(visible, func(i, j int) bool { return visible[i].name < visible[j].name })
+	}
+	rows := make([][]string, 0, len(visible))
+	for _, p := range visible {
 		rows = append(rows, []string{
 			p.name,
 			emptyAsNA(p.unit),
 			fmt.Sprintf("%d", p.messages),
 			formatRange(p.vmin, p.vmax),
 			formatFloat(p.precision) + " (" + p.precSrc + ")",
-			p.dtype,
+			dtypeBadge(p.dtype),
 			formatFloat(p.step),
 		})
 	}
-	cliSection("Variables")
-	cliTable([]string{"name", "unit", "msgs", "range", "precision", "dtype", "step"}, rows)
+	ui.Section("Variables")
+	cliTableAligned([]string{"name", "unit", "msgs", "range", "precision", "dtype", "step"}, rows, "llrllll")
+	if hidden > 0 {
+		ui.KVf("more", "%d variables omitted", hidden)
+	}
 }
 
 func buildTimeCatalog(times []time.Time) format.TimeCatalog {
@@ -1216,4 +1334,37 @@ func dtypeName(d quantize.DType) string {
 		return "f32"
 	}
 	return fmt.Sprintf("dtype(%d)", uint8(d))
+}
+
+// countExpectedTiles totals the tiles each kept message would emit across the
+// zoom range. Called once after the header scan to feed the progress bar.
+func countExpectedTiles(headers []parser.GribHeader, skip []bool, minZoom, maxZoom uint8) int64 {
+	var total int64
+	for i := range headers {
+		if skip != nil && i < len(skip) && skip[i] {
+			continue
+		}
+		shell := parser.GRIBFile{Header: headers[i]}
+		for z := minZoom; z <= maxZoom; z++ {
+			total += int64(len(tiler.TilesIntersectingGrid(&shell, z)))
+		}
+	}
+	return total
+}
+
+func formatTileRate(rate float64) string {
+	switch {
+	case rate >= 1e6:
+		return fmt.Sprintf("%.2fM tiles/s", rate/1e6)
+	case rate >= 1e3:
+		return fmt.Sprintf("%.1fk tiles/s", rate/1e3)
+	}
+	return fmt.Sprintf("%.0f tiles/s", rate)
+}
+
+func formatTileRateString(count int64, d time.Duration) string {
+	if count <= 0 || d <= 0 {
+		return "n/a"
+	}
+	return formatTileRate(float64(count) / d.Seconds())
 }

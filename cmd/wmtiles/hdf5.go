@@ -10,6 +10,7 @@ import (
 	"runtime/trace"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hstin-de/wmtiles/encode"
@@ -64,21 +65,50 @@ func runEncodeHDF5(command string, args []string) error {
 		}()
 	}
 
-	cliSection("WMTiles encode")
-	cliKV("output", flags.output)
-	cliKVf("zoom range", "%d..%d", flags.minZoom, flags.maxZoom)
-	cliKVf("tile size", "%d px", 1<<flags.tileSizeLog2)
+	subtitle := fmt.Sprintf("%d files -> %s   %d cores", len(inputs), flags.output, runtime.GOMAXPROCS(0))
+	ui.Banner(command, subtitle)
+
+	ui.Section("Settings")
+	ui.KVf("zoom range", "%d..%d", flags.minZoom, flags.maxZoom)
+	ui.KVf("tile size", "%d px", 1<<flags.tileSizeLog2)
 	if flags.filter == "" {
-		cliKV("filter", "all variables")
+		ui.KV("filter", "all variables")
 	} else {
-		cliKV("filter", flags.filter)
+		ui.KV("filter", flags.filter)
 	}
-	cliKVf("inputs", "%d HDF5 files", len(inputs))
+	ui.KVf("inputs", "%d HDF5 files", len(inputs))
 	if len(inputs) > 0 {
-		cliKV("first", inputs[0])
+		ui.KV("first", inputs[0])
 		if len(inputs) > 1 {
-			cliKV("last", inputs[len(inputs)-1])
+			ui.KV("last", inputs[len(inputs)-1])
 		}
+	}
+
+	ui.Section("Encode")
+
+	var (
+		scanPhase, tilePhase, compressPhase, writePhase, snapPhase *Phase
+		bytesOnDisk                                                atomic.Uint64
+		scannedFiles                                               atomic.Int64
+		scanStart                                                  atomic.Int64
+		scanEnd                                                    atomic.Int64
+		tileStart                                                  atomic.Int64
+		tileEnd                                                    atomic.Int64
+		finalPlans                                                 []encode.VariablePlan
+	)
+	var enc *encode.Encoder
+
+	endTilePhase := func() {
+		if tilePhase == nil {
+			return
+		}
+		sub, _ := enc.Progress()
+		tilePhase.SetCurrent(sub)
+		start := time.Unix(0, tileStart.Load())
+		dur := time.Since(start)
+		tileEnd.Store(time.Now().UnixNano())
+		tilePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(sub), formatTileRateString(sub, dur)))
+		tilePhase = nil
 	}
 
 	opts := encode.Options{
@@ -92,6 +122,63 @@ func runEncodeHDF5(command string, args []string) error {
 		},
 		DisableDeltaCodec: flags.disableDelta,
 		ZstdLevel:         flags.zstdLevel,
+		OnInputScanned: func(name string, records int) {
+			if scanPhase == nil {
+				scanStart.Store(time.Now().UnixNano())
+				scanPhase = ui.StartPhase("scan inputs", int64(len(inputs)))
+			}
+			n := scannedFiles.Add(1)
+			scanPhase.SetCurrent(n)
+			scanPhase.SetExtra(filepath.Base(name))
+		},
+		OnScanComplete: func(stats encode.ScanStats) {
+			scanEnd.Store(time.Now().UnixNano())
+			if scanPhase != nil {
+				scanPhase.Done(fmt.Sprintf("%d files, %s msgs kept", int(scannedFiles.Load()), commaInt(int64(stats.KeptMessages))))
+				scanPhase = nil
+			}
+			ui.KVf("variables", "%d", stats.VariableCount)
+			ui.KV("time axis", describeTimeCatalog(stats.TimeAxis))
+			ui.KV("grid bbox", formatBBox(stats.BBox))
+			tileStart.Store(time.Now().UnixNano())
+			tilePhase = ui.StartPhase("decode + tile", 0)
+		},
+		OnFinishStats: func(plans []encode.VariablePlan) {
+			finalPlans = plans
+		},
+		OnPhase: func(stage string) {
+			switch stage {
+			case "compress_blocks":
+				endTilePhase()
+				compressPhase = ui.StartPhase("compress blocks", 0)
+			case "write_blocks":
+				if compressPhase != nil {
+					compressPhase.Done("")
+					compressPhase = nil
+				}
+				writePhase = ui.StartPhase("write blocks", 0)
+			case "write_snapshot":
+				if writePhase != nil {
+					writePhase.Done(humanBytes(int64(bytesOnDisk.Load())) + " on disk")
+					writePhase = nil
+				}
+				snapPhase = ui.StartPhase("write snapshot", 0)
+			}
+		},
+		OnBlockCompressed: func(idx, total int, bytes uint64) {
+			if compressPhase != nil {
+				compressPhase.SetTotal(int64(total))
+				compressPhase.AddCurrent(1)
+			}
+		},
+		OnBlockWritten: func(idx, total int, bytes uint64) {
+			if writePhase != nil {
+				writePhase.SetTotal(int64(total))
+				writePhase.AddCurrent(1)
+				bytesOnDisk.Add(bytes)
+				writePhase.SetExtra(humanBytes(int64(bytesOnDisk.Load())))
+			}
+		},
 	}
 	if flags.filter != "" {
 		for n := range strings.SplitSeq(flags.filter, ",") {
@@ -102,30 +189,136 @@ func runEncodeHDF5(command string, args []string) error {
 		}
 	}
 
-	enc, err := encode.NewEncoder(flags.output, opts)
+	encCreated, err := encode.NewEncoder(flags.output, opts)
 	if err != nil {
 		return fmt.Errorf("encoder init: %w", err)
 	}
+	enc = encCreated
 	for _, in := range inputs {
 		if err := enc.AddFile(in, encode.FormatHDF5); err != nil {
 			return fmt.Errorf("add %s: %w", in, err)
 		}
 	}
 
-	t0 := time.Now()
-	cliSection("Tile encoding")
-	if err := enc.Finish(); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-	cliKV("duration", formatDuration(time.Since(t0)))
+	// Tile work runs inside Finish; we poll enc.Progress to keep tilePhase live.
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		var lastSub, lastSk int64
+		t := time.NewTicker(150 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-t.C:
+				if tilePhase == nil {
+					continue
+				}
+				sub, sk := enc.Progress()
+				if sub == lastSub && sk == lastSk {
+					continue
+				}
+				lastSub, lastSk = sub, sk
+				tilePhase.SetCurrent(sub + sk)
+				if start := tileStart.Load(); start > 0 {
+					elapsed := time.Since(time.Unix(0, start))
+					if elapsed > 250*time.Millisecond {
+						rate := float64(sub) / elapsed.Seconds()
+						tilePhase.SetExtra(formatTileRate(rate) + "  " + commaInt(sub) + " written")
+					}
+				}
+			}
+		}
+	}()
 
-	st, _ := os.Stat(flags.output)
-	cliSection("Done")
-	if st != nil {
-		cliKV("file", flags.output)
-		cliKV("size", humanBytes(st.Size()))
+	t0 := time.Now()
+	finishErr := enc.Finish()
+	close(stopPoll)
+	<-pollDone
+
+	if finishErr != nil {
+		if tilePhase != nil {
+			tilePhase.Done("failed")
+		}
+		return fmt.Errorf("encode: %w", finishErr)
 	}
+	if snapPhase != nil {
+		snapPhase.Done("")
+	}
+
+	if len(finalPlans) > 0 {
+		printEncodePlans(finalPlans)
+	}
+
+	sub, sk := enc.Progress()
+	ui.Section("Done")
+	st, _ := os.Stat(flags.output)
+	rows := [][2]string{{"output", flags.output}}
+	if st != nil {
+		rows = append(rows, [2]string{"size", humanBytes(st.Size())})
+		var totalInput int64
+		for _, in := range inputs {
+			if inSt, err := os.Stat(in); err == nil {
+				totalInput += inSt.Size()
+			}
+		}
+		if totalInput > 0 {
+			ratio := float64(totalInput) / float64(st.Size())
+			rows = append(rows, [2]string{"input -> output", fmt.Sprintf("%s -> %s  (%.2fx)", humanBytes(totalInput), humanBytes(st.Size()), ratio)})
+		}
+	}
+	scanDur := time.Duration(0)
+	if s, e := scanStart.Load(), scanEnd.Load(); s > 0 && e > s {
+		scanDur = time.Duration(e - s)
+	}
+	encodeDur := time.Duration(0)
+	if s, e := tileStart.Load(), tileEnd.Load(); s > 0 && e > s {
+		encodeDur = time.Duration(e - s)
+	}
+	rows = append(rows,
+		[2]string{"tiles written", commaInt(sub)},
+		[2]string{"tiles skipped", commaInt(sk)},
+		[2]string{"scan", formatDuration(scanDur)},
+		[2]string{"encode", formatDuration(encodeDur)},
+		[2]string{"total", formatDuration(time.Since(t0))},
+	)
+	ui.Summary(rows)
 	return nil
+}
+
+// printEncodePlans mirrors printVariablePlans for the encode.Encoder pipeline.
+func printEncodePlans(plans []encode.VariablePlan) {
+	if len(plans) == 0 {
+		return
+	}
+	const maxRows = 20
+	visible := plans
+	hidden := 0
+	if len(plans) > maxRows {
+		sort.SliceStable(plans, func(i, j int) bool { return plans[i].Messages > plans[j].Messages })
+		visible = plans[:maxRows]
+		hidden = len(plans) - maxRows
+		sort.Slice(visible, func(i, j int) bool { return visible[i].Name < visible[j].Name })
+	}
+	rows := make([][]string, 0, len(visible))
+	for _, p := range visible {
+		rows = append(rows, []string{
+			p.Name,
+			emptyAsNA(p.Unit),
+			fmt.Sprintf("%d", p.Messages),
+			formatRange(p.Min, p.Max),
+			formatFloat(p.Precision) + " (" + p.PrecSrc + ")",
+			dtypeBadge(p.DType),
+			formatFloat(p.Step),
+		})
+	}
+	ui.Section("Variables")
+	cliTableAligned([]string{"name", "unit", "msgs", "range", "precision", "dtype", "step"}, rows, "llrllll")
+	if hidden > 0 {
+		ui.KVf("more", "%d variables omitted", hidden)
+	}
 }
 
 type hdf5EncodeFlags struct {

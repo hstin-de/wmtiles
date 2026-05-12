@@ -1,70 +1,42 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"strings"
 	"time"
 )
 
-var cliOut io.Writer = os.Stdout
-var cliSectionStarted bool
+// cliOut is kept as a back-compat hook for the few callers that build bespoke
+// formatted lines (compare.go's fidelity table). It mirrors whatever the
+// renderer is writing to, so test harnesses can still capture output.
+var cliOut io.Writer = &renderProxy{}
 
-func cliSection(title string) {
-	if cliSectionStarted {
-		fmt.Fprintln(cliOut)
+type renderProxy struct{}
+
+func (renderProxy) Write(p []byte) (int, error) {
+	if ui == nil {
+		return len(p), nil
 	}
-	cliSectionStarted = true
-	fmt.Fprintln(cliOut, title)
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	return ui.out.Write(p)
 }
 
-func cliKV(label, value string) {
-	fmt.Fprintf(cliOut, "  %-20s %s\n", label+":", value)
-}
+func cliSection(title string) { ui.Section(title) }
+
+func cliKV(label, value string) { ui.KV(label, value) }
 
 func cliKVf(label, format string, args ...any) {
 	cliKV(label, fmt.Sprintf(format, args...))
 }
 
-func cliTable(headers []string, rows [][]string) {
-	if len(headers) == 0 {
-		return
-	}
-	widths := make([]int, len(headers))
-	for i, h := range headers {
-		widths[i] = len(h)
-	}
-	for _, row := range rows {
-		for i := range headers {
-			if i < len(row) && len(row[i]) > widths[i] {
-				widths[i] = len(row[i])
-			}
-		}
-	}
-	fmt.Fprint(cliOut, "  ")
-	for i, h := range headers {
-		if i > 0 {
-			fmt.Fprint(cliOut, "  ")
-		}
-		fmt.Fprintf(cliOut, "%-*s", widths[i], h)
-	}
-	fmt.Fprintln(cliOut)
-	for _, row := range rows {
-		fmt.Fprint(cliOut, "  ")
-		for i := range headers {
-			if i > 0 {
-				fmt.Fprint(cliOut, "  ")
-			}
-			cell := ""
-			if i < len(row) {
-				cell = row[i]
-			}
-			fmt.Fprintf(cliOut, "%-*s", widths[i], cell)
-		}
-		fmt.Fprintln(cliOut)
-	}
+func cliTable(headers []string, rows [][]string) { ui.Table(headers, rows, "") }
+
+func cliTableAligned(headers []string, rows [][]string, align string) {
+	ui.Table(headers, rows, align)
 }
 
 func boolWord(v bool) string {
@@ -102,7 +74,14 @@ func formatThroughput(count int64, d time.Duration, unit string) string {
 	if count <= 0 || d <= 0 {
 		return "n/a"
 	}
-	return fmt.Sprintf("%.1f %s/s", float64(count)/d.Seconds(), unit)
+	rate := float64(count) / d.Seconds()
+	switch {
+	case rate >= 1e6:
+		return fmt.Sprintf("%.2fM %s/s", rate/1e6, unit)
+	case rate >= 1e3:
+		return fmt.Sprintf("%.1fk %s/s", rate/1e3, unit)
+	}
+	return fmt.Sprintf("%.1f %s/s", rate, unit)
 }
 
 func formatDedupRatio(contents, addressed uint64) string {
@@ -142,4 +121,35 @@ func dtypeCodeName(d uint8) string {
 	default:
 		return fmt.Sprintf("dtype(%d)", d)
 	}
+}
+
+// dtypeBadge colours the small dtype tag so it pops in tables.
+func dtypeBadge(d string) string {
+	if ui == nil {
+		return d
+	}
+	switch d {
+	case "u8":
+		return ui.styled(d, ansiGreen)
+	case "u16":
+		return ui.styled(d, ansiCyan)
+	case "f32":
+		return ui.styled(d, ansiMagenta)
+	}
+	return d
+}
+
+// captureLines is used by tests that previously redirected cliOut to a buffer.
+// The renderer is paused, output is captured to buf, then resumed.
+func captureLines(fn func()) string {
+	var buf bytes.Buffer
+	if ui == nil {
+		fn()
+		return buf.String()
+	}
+	prev := ui.out
+	ui.out = &buf
+	defer func() { ui.out = prev }()
+	fn()
+	return buf.String()
 }

@@ -58,16 +58,16 @@ func runExtend(args []string) error {
 		srcFormat = srcFormatHDF5
 	}
 
-	cliSection("WMTiles extend")
-	cliKV("file", wmtPath)
-	cliKV("input", srcPath)
-	cliKV("source format", srcFormat.String())
+	ui.Banner("extend", fmt.Sprintf("%s <- %s   %d cores", wmtPath, srcPath, runtime.GOMAXPROCS(0)))
+
+	ui.Section("Settings")
+	ui.KV("source format", srcFormat.String())
 	if *filterShortNames == "" {
-		cliKV("filter", "all shortNames")
+		ui.KV("filter", "all shortNames")
 	} else {
-		cliKV("filter", *filterShortNames)
+		ui.KV("filter", *filterShortNames)
 	}
-	cliKV("replace blocks", boolWord(*allowReplace))
+	ui.KV("replace blocks", boolWord(*allowReplace))
 
 	r, err := reader.Open(wmtPath)
 	if err != nil {
@@ -76,12 +76,13 @@ func runExtend(args []string) error {
 	pixelSize := 1 << r.Header.TilePixelSizeLog2
 	minZoom := r.Header.MinZoom
 	maxZoom := r.Header.MaxZoom
-	cliKVf("current gen", "%d", r.Header.SnapshotGeneration)
-	cliKVf("zoom range", "%d..%d", minZoom, maxZoom)
-	cliKVf("tile size", "%d px", pixelSize)
+	ui.KVf("current gen", "%d", r.Header.SnapshotGeneration)
+	ui.KVf("zoom range", "%d..%d", minZoom, maxZoom)
+	ui.KVf("tile size", "%d px", pixelSize)
 	r.Close()
 
-	cliSection("Scan source")
+	ui.Section("Extend")
+	scanPhase := ui.StartPhase("scan source", 0)
 	var (
 		parsedMsgs           []parsedMsg
 		bySig                map[varKey]*varInfo
@@ -108,6 +109,7 @@ func runExtend(args []string) error {
 			return fmt.Errorf("scan GRIB: %w", err)
 		}
 	}
+	scanPhase.Done(fmt.Sprintf("%s msgs kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen))))
 	if keptSeen == 0 {
 		if *filterShortNames != "" {
 			return fmt.Errorf("filter %q matched no messages (scanned %d)", *filterShortNames, totalSeen)
@@ -118,11 +120,47 @@ func runExtend(args []string) error {
 		return fmt.Errorf("no forecast timestamps?")
 	}
 	timeCatalog := buildTimeCatalog(allTimes)
-	cliKVf("messages", "%s kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen)))
-	cliKVf("variables", "%d", len(bySig))
-	cliKV("time axis", describeTimeCatalog(timeCatalog))
+	ui.KVf("variables", "%d", len(bySig))
+	ui.KV("time axis", describeTimeCatalog(timeCatalog))
 
-	ctx, err := encoder.OpenForAppend(wmtPath, encoder.AppendOptions{AllowReplace: *allowReplace, SkipInternalWorkers: true})
+	var (
+		compressPhase, writePhase, snapPhase *Phase
+		bytesOnDisk                          atomic.Uint64
+	)
+	ctx, err := encoder.OpenForAppend(wmtPath, encoder.AppendOptions{
+		AllowReplace:        *allowReplace,
+		SkipInternalWorkers: true,
+		OnPhase: func(stage string) {
+			switch stage {
+			case "compress_blocks":
+				compressPhase = ui.StartPhase("compress blocks", 0)
+			case "write_blocks":
+				if compressPhase != nil {
+					compressPhase.Done("")
+				}
+				writePhase = ui.StartPhase("write blocks", 0)
+			case "write_snapshot":
+				if writePhase != nil {
+					writePhase.Done(humanBytes(int64(bytesOnDisk.Load())) + " on disk")
+				}
+				snapPhase = ui.StartPhase("write snapshot", 0)
+			}
+		},
+		OnBlockCompressed: func(idx, total int, bytes uint64) {
+			if compressPhase != nil {
+				compressPhase.SetTotal(int64(total))
+				compressPhase.AddCurrent(1)
+			}
+		},
+		OnBlockWritten: func(idx, total int, bytes uint64) {
+			if writePhase != nil {
+				writePhase.SetTotal(int64(total))
+				writePhase.AddCurrent(1)
+				bytesOnDisk.Add(bytes)
+				writePhase.SetExtra(humanBytes(int64(bytesOnDisk.Load())))
+			}
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("open for append: %w", err)
 	}
@@ -151,37 +189,43 @@ func runExtend(args []string) error {
 		return nil
 	}
 
+	encodePhase := ui.StartPhase("decode + tile", 0)
 	t0 := time.Now()
 	submitted, dropped, err := tileFromParsed(parsedMsgs, bySig, timeIdxByTime,
 		overrides, &appendSink{ctx: ctx, alreadyPresent: &alreadyPresent},
 		minZoom, maxZoom, pixelSize, onDup)
 	if err != nil {
+		encodePhase.Done("failed")
 		ctx.Close()
 		return fmt.Errorf("stream: %w", err)
 	}
 	encodeDuration := time.Since(t0)
-
-	plans := finalVariablePlans(bySig, overrides)
-	printVariablePlans(plans)
-	cliSection("Append plan")
-	cliKVf("already present", "%d", alreadyPresent.Load())
-
-	cliSection("Tile encoding")
-	cliKV("tiles written", commaInt(submitted))
-	cliKV("tiles skipped", commaInt(dropped))
-	cliKV("duration", formatDuration(encodeDuration))
-	cliKV("throughput", formatThroughput(submitted, encodeDuration, "tiles"))
-	cliKVf("workers", "%d", runtime.GOMAXPROCS(0))
+	encodePhase.SetCurrent(submitted + dropped)
+	encodePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(submitted), formatTileRateString(submitted, encodeDuration)))
 
 	if err := ctx.Finish(); err != nil {
 		return fmt.Errorf("commit append: %w", err)
 	}
-	st, _ := os.Stat(wmtPath)
-	cliSection("Done")
-	if st != nil {
-		cliKV("file", wmtPath)
-		cliKV("size", humanBytes(st.Size()))
+	if snapPhase != nil {
+		snapPhase.Done("")
 	}
+
+	plans := finalVariablePlans(bySig, overrides)
+	printVariablePlans(plans)
+
+	ui.Section("Done")
+	st, _ := os.Stat(wmtPath)
+	rows := [][2]string{{"file", wmtPath}}
+	if st != nil {
+		rows = append(rows, [2]string{"size", humanBytes(st.Size())})
+	}
+	rows = append(rows,
+		[2]string{"tiles written", commaInt(submitted)},
+		[2]string{"tiles skipped", commaInt(dropped)},
+		[2]string{"already present", fmt.Sprintf("%d", alreadyPresent.Load())},
+		[2]string{"duration", formatDuration(encodeDuration)},
+	)
+	ui.Summary(rows)
 	return nil
 }
 
@@ -220,18 +264,17 @@ func runCompact(args []string) error {
 		return err
 	}
 
-	cliSection("WMTiles compact")
-	cliKV("input", in)
-	cliKV("output", out)
+	ui.Banner("compact", fmt.Sprintf("%s -> %s", in, out))
 
 	r, err := reader.Open(in)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer r.Close()
-	cliKVf("generation", "%d", r.Header.SnapshotGeneration)
-	cliKVf("variables", "%d", len(r.Snapshot.Variables))
-	cliKVf("blocks", "%d", r.Snapshot.Header.NumBlocks)
+	ui.Section("Settings")
+	ui.KVf("generation", "%d", r.Header.SnapshotGeneration)
+	ui.KVf("variables", "%d", len(r.Snapshot.Variables))
+	ui.KVf("blocks", "%d", r.Snapshot.Header.NumBlocks)
 
 	specs := make([]encoder.VariableSpec, len(r.Snapshot.Variables))
 	for i, v := range r.Snapshot.Variables {
@@ -247,6 +290,10 @@ func runCompact(args []string) error {
 		float64(r.Header.BBoxLonMaxE7) / 1e7,
 		float64(r.Header.BBoxLatMaxE7) / 1e7,
 	}
+	var (
+		compressPhase, writePhase, snapPhase *Phase
+		bytesOnDisk                          atomic.Uint64
+	)
 	opts := encoder.Options{
 		TilePixelSizeLog2:     r.Header.TilePixelSizeLog2,
 		MinZoom:               r.Header.MinZoom,
@@ -256,6 +303,36 @@ func runCompact(args []string) error {
 		BBox:                  bbox,
 		Variables:             specs,
 		Metadata:              r.Snapshot.Metadata,
+		OnPhase: func(stage string) {
+			switch stage {
+			case "compress_blocks":
+				compressPhase = ui.StartPhase("compress blocks", 0)
+			case "write_blocks":
+				if compressPhase != nil {
+					compressPhase.Done("")
+				}
+				writePhase = ui.StartPhase("write blocks", 0)
+			case "write_snapshot":
+				if writePhase != nil {
+					writePhase.Done(humanBytes(int64(bytesOnDisk.Load())) + " on disk")
+				}
+				snapPhase = ui.StartPhase("write snapshot", 0)
+			}
+		},
+		OnBlockCompressed: func(idx, total int, bytes uint64) {
+			if compressPhase != nil {
+				compressPhase.SetTotal(int64(total))
+				compressPhase.AddCurrent(1)
+			}
+		},
+		OnBlockWritten: func(idx, total int, bytes uint64) {
+			if writePhase != nil {
+				writePhase.SetTotal(int64(total))
+				writePhase.AddCurrent(1)
+				bytesOnDisk.Add(bytes)
+				writePhase.SetExtra(humanBytes(int64(bytesOnDisk.Load())))
+			}
+		},
 	}
 	enc, err := encoder.NewStreamingEncoder(opts, out)
 	if err != nil {
@@ -288,6 +365,9 @@ func runCompact(args []string) error {
 
 	declared := 0
 	tilesCopied := 0
+	ui.Section("Compact")
+	copyPhase := ui.StartPhase("copy tiles", int64(len(rows)))
+	tCopy := time.Now()
 	for _, row := range rows {
 		e := row.entry
 		precision := r.Snapshot.Variables[row.varID].DefaultPrecisionHint
@@ -318,20 +398,35 @@ func runCompact(args []string) error {
 			enc.Close()
 			return err
 		}
+		copyPhase.AddCurrent(1)
 	}
+	copyPhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(int64(tilesCopied)), formatTileRateString(int64(tilesCopied), time.Since(tCopy))))
 
 	if err := enc.Finish(); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
+	if snapPhase != nil {
+		snapPhase.Done("")
+	}
+
 	st, _ := os.Stat(out)
 	stIn, _ := os.Stat(in)
-	cliSection("Done")
+	ui.Section("Done")
+	rows2 := [][2]string{{"output", out}}
 	if st != nil && stIn != nil {
-		cliKV("input size", humanBytes(stIn.Size()))
-		cliKV("output size", humanBytes(st.Size()))
-		cliKVf("blocks copied", "%d", declared)
-		cliKV("tiles copied", commaInt(int64(tilesCopied)))
-		cliKV("file", out)
+		rows2 = append(rows2,
+			[2]string{"input size", humanBytes(stIn.Size())},
+			[2]string{"output size", humanBytes(st.Size())},
+		)
+		if stIn.Size() > 0 {
+			ratio := float64(stIn.Size()) / float64(st.Size())
+			rows2 = append(rows2, [2]string{"ratio", fmt.Sprintf("%.2fx", ratio)})
+		}
 	}
+	rows2 = append(rows2,
+		[2]string{"blocks copied", fmt.Sprintf("%d", declared)},
+		[2]string{"tiles copied", commaInt(int64(tilesCopied))},
+	)
+	ui.Summary(rows2)
 	return nil
 }

@@ -82,6 +82,20 @@ type Options struct {
 	// SkipInternalWorkers disables the channel-based quantize+codec pool;
 	// callers must drive the encoder via DirectWorker.SubmitDirect.
 	SkipInternalWorkers bool
+
+	// OnBlockCompressed fires once per block after finishBlock returns. idx is
+	// the position in the declaration order; total is the full count. bytes is
+	// the final block length including its header. Safe to leave nil.
+	OnBlockCompressed func(idx, total int, bytes uint64)
+
+	// OnBlockWritten fires once per block after its bytes have been streamed to
+	// disk. idx/total mirror OnBlockCompressed; bytes is the on-disk length.
+	OnBlockWritten func(idx, total int, bytes uint64)
+
+	// OnPhase reports the Finish-side stage transitions ("compress_blocks",
+	// "write_blocks", "write_snapshot"). Use it to flip the CLI renderer
+	// without polling.
+	OnPhase func(stage string)
 }
 
 func defaults(o *Options) {

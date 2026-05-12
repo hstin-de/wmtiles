@@ -9,10 +9,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hstin-de/wmtiles/encoder"
+	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/parser"
+	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/tiler"
 )
 
@@ -58,6 +61,39 @@ type Options struct {
 	// the same resolved variable and valid time. By default duplicates are an
 	// error.
 	AllowDuplicateMessages bool
+
+	// Progress callbacks mirror encoder.Options; all are optional and nil-safe.
+	OnInputScanned    func(name string, records int)
+	OnScanComplete    func(stats ScanStats)
+	OnFinishStats     func(plans []VariablePlan)
+	OnTileSubmitted   func(submitted, skipped int64)
+	OnBlockCompressed func(idx, total int, bytes uint64)
+	OnBlockWritten    func(idx, total int, bytes uint64)
+	OnPhase           func(stage string)
+}
+
+// ScanStats summarises what scanInputs found, fired right before tile work
+// begins so the CLI can print variable count, time axis, and bbox up front.
+type ScanStats struct {
+	InputCount    int
+	TotalMessages int
+	KeptMessages  int
+	VariableCount int
+	TimeAxis      format.TimeCatalog
+	BBox          [4]float64
+}
+
+// VariablePlan describes one resolved variable after stream completes.
+type VariablePlan struct {
+	Name      string
+	Unit      string
+	Messages  int
+	Min       float64
+	Max       float64
+	Precision float64
+	PrecSrc   string
+	DType     string
+	Step      float64
 }
 
 // Encoder collects one or more source inputs and writes them as one fresh WMT
@@ -68,6 +104,15 @@ type Encoder struct {
 	opts     Options
 	inputs   []input
 	finished bool
+
+	submitted atomic.Int64
+	skipped   atomic.Int64
+}
+
+// Progress returns the number of tiles submitted to and skipped by the active
+// Finish call. Safe to call from any goroutine while Finish is in flight.
+func (e *Encoder) Progress() (submitted, skipped int64) {
+	return e.submitted.Load(), e.skipped.Load()
 }
 
 type input struct {
@@ -177,19 +222,35 @@ func (e *Encoder) Finish() error {
 		return err
 	}
 	refTime := times[0]
+	timeCat := timeCatalogFromTimes(times)
+	bboxArr := [4]float64{bounds.West, bounds.South, bounds.East, bounds.North}
+
+	if e.opts.OnScanComplete != nil {
+		e.opts.OnScanComplete(ScanStats{
+			InputCount:    len(e.inputs),
+			TotalMessages: kept,
+			KeptMessages:  kept,
+			VariableCount: len(bySig),
+			TimeAxis:      timeCat,
+			BBox:          bboxArr,
+		})
+	}
 	enc, err := encoder.NewStreamingEncoder(encoder.Options{
 		TilePixelSizeLog2:     tileSizeLog2,
 		MinZoom:               e.opts.MinZoom,
 		MaxZoom:               e.opts.MaxZoom,
 		ReferenceForecastTime: refTime,
-		TimeCatalog:           timeCatalogFromTimes(times),
-		BBox:                  [4]float64{bounds.West, bounds.South, bounds.East, bounds.North},
+		TimeCatalog:           timeCat,
+		BBox:                  bboxArr,
 		Variables:             specs,
 		Metadata:              e.metadata(kept),
 		CreationTime:          e.opts.CreationTime,
 		OnPixelsConsumed:      tiler.PutTileBuf,
 		DisableDeltaCodec:     e.opts.DisableDeltaCodec,
 		ZstdLevel:             e.opts.ZstdLevel,
+		OnBlockCompressed:     e.opts.OnBlockCompressed,
+		OnBlockWritten:        e.opts.OnBlockWritten,
+		OnPhase:               e.opts.OnPhase,
 	}, e.outPath)
 	if err != nil {
 		return fmt.Errorf("wmtiles/encode: encoder init: %w", err)
@@ -199,10 +260,69 @@ func (e *Encoder) Finish() error {
 		enc.Close()
 		return err
 	}
+
+	if e.opts.OnFinishStats != nil {
+		e.opts.OnFinishStats(finalVariablePlans(bySig, e.opts.Precision))
+	}
+
 	if err := enc.Finish(); err != nil {
 		return fmt.Errorf("wmtiles/encode: encode: %w", err)
 	}
 	return nil
+}
+
+// finalVariablePlans converts the per-variable stats accumulated during
+// streamTiles into a sorted public view for the CLI Variables table.
+func finalVariablePlans(bySig map[varKey]*varInfo, overrides map[string]float64) []VariablePlan {
+	out := make([]VariablePlan, 0, len(bySig))
+	for _, v := range bySig {
+		if !v.hasFinite {
+			continue
+		}
+		precision, src := resolvePrecisionSource(v, overrides)
+		params := quantize.FitParams(v.vmin, v.vmax, precision)
+		out = append(out, VariablePlan{
+			Name:      v.name,
+			Unit:      v.unit,
+			Messages:  v.messageCount,
+			Min:       v.vmin,
+			Max:       v.vmax,
+			Precision: precision,
+			PrecSrc:   src,
+			DType:     dtypeStr(params.DType),
+			Step:      params.Scale,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func resolvePrecisionSource(v *varInfo, overrides map[string]float64) (float64, string) {
+	if p, ok := overrides[v.name]; ok {
+		return p, "override"
+	}
+	if p, ok := overrides[v.shortName]; ok {
+		return p, "override"
+	}
+	if p := defaultPrecisionFor(v.shortName, v.unit); p > 0 {
+		return p, "auto"
+	}
+	if v.vmax > v.vmin {
+		return (v.vmax - v.vmin) / autoPrecisionSteps, "cap"
+	}
+	return 0, "default"
+}
+
+func dtypeStr(d quantize.DType) string {
+	switch d {
+	case quantize.DTypeU8:
+		return "u8"
+	case quantize.DTypeU16:
+		return "u16"
+	case quantize.DTypeF32:
+		return "f32"
+	}
+	return fmt.Sprintf("dtype(%d)", uint8(d))
 }
 
 func (e *Encoder) metadata(messageCount int) map[string]any {
@@ -279,6 +399,7 @@ func (e *Encoder) scanInputs() (
 	timesSeen := map[time.Time]struct{}{}
 	boundsInit := false
 	for _, in := range e.inputs {
+		beforeKept := keptSeen
 		err = in.forEachHeaderFiltered(keepShortName, func(h parser.GribHeader) error {
 			keptSeen++
 
@@ -327,6 +448,9 @@ func (e *Encoder) scanInputs() (
 		})
 		if err != nil {
 			return nil, nil, scanBounds{}, totalSeen, keptSeen, fmt.Errorf("wmtiles/encode: scan %s: %w", in.name, err)
+		}
+		if e.opts.OnInputScanned != nil {
+			e.opts.OnInputScanned(in.name, keptSeen-beforeKept)
 		}
 	}
 
@@ -444,6 +568,7 @@ func (e *Encoder) streamTiles(
 				}
 				px := tiler.Tile(w.s, w.z, w.x, w.y, pixSize)
 				if px == nil {
+					e.skipped.Add(1)
 					continue
 				}
 				if err := enc.Submit(encoder.Tile{
@@ -454,6 +579,7 @@ func (e *Encoder) streamTiles(
 					setErr(err)
 					continue
 				}
+				e.submitted.Add(1)
 			}
 		}()
 	}

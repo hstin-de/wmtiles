@@ -62,16 +62,16 @@ func runServe(args []string) error {
 	})
 
 	baseURL := serveBaseURL(*addr)
-	cliSection("WMTiles serve")
-	cliKV("file", path)
-	cliKV("data URL", baseURL+"/wmt")
+	ui.Banner("serve", path)
+	ui.Section("Serving")
+	ui.KV("data URL", ui.styled(baseURL+"/wmt", ansiBrCyan))
 	if len(web.ViewerJS) == 0 {
-		cliKV("viewer", "not bundled")
-		cliKV("note", "/wmt works; /viewer.js and / return 404")
+		ui.KV("viewer", "not bundled")
+		ui.KV("note", "/wmt works; /viewer.js and / return 404")
 	} else {
-		cliKV("viewer URL", baseURL+"/")
+		ui.KV("viewer URL", ui.styled(baseURL+"/", ansiBrCyan))
 	}
-	cliKV("status", "listening")
+	ui.KV("status", ui.styled("listening", ansiGreen, ansiBold))
 	return http.ListenAndServe(*addr, mux)
 }
 

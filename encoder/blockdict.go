@@ -221,8 +221,9 @@ func defaultZstdLevel(level int) int {
 
 // finishBlocksParallel runs finishBlock on every block over a GOMAXPROCS
 // worker pool. Blocks are independent after addEncoded, so no synchronisation
-// is needed beyond the result slice.
-func finishBlocksParallel(declarations []blockKey, blocks map[blockKey]*blockBuilder, comp format.InternalCompression, dictOpts dictOptions) error {
+// is needed beyond the result slice. onDone, if non-nil, is invoked once per
+// block under a mutex with the declaration index and final block byte length.
+func finishBlocksParallel(declarations []blockKey, blocks map[blockKey]*blockBuilder, comp format.InternalCompression, dictOpts dictOptions, onDone func(idx int, bytes uint64)) error {
 	n := len(declarations)
 	if n == 0 {
 		return nil
@@ -241,6 +242,7 @@ func finishBlocksParallel(declarations []blockKey, blocks map[blockKey]*blockBui
 	close(jobs)
 
 	errs := make([]error, n)
+	var doneMu sync.Mutex
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -250,6 +252,13 @@ func finishBlocksParallel(declarations []blockKey, blocks map[blockKey]*blockBui
 				bb := blocks[declarations[i]]
 				if e := bb.finishBlock(comp, dictOpts); e != nil {
 					errs[i] = e
+					continue
+				}
+				if onDone != nil {
+					entry := bb.blockTableEntry(0)
+					doneMu.Lock()
+					onDone(i, entry.BlockLength)
+					doneMu.Unlock()
 				}
 			}
 		}()

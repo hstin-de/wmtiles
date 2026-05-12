@@ -32,6 +32,12 @@ type AppendOptions struct {
 	// SkipInternalWorkers disables the channel-based quantize+codec pool;
 	// callers must drive the context via NewDirectAppendWorker.
 	SkipInternalWorkers bool
+
+	// OnBlockCompressed / OnBlockWritten / OnPhase mirror encoder.Options. Used
+	// to drive the CLI renderer without polling.
+	OnBlockCompressed func(idx, total int, bytes uint64)
+	OnBlockWritten    func(idx, total int, bytes uint64)
+	OnPhase           func(stage string)
 }
 
 type AppendCtx struct {
@@ -76,6 +82,16 @@ type AppendCtx struct {
 	errMu     sync.Mutex
 	firstErr  error
 	finishing sync.Once
+
+	onBlockCompressed func(idx, total int, bytes uint64)
+	onBlockWritten    func(idx, total int, bytes uint64)
+	onPhase           func(stage string)
+}
+
+func (a *AppendCtx) firePhase(stage string) {
+	if a.onPhase != nil {
+		a.onPhase(stage)
+	}
 }
 
 type loadedSnapshot struct {
@@ -151,6 +167,9 @@ func OpenForAppend(path string, opts AppendOptions) (*AppendCtx, error) {
 		timeCatalog:          cloneTimeCatalog(snap.timeCat),
 		cursor:               h.FileLogicalEnd - uint64(format.FileTrailerSize), // overwrite existing trailer; new blocks + trailer are appended from here
 		serializerDone:       make(chan struct{}),
+		onBlockCompressed:    opts.OnBlockCompressed,
+		onBlockWritten:       opts.OnBlockWritten,
+		onPhase:              opts.OnPhase,
 	}
 
 	ctx.existingBlocks = existing
@@ -485,7 +504,15 @@ func (a *AppendCtx) Finish() error {
 		comp := a.header.InternalCompression
 		dictOpts := defaultDictOptions()
 		dictOpts.enabled = a.enableTileDict
-		if e := finishBlocksParallel(a.declarations, a.blocks, comp, dictOpts); e != nil {
+		totalBlocks := len(a.declarations)
+		a.firePhase("compress_blocks")
+		var compressCb func(int, uint64)
+		if a.onBlockCompressed != nil {
+			compressCb = func(idx int, bytes uint64) {
+				a.onBlockCompressed(idx, totalBlocks, bytes)
+			}
+		}
+		if e := finishBlocksParallel(a.declarations, a.blocks, comp, dictOpts, compressCb); e != nil {
 			err = e
 			a.cleanupOnErr()
 			return
@@ -497,7 +524,8 @@ func (a *AppendCtx) Finish() error {
 			a.cleanupOnErr()
 			return
 		}
-		for _, k := range a.declarations {
+		a.firePhase("write_blocks")
+		for i, k := range a.declarations {
 			bb := a.blocks[k]
 			off := a.cursor
 			n, e := bb.writeBlockTo(a.out)
@@ -508,6 +536,9 @@ func (a *AppendCtx) Finish() error {
 			}
 			a.cursor += uint64(n)
 			newEntries = append(newEntries, bb.blockTableEntry(off))
+			if a.onBlockWritten != nil {
+				a.onBlockWritten(i, totalBlocks, uint64(n))
+			}
 			bb.release()
 		}
 

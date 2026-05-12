@@ -11,6 +11,7 @@ import (
 )
 
 func main() {
+	initRenderer()
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -120,25 +121,26 @@ func runInspect(args []string) error {
 	h := r.Header
 	snap := r.Snapshot
 
-	cliSection("WMTiles inspect")
-	cliKV("file", args[0])
-	if st, _ := os.Stat(args[0]); st != nil {
-		cliKV("file size", humanBytes(st.Size()))
-		cliKV("logical end", humanBytes(int64(h.FileLogicalEnd)))
-	}
-	cliKVf("format version", "%d", h.FormatVersion)
-	cliKVf("generation", "%d", h.SnapshotGeneration)
-	cliKVf("zoom range", "%d..%d", h.MinZoom, h.MaxZoom)
-	cliKVf("tile size", "%d px", 1<<h.TilePixelSizeLog2)
-	cliKVf("compression", "%d", h.InternalCompression)
-	cliKV("cold start", boolWord(h.Flags&format.FlagColdStartInWindow != 0))
-	cliKV("previous snap", boolWord(h.Flags&format.FlagHasPreviousSnapshot != 0))
+	ui.Banner("inspect", args[0])
 
-	cliSection("Snapshot")
-	cliKV("reference time", time.UnixMilli(snap.Header.ReferenceTimeMs).UTC().Format(time.RFC3339))
-	cliKV("time axis", describeTimeCatalog(snap.TimeCat))
-	cliKVf("variables", "%d", len(snap.Variables))
-	cliKVf("blocks", "%d", snap.Header.NumBlocks)
+	ui.Section("File")
+	if st, _ := os.Stat(args[0]); st != nil {
+		ui.KV("file size", humanBytes(st.Size()))
+		ui.KV("logical end", humanBytes(int64(h.FileLogicalEnd)))
+	}
+	ui.KVf("format version", "%d", h.FormatVersion)
+	ui.KVf("generation", "%d", h.SnapshotGeneration)
+	ui.KVf("zoom range", "%d..%d", h.MinZoom, h.MaxZoom)
+	ui.KVf("tile size", "%d px", 1<<h.TilePixelSizeLog2)
+	ui.KVf("compression", "%d", h.InternalCompression)
+	ui.KV("cold start", boolWord(h.Flags&format.FlagColdStartInWindow != 0))
+	ui.KV("previous snap", boolWord(h.Flags&format.FlagHasPreviousSnapshot != 0))
+
+	ui.Section("Snapshot")
+	ui.KV("reference time", time.UnixMilli(snap.Header.ReferenceTimeMs).UTC().Format(time.RFC3339))
+	ui.KV("time axis", describeTimeCatalog(snap.TimeCat))
+	ui.KVf("variables", "%d", len(snap.Variables))
+	ui.KVf("blocks", "%d", snap.Header.NumBlocks)
 
 	rows := make([][]string, 0, len(snap.Variables))
 	for _, v := range snap.Variables {
@@ -154,14 +156,14 @@ func runInspect(args []string) error {
 			fmt.Sprintf("%d", v.VariableID),
 			v.Name,
 			emptyAsNA(v.Unit),
-			dtypeCodeName(v.DefaultDType),
+			dtypeBadge(dtypeCodeName(v.DefaultDType)),
 			formatFloat(v.DefaultPrecisionHint),
 			"[" + minS + ", " + maxS + "]",
 			emptyAsNA(v.ColormapHint),
 		})
 	}
-	cliSection("Variables")
-	cliTable([]string{"id", "name", "unit", "dtype", "precision", "range", "colormap"}, rows)
+	ui.Section("Variables")
+	cliTableAligned([]string{"id", "name", "unit", "dtype", "precision", "range", "colormap"}, rows, "rlllllll")
 
 	totalBlocks := 0
 	totalAddressed := uint64(0)
@@ -176,23 +178,23 @@ func runInspect(args []string) error {
 	}); err != nil {
 		return fmt.Errorf("iterate blocks: %w", err)
 	}
-	cliSection("Storage")
-	cliKVf("blocks", "%d", totalBlocks)
-	cliKV("addressed tiles", commaUint(totalAddressed))
-	cliKV("unique blobs", commaUint(totalContents))
-	cliKV("dedup ratio", formatDedupRatio(totalContents, totalAddressed))
-	cliKV("variable catalog", humanBytes(int64(snap.Header.VariableCatalogLen)))
-	cliKV("time catalog", humanBytes(int64(snap.Header.TimeCatalogLen)))
-	cliKV("block table root", humanBytes(int64(snap.Header.BlockTableRootLen)))
-	cliKV("block table leaves", humanBytes(int64(snap.Header.BlockTableLeavesLen)))
-	cliKV("metadata", humanBytes(int64(snap.Header.MetadataLen)))
-	cliKV("blocks total", humanBytes(int64(totalBytes)))
+	ui.Section("Storage")
+	ui.KVf("blocks", "%d", totalBlocks)
+	ui.KV("addressed tiles", commaUint(totalAddressed))
+	ui.KV("unique blobs", commaUint(totalContents))
+	ui.KV("dedup ratio", formatDedupRatio(totalContents, totalAddressed))
+	ui.KV("variable catalog", humanBytes(int64(snap.Header.VariableCatalogLen)))
+	ui.KV("time catalog", humanBytes(int64(snap.Header.TimeCatalogLen)))
+	ui.KV("block table root", humanBytes(int64(snap.Header.BlockTableRootLen)))
+	ui.KV("block table leaves", humanBytes(int64(snap.Header.BlockTableLeavesLen)))
+	ui.KV("metadata", humanBytes(int64(snap.Header.MetadataLen)))
+	ui.KV("blocks total", humanBytes(int64(totalBytes)))
 
 	st, _ := os.Stat(args[0])
 	if st != nil {
 		slack := int64(st.Size()) - int64(h.FileLogicalEnd)
 		if slack > 0 {
-			cliKV("orphaned bytes", humanBytes(slack))
+			ui.KV("orphaned bytes", humanBytes(slack))
 		}
 	}
 	return nil
@@ -208,12 +210,18 @@ func runVerify(args []string) error {
 	}
 	defer r.Close()
 
+	ui.Banner("verify", args[0])
+
+	ui.Section("Verify")
 	if err := r.SanityCheck(); err != nil {
 		return err
 	}
 
+	totalBlocks := int64(r.Snapshot.Header.NumBlocks)
+	verifyPhase := ui.StartPhase("verify blocks", totalBlocks)
 	totalAddressed := uint64(0)
 	totalContents := uint64(0)
+	var scanned int64
 	if err := r.EachBlock(func(e format.BlockTableEntry) error {
 		totalAddressed += e.NumAddressedTiles
 		totalContents += e.NumTileContents
@@ -222,18 +230,23 @@ func runVerify(args []string) error {
 			r.Header.MinZoom, 0, 0, out); err != nil {
 			_ = err
 		}
+		scanned++
+		verifyPhase.SetCurrent(scanned)
 		return nil
 	}); err != nil {
+		verifyPhase.Done("failed")
 		return err
 	}
+	verifyPhase.Done("")
 
-	cliSection("WMTiles verify")
-	cliKV("file", args[0])
-	cliKV("status", "ok")
-	cliKV("checks", "header, snapshot, block table, sample tile decode")
-	cliKV("addressed tiles", commaUint(totalAddressed))
-	cliKV("unique blobs", commaUint(totalContents))
-	cliKV("dedup ratio", formatDedupRatio(totalContents, totalAddressed))
+	ui.Section("Done")
+	ui.Summary([][2]string{
+		{"status", ui.styled("ok", ansiGreen, ansiBold)},
+		{"checks", "header, snapshot, block table, sample tile decode"},
+		{"addressed tiles", commaUint(totalAddressed)},
+		{"unique blobs", commaUint(totalContents)},
+		{"dedup ratio", formatDedupRatio(totalContents, totalAddressed)},
+	})
 	return nil
 }
 
@@ -248,22 +261,21 @@ func runSnapshotHistory(args []string) error {
 	defer r.Close()
 
 	h := r.Header
-	cliSection("WMTiles snapshots")
-	cliKV("file", args[0])
-	cliSection("Active snapshot")
-	cliKVf("generation", "%d", h.SnapshotGeneration)
-	cliKVf("offset", "%d", h.ActiveSnapshotOffset)
-	cliKV("length", humanBytes(int64(h.ActiveSnapshotLength)))
-	cliKVf("variables", "%d", r.Snapshot.Header.NumVariables)
-	cliKVf("time steps", "%d", r.Snapshot.Header.NumTimeSteps)
-	cliKVf("blocks", "%d", r.Snapshot.Header.NumBlocks)
+	ui.Banner("snapshot-history", args[0])
+	ui.Section("Active snapshot")
+	ui.KVf("generation", "%d", h.SnapshotGeneration)
+	ui.KVf("offset", "%d", h.ActiveSnapshotOffset)
+	ui.KV("length", humanBytes(int64(h.ActiveSnapshotLength)))
+	ui.KVf("variables", "%d", r.Snapshot.Header.NumVariables)
+	ui.KVf("time steps", "%d", r.Snapshot.Header.NumTimeSteps)
+	ui.KVf("blocks", "%d", r.Snapshot.Header.NumBlocks)
 	if h.Flags&format.FlagHasPreviousSnapshot != 0 {
-		cliSection("Previous snapshot")
-		cliKVf("offset", "%d", h.PreviousSnapshotOffset)
-		cliKV("length", humanBytes(int64(h.PreviousSnapshotLength)))
+		ui.Section("Previous snapshot")
+		ui.KVf("offset", "%d", h.PreviousSnapshotOffset)
+		ui.KV("length", humanBytes(int64(h.PreviousSnapshotLength)))
 	} else {
-		cliSection("Previous snapshot")
-		cliKV("status", "none")
+		ui.Section("Previous snapshot")
+		ui.KV("status", "none")
 	}
 	return nil
 }

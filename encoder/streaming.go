@@ -299,6 +299,12 @@ func (s *StreamingEncoder) Submit(t Tile) error {
 	return nil
 }
 
+func (s *StreamingEncoder) firePhase(stage string) {
+	if s.opts.OnPhase != nil {
+		s.opts.OnPhase(stage)
+	}
+}
+
 func (s *StreamingEncoder) Finish() error {
 	var err error
 	s.finishing.Do(func() {
@@ -319,7 +325,15 @@ func (s *StreamingEncoder) Finish() error {
 		dictOpts := defaultDictOptions()
 		dictOpts.enabled = s.opts.EnableTileDict
 		dictOpts.level = s.opts.ZstdLevel
-		if e := finishBlocksParallel(s.declarations, s.blocks, s.opts.InternalCompression, dictOpts); e != nil {
+		totalBlocks := len(s.declarations)
+		s.firePhase("compress_blocks")
+		var compressCb func(int, uint64)
+		if s.opts.OnBlockCompressed != nil {
+			compressCb = func(idx int, bytes uint64) {
+				s.opts.OnBlockCompressed(idx, totalBlocks, bytes)
+			}
+		}
+		if e := finishBlocksParallel(s.declarations, s.blocks, s.opts.InternalCompression, dictOpts, compressCb); e != nil {
 			err = e
 			s.cleanupOnErr()
 			return
@@ -330,7 +344,8 @@ func (s *StreamingEncoder) Finish() error {
 			s.cleanupOnErr()
 			return
 		}
-		for _, k := range s.declarations {
+		s.firePhase("write_blocks")
+		for i, k := range s.declarations {
 			bb := s.blocks[k]
 			off := s.cursor
 			n, e := bb.writeBlockTo(s.out)
@@ -341,6 +356,9 @@ func (s *StreamingEncoder) Finish() error {
 			}
 			s.cursor += uint64(n)
 			s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
+			if s.opts.OnBlockWritten != nil {
+				s.opts.OnBlockWritten(i, totalBlocks, uint64(n))
+			}
 			bb.release()
 		}
 
@@ -361,6 +379,7 @@ func (s *StreamingEncoder) Finish() error {
 		if now.IsZero() {
 			now = time.Now()
 		}
+		s.firePhase("write_snapshot")
 		plan := &snapshotPlan{
 			creationTimeMs:  now.UnixMilli(),
 			referenceTimeMs: msFromTime(s.opts.ReferenceForecastTime),
