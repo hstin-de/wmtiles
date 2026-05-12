@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -14,20 +13,13 @@ import (
 
 	"github.com/hstin-de/wmtiles/directory"
 	"github.com/hstin-de/wmtiles/format"
+	"github.com/hstin-de/wmtiles/internal/scan"
 	"github.com/hstin-de/wmtiles/parser"
 	"github.com/hstin-de/wmtiles/quantize"
 	"github.com/hstin-de/wmtiles/reader"
 	"github.com/hstin-de/wmtiles/tileid"
 	"github.com/hstin-de/wmtiles/tiler"
 )
-
-type compareFlags struct {
-	srcPath, wmtPath string
-	srcFormat        encodeSrcFormat
-	varFilter        string
-	zoomFilter       int
-	tolOverride      float64
-}
 
 type encodeSrcFormat int
 
@@ -45,87 +37,56 @@ func (f encodeSrcFormat) String() string {
 	}
 }
 
-func parseCompareFlags(args []string) (compareFlags, error) {
-	fs := flag.NewFlagSet("compare", flag.ContinueOnError)
-	varFilter := fs.String("variable", "", "only check this .wmt variable name (default: all)")
-	zoomFilter := fs.Int("zoom", -1, "only check tiles at this zoom level (default: all zooms in the file)")
-	tolOverride := fs.Float64("tolerance", 0, "override per variable tolerance (default: per block scale/2)")
-	formatOverride := fs.String("format", "", "override source format (grib2|hdf5); default = auto-detect")
-	if err := fs.Parse(args); err != nil {
-		return compareFlags{}, err
+func runCompare(c *compareCmd) error {
+	if _, err := os.Stat(c.Source); err != nil {
+		return err
 	}
-	if fs.NArg() != 2 {
-		return compareFlags{}, fmt.Errorf("usage: wmtiles compare <input.{grib2|h5}> <file.wmt> [--variable NAME] [--zoom Z] [--tolerance K] [--format grib2|hdf5]")
-	}
-	srcPath := fs.Arg(0)
-	srcFormat := srcFormatGRIB2
-	if *formatOverride != "" {
-		switch strings.ToLower(*formatOverride) {
-		case "hdf5":
-			srcFormat = srcFormatHDF5
-		case "grib2":
-			srcFormat = srcFormatGRIB2
-		default:
-			return compareFlags{}, fmt.Errorf("--format must be grib2 or hdf5, got %q", *formatOverride)
-		}
-	} else if parser.IsHDF5File(srcPath) {
-		srcFormat = srcFormatHDF5
-	}
-	return compareFlags{
-		srcPath:     srcPath,
-		wmtPath:     fs.Arg(1),
-		srcFormat:   srcFormat,
-		varFilter:   *varFilter,
-		zoomFilter:  *zoomFilter,
-		tolOverride: *tolOverride,
-	}, nil
-}
 
-func runCompare(args []string) error {
-	flags, err := parseCompareFlags(args)
+	srcFmtEnc, err := resolveInputFormat(c.Format, c.Source)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(flags.srcPath); err != nil {
-		return err
+	srcFormat := srcFormatGRIB2
+	if srcFmtEnc == "hdf5" {
+		srcFormat = srcFormatHDF5
 	}
 
-	r, err := reader.Open(flags.wmtPath)
+	r, err := reader.Open(c.File)
 	if err != nil {
 		return fmt.Errorf("open wmt: %w", err)
 	}
 	defer r.Close()
 
-	wantNames := selectVariables(r, flags.varFilter)
+	wantNames := selectVariables(r, c.Variable)
 	if len(wantNames) == 0 {
-		return fmt.Errorf("no variables match --variable=%q", flags.varFilter)
+		return fmt.Errorf("no variables match --variable=%q", c.Variable)
 	}
 
 	timeToIdx := buildTimeToIdx(r)
 
-	ui.Banner("compare", fmt.Sprintf("%s vs %s", flags.srcPath, flags.wmtPath))
+	ui.Banner("compare", fmt.Sprintf("%s vs %s", c.Source, c.File))
 
 	ui.Section("Settings")
-	ui.KV("source format", flags.srcFormat.String())
-	if flags.varFilter == "" {
+	ui.KV("source format", srcFormat.String())
+	if c.Variable == "" {
 		ui.KV("variables", fmt.Sprintf("%d selected", len(wantNames)))
 	} else {
-		ui.KV("variable", flags.varFilter)
+		ui.KV("variable", c.Variable)
 	}
-	if flags.zoomFilter >= 0 {
-		ui.KVf("zoom", "%d", flags.zoomFilter)
+	if c.Zoom >= 0 {
+		ui.KVf("zoom", "%d", c.Zoom)
 	} else {
 		ui.KV("zoom", "all")
 	}
-	if flags.tolOverride > 0 {
-		ui.KV("tolerance", formatFloat(flags.tolOverride))
+	if c.Tolerance > 0 {
+		ui.KV("tolerance", formatFloat(c.Tolerance))
 	} else {
 		ui.KV("tolerance", "per block scale/2 plus f32 slack")
 	}
 
 	ui.Section("Compare")
 	scanPhase := ui.StartPhase("scan source", 0)
-	samplers, err := buildSamplersForVariables(flags.srcPath, flags.srcFormat, wantNames, timeToIdx)
+	samplers, err := buildSamplersForVariables(c.Source, srcFormat, wantNames, timeToIdx)
 	if err != nil {
 		scanPhase.Done("failed")
 		return err
@@ -145,11 +106,11 @@ func runCompare(args []string) error {
 		return err
 	}
 
-	stats := initStats(r, flags.tolOverride)
+	stats := initStats(r, c.Tolerance)
 
 	comparePhase := ui.StartPhase("compare tiles", int64(totalAddressed))
 	startTime := time.Now()
-	enqueued, err := runCompareWorkers(r, samplers, stats, flags.zoomFilter)
+	enqueued, err := runCompareWorkers(r, samplers, stats, c.Zoom)
 	if err != nil {
 		comparePhase.Done("failed")
 		return err
@@ -525,7 +486,7 @@ func buildSamplersForVariables(path string, format encodeSrcFormat,
 		if base == "" || base == "unknown" {
 			base = fmt.Sprintf("param_%d_%d_%d", h.Discipline, h.ParameterCategory, h.ParameterNumber)
 		}
-		return base + levelSuffix(h.TypeOfLevel, h.Level, h.BottomLevel)
+		return base + scan.LevelSuffix(h.TypeOfLevel, h.Level, h.BottomLevel)
 	}
 	keep := func(h *parser.GribHeader) bool {
 		if !want[headerName(h)] {

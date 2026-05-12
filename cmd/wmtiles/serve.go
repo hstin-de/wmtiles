@@ -1,8 +1,6 @@
 package main
 
 import (
-	"flag"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,22 +9,15 @@ import (
 	"github.com/hstin-de/wmtiles/cmd/wmtiles/web"
 )
 
-func runServe(args []string) error {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	addr := flags.String("addr", ":8080", "listen address")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 1 {
-		return fmt.Errorf("usage: wmtiles serve [--addr :8080] <file.wmt>")
-	}
-	path, err := filepath.Abs(flags.Arg(0))
+func runServe(c *serveCmd) error {
+	path, err := filepath.Abs(c.File)
 	if err != nil {
 		return err
 	}
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
+	addr := &c.Addr
 
 	const noViewerMsg = "viewer not bundled in this build " +
 		"(rebuild with `make`, or `go build -tags embed`)"

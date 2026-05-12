@@ -219,10 +219,9 @@ func defaultZstdLevel(level int) int {
 	return level
 }
 
-// finishBlocksParallel runs finishBlock on every block over a GOMAXPROCS
-// worker pool. Blocks are independent after addEncoded, so no synchronisation
-// is needed beyond the result slice. onDone, if non-nil, is invoked once per
-// block under a mutex with the declaration index and final block byte length.
+// Blocks are independent after addEncoded so the pool needs nothing beyond
+// the per-index err slice. onDone runs under a mutex so the callback can
+// safely poke shared CLI state.
 func finishBlocksParallel(declarations []blockKey, blocks map[blockKey]*blockBuilder, comp format.InternalCompression, dictOpts dictOptions, onDone func(idx int, bytes uint64)) error {
 	n := len(declarations)
 	if n == 0 {

@@ -1,10 +1,15 @@
-package main
+package scan
 
 import (
 	"fmt"
 	"math"
 	"strings"
 )
+
+// ~10 bits of buckets against the observed range, comfortably above NWP SNR
+// so the per-block auto-cap doesn't visibly lossy variables we have no hint
+// for.
+const AutoPrecisionSteps = 1024
 
 var precisionByShortName = map[string]float64{
 	"t": 0.125, "2t": 0.125, "tmax": 0.125, "tmin": 0.125,
@@ -20,7 +25,7 @@ var precisionByShortName = map[string]float64{
 
 	"tcc": 0.5, "lcc": 0.5, "mcc": 0.5, "hcc": 0.5, "ccl": 0.5,
 	"tciwc": 0.001,
-	"r": 0.5, "2r": 0.5, "rh": 0.5,
+	"r":     0.5, "2r": 0.5, "rh": 0.5,
 
 	"tp": 0.05, "lsp": 0.05, "cp": 0.05, "rain": 0.05,
 	"asnow": 0.05, "sf": 0.05, "sd": 0.01,
@@ -38,6 +43,15 @@ var precisionByShortName = map[string]float64{
 	"cape": 1, "cin": 1, "mlcape": 1, "mucape": 1, "sbcape": 1,
 
 	"vis": 10,
+
+	"dbzh": 0.5, "dbzv": 0.5, "th": 0.5, "tv": 0.5,
+	"rate": 0.01, "rr": 0.01, "acrr": 0.05,
+	"vrad": 0.1, "vradh": 0.1, "vradv": 0.1, "wrad": 0.1,
+	"zdr":   0.05,
+	"rhohv": 0.005,
+	"phidp": 0.5,
+	"kdp":   0.05,
+	"sqi":   0.005, "snr": 0.1,
 }
 
 var precisionByUnit = map[string]float64{
@@ -62,7 +76,8 @@ var precisionByUnit = map[string]float64{
 	"J/kg":     1,
 }
 
-func defaultPrecisionFor(shortName, unit string) float64 {
+// 0 means "no hint": caller falls back to the AutoPrecisionSteps cap.
+func DefaultPrecisionFor(shortName, unit string) float64 {
 	if p, ok := precisionByShortName[strings.ToLower(strings.TrimSpace(shortName))]; ok {
 		return p
 	}
@@ -72,7 +87,36 @@ func defaultPrecisionFor(shortName, unit string) float64 {
 	return 0
 }
 
-func parsePrecisionOverrides(s string) (map[string]float64, error) {
+// Source label feeds the CLI's precision column ("auto" / "cap" / etc).
+func ResolveBlockPrecision(v *VarInfo, vmin, vmax float64, overrides map[string]float64) (float64, string) {
+	if p, ok := overrides[v.Name]; ok {
+		return p, "override"
+	}
+	if p, ok := overrides[v.ShortName]; ok {
+		return p, "override"
+	}
+	if p := DefaultPrecisionFor(v.ShortName, v.Unit); p > 0 {
+		return p, "auto"
+	}
+	if vmax > vmin {
+		return (vmax - vmin) / AutoPrecisionSteps, "cap"
+	}
+	return 0, "default"
+}
+
+// Explicit overrides win over auto, which wins over per-block caps, which
+// wins over the default. Used to pick a single label for the var table when
+// blocks resolved different sources.
+func DominantPrecSource(sources map[string]struct{}) string {
+	for _, candidate := range []string{"override", "auto", "cap", "default"} {
+		if _, ok := sources[candidate]; ok {
+			return candidate
+		}
+	}
+	return "default"
+}
+
+func ParsePrecisionOverrides(s string) (map[string]float64, error) {
 	out := map[string]float64{}
 	if s = strings.TrimSpace(s); s == "" {
 		return out, nil

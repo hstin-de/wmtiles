@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"runtime"
@@ -11,28 +10,19 @@ import (
 	"time"
 
 	"github.com/hstin-de/wmtiles/directory"
+	"github.com/hstin-de/wmtiles/encode"
 	"github.com/hstin-de/wmtiles/encoder"
 	"github.com/hstin-de/wmtiles/format"
-	"github.com/hstin-de/wmtiles/parser"
+	"github.com/hstin-de/wmtiles/internal/scan"
 	"github.com/hstin-de/wmtiles/reader"
 	"github.com/hstin-de/wmtiles/tileid"
 )
 
-func runExtend(args []string) error {
-	fs := flag.NewFlagSet("extend", flag.ContinueOnError)
-	filterShortNames := fs.String("filter", "", "comma-separated list of shortNames to keep (default: all)")
-	allowReplace := fs.Bool("allow-replace", false, "overwrite existing (variable, time) blocks instead of erroring")
-	precisionOverride := fs.String("precision", "", "per variable quantization precision overrides")
-	formatOverride := fs.String("format", "", "override input format (grib2|hdf5); default = auto-detect")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: wmtiles extend <file.wmt> <input.{grib2|h5}> [--format grib2|hdf5]")
-	}
-	wmtPath := fs.Arg(0)
-	srcPath := fs.Arg(1)
-	overrides, err := parsePrecisionOverrides(*precisionOverride)
+func runExtend(c *extendCmd) error {
+	wmtPath := c.File
+	srcPath := c.Source
+
+	overrides, err := scan.ParsePrecisionOverrides(c.Precision)
 	if err != nil {
 		return err
 	}
@@ -44,17 +34,12 @@ func runExtend(args []string) error {
 		return err
 	}
 
+	srcFormatEnc, err := resolveInputFormat(c.Format, srcPath)
+	if err != nil {
+		return err
+	}
 	srcFormat := srcFormatGRIB2
-	if *formatOverride != "" {
-		switch strings.ToLower(*formatOverride) {
-		case "hdf5":
-			srcFormat = srcFormatHDF5
-		case "grib2":
-			srcFormat = srcFormatGRIB2
-		default:
-			return fmt.Errorf("--format must be grib2 or hdf5, got %q", *formatOverride)
-		}
-	} else if parser.IsHDF5File(srcPath) {
+	if srcFormatEnc == encode.FormatHDF5 {
 		srcFormat = srcFormatHDF5
 	}
 
@@ -62,12 +47,12 @@ func runExtend(args []string) error {
 
 	ui.Section("Settings")
 	ui.KV("source format", srcFormat.String())
-	if *filterShortNames == "" {
+	if c.Filter == "" {
 		ui.KV("filter", "all shortNames")
 	} else {
-		ui.KV("filter", *filterShortNames)
+		ui.KV("filter", c.Filter)
 	}
-	ui.KV("replace blocks", boolWord(*allowReplace))
+	ui.KV("replace blocks", boolWord(c.AllowReplace))
 
 	r, err := reader.Open(wmtPath)
 	if err != nil {
@@ -82,66 +67,68 @@ func runExtend(args []string) error {
 	r.Close()
 
 	ui.Section("Extend")
-	scanPhase := ui.StartPhase("scan source", 0)
-	var (
-		parsedMsgs           []parsedMsg
-		bySig                map[varKey]*varInfo
-		allTimes             []time.Time
-		totalSeen, keptSeen  int
-	)
-	switch srcFormat {
-	case srcFormatHDF5:
-		parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err = parseAllHDF5Messages(srcPath, *filterShortNames)
-		if err != nil {
-			return fmt.Errorf("scan HDF5: %w", err)
-		}
-	default:
-		gribData, gerr := os.ReadFile(srcPath)
-		if gerr != nil {
-			return fmt.Errorf("read GRIB: %w", gerr)
-		}
-		gribRanges, gerr := parser.MessageRanges(gribData)
-		if gerr != nil {
-			return fmt.Errorf("scan GRIB: %w", gerr)
-		}
-		parsedMsgs, bySig, allTimes, _, totalSeen, keptSeen, err = parseAllMessages(gribData, gribRanges, *filterShortNames)
-		if err != nil {
-			return fmt.Errorf("scan GRIB: %w", err)
-		}
-	}
-	scanPhase.Done(fmt.Sprintf("%s msgs kept of %s", commaInt(int64(keptSeen)), commaInt(int64(totalSeen))))
-	if keptSeen == 0 {
-		if *filterShortNames != "" {
-			return fmt.Errorf("filter %q matched no messages (scanned %d)", *filterShortNames, totalSeen)
-		}
-		return fmt.Errorf("no records found in %s", srcPath)
-	}
-	if len(allTimes) == 0 {
-		return fmt.Errorf("no forecast timestamps?")
-	}
-	timeCatalog := buildTimeCatalog(allTimes)
-	ui.KVf("variables", "%d", len(bySig))
-	ui.KV("time axis", describeTimeCatalog(timeCatalog))
 
 	var (
-		compressPhase, writePhase, snapPhase *Phase
-		bytesOnDisk                          atomic.Uint64
+		scanPhase, tilePhase, compressPhase, writePhase, snapPhase *Phase
+		bytesOnDisk                                                atomic.Uint64
+		scanStart, scanEnd, tileStart, tileEnd                     atomic.Int64
+		scannedFiles                                               atomic.Int64
+		finalPlans                                                 []encode.VariablePlan
 	)
-	ctx, err := encoder.OpenForAppend(wmtPath, encoder.AppendOptions{
-		AllowReplace:        *allowReplace,
-		SkipInternalWorkers: true,
+	var app *encode.Appender
+
+	endTilePhase := func() {
+		if tilePhase == nil {
+			return
+		}
+		sub, _ := app.Progress()
+		tilePhase.SetCurrent(sub)
+		start := time.Unix(0, tileStart.Load())
+		dur := time.Since(start)
+		tileEnd.Store(time.Now().UnixNano())
+		tilePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(sub), formatTileRateString(sub, dur)))
+		tilePhase = nil
+	}
+
+	opts := encode.AppenderOptions{
+		AllowReplace: c.AllowReplace,
+		Precision:    overrides,
+		OnInputScanned: func(name string, records int) {
+			if scanPhase == nil {
+				scanStart.Store(time.Now().UnixNano())
+				scanPhase = ui.StartPhase("scan source", 0)
+			}
+			scannedFiles.Add(1)
+			scanPhase.SetExtra(fmt.Sprintf("%s messages", commaInt(int64(records))))
+		},
+		OnScanComplete: func(stats encode.ScanStats) {
+			scanEnd.Store(time.Now().UnixNano())
+			if scanPhase != nil {
+				scanPhase.Done(fmt.Sprintf("%s msgs kept of %s", commaInt(int64(stats.KeptMessages)), commaInt(int64(stats.TotalMessages))))
+				scanPhase = nil
+			}
+			ui.KVf("variables", "%d", stats.VariableCount)
+			tileStart.Store(time.Now().UnixNano())
+			tilePhase = ui.StartPhase("decode + tile", stats.ExpectedTiles)
+		},
+		OnFinishStats: func(plans []encode.VariablePlan) {
+			finalPlans = plans
+		},
 		OnPhase: func(stage string) {
 			switch stage {
 			case "compress_blocks":
+				endTilePhase()
 				compressPhase = ui.StartPhase("compress blocks", 0)
 			case "write_blocks":
 				if compressPhase != nil {
 					compressPhase.Done("")
+					compressPhase = nil
 				}
 				writePhase = ui.StartPhase("write blocks", 0)
 			case "write_snapshot":
 				if writePhase != nil {
 					writePhase.Done(humanBytes(int64(bytesOnDisk.Load())) + " on disk")
+					writePhase = nil
 				}
 				snapPhase = ui.StartPhase("write snapshot", 0)
 			}
@@ -160,106 +147,105 @@ func runExtend(args []string) error {
 				writePhase.SetExtra(humanBytes(int64(bytesOnDisk.Load())))
 			}
 		},
-	})
+	}
+	if c.Filter != "" {
+		for n := range strings.SplitSeq(c.Filter, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				opts.FilterVariables = append(opts.FilterVariables, n)
+			}
+		}
+	}
+
+	created, err := encode.NewAppender(wmtPath, opts)
 	if err != nil {
-		return fmt.Errorf("open for append: %w", err)
+		return fmt.Errorf("appender init: %w", err)
+	}
+	app = created
+	if err := app.AddFile(srcPath, srcFormatEnc); err != nil {
+		return fmt.Errorf("add %s: %w", srcPath, err)
 	}
 
-	specs := buildPreliminaryVariableSpecs(bySig, overrides)
-	for _, s := range specs {
-		if _, err := ctx.RegisterVariable(s); err != nil {
-			ctx.Close()
-			return fmt.Errorf("register variable %q: %w", s.Name, err)
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		var lastSub, lastSk int64
+		t := time.NewTicker(120 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-t.C:
+				if tilePhase == nil {
+					continue
+				}
+				sub, sk := app.Progress()
+				if sub == lastSub && sk == lastSk {
+					continue
+				}
+				lastSub, lastSk = sub, sk
+				tilePhase.SetCurrent(sub + sk)
+				if start := tileStart.Load(); start > 0 {
+					elapsed := time.Since(time.Unix(0, start))
+					if elapsed > 200*time.Millisecond {
+						rate := float64(sub) / elapsed.Seconds()
+						tilePhase.SetExtra(formatTileRate(rate) + "  " + commaInt(sub) + " written")
+					}
+				}
+			}
 		}
-	}
+	}()
 
-	timeIdxByTime := make(map[time.Time]uint32, len(allTimes))
-	for _, t := range allTimes {
-		idx, err := ctx.RegisterTimeStep(t.UnixMilli())
-		if err != nil {
-			ctx.Close()
-			return fmt.Errorf("register time %s: %w", t, err)
-		}
-		timeIdxByTime[t] = idx
-	}
-
-	var alreadyPresent atomic.Int64
-	onDup := func(name string, t time.Time) error {
-		alreadyPresent.Add(1)
-		return nil
-	}
-
-	encodePhase := ui.StartPhase("decode + tile", 0)
 	t0 := time.Now()
-	submitted, dropped, err := tileFromParsed(parsedMsgs, bySig, timeIdxByTime,
-		overrides, &appendSink{ctx: ctx, alreadyPresent: &alreadyPresent},
-		minZoom, maxZoom, pixelSize, onDup)
-	if err != nil {
-		encodePhase.Done("failed")
-		ctx.Close()
-		return fmt.Errorf("stream: %w", err)
-	}
-	encodeDuration := time.Since(t0)
-	encodePhase.SetCurrent(submitted + dropped)
-	encodePhase.Done(fmt.Sprintf("%s tiles  %s", commaInt(submitted), formatTileRateString(submitted, encodeDuration)))
+	finishErr := app.Finish()
+	close(stopPoll)
+	<-pollDone
 
-	if err := ctx.Finish(); err != nil {
-		return fmt.Errorf("commit append: %w", err)
+	if finishErr != nil {
+		if tilePhase != nil {
+			tilePhase.Done("failed")
+		}
+		return fmt.Errorf("extend: %w", finishErr)
 	}
 	if snapPhase != nil {
 		snapPhase.Done("")
 	}
 
-	plans := finalVariablePlans(bySig, overrides)
-	printVariablePlans(plans)
+	if len(finalPlans) > 0 {
+		printVariablePlans(finalPlans)
+	}
 
+	stats := app.Stats()
 	ui.Section("Done")
 	st, _ := os.Stat(wmtPath)
 	rows := [][2]string{{"file", wmtPath}}
 	if st != nil {
 		rows = append(rows, [2]string{"size", humanBytes(st.Size())})
 	}
+	scanDur := time.Duration(0)
+	if s, e := scanStart.Load(), scanEnd.Load(); s > 0 && e > s {
+		scanDur = time.Duration(e - s)
+	}
+	encodeDur := time.Duration(0)
+	if s, e := tileStart.Load(), tileEnd.Load(); s > 0 && e > s {
+		encodeDur = time.Duration(e - s)
+	}
 	rows = append(rows,
-		[2]string{"tiles written", commaInt(submitted)},
-		[2]string{"tiles skipped", commaInt(dropped)},
-		[2]string{"already present", fmt.Sprintf("%d", alreadyPresent.Load())},
-		[2]string{"duration", formatDuration(encodeDuration)},
+		[2]string{"tiles written", commaInt(stats.Submitted)},
+		[2]string{"tiles skipped", commaInt(stats.Skipped)},
+		[2]string{"already present", fmt.Sprintf("%d", stats.AlreadyPresent)},
+		[2]string{"scan", formatDuration(scanDur)},
+		[2]string{"encode", formatDuration(encodeDur)},
+		[2]string{"total", formatDuration(time.Since(t0))},
 	)
 	ui.Summary(rows)
 	return nil
 }
 
-// appendSink adapts AppendCtx to blockSink. "already exists" collisions are
-// counted, not propagated — extend reports them in the summary.
-type appendSink struct {
-	ctx            *encoder.AppendCtx
-	alreadyPresent *atomic.Int64
-}
-
-func (a *appendSink) DeclareBlock(spec encoder.BlockSpec) error {
-	err := a.ctx.DeclareBlock(spec)
-	if err != nil && strings.Contains(err.Error(), "already exists") {
-		a.alreadyPresent.Add(1)
-		return nil
-	}
-	return err
-}
-
-func (a *appendSink) Submit(t encoder.Tile) error {
-	return a.ctx.Submit(t)
-}
-
-// NewDirectWorker satisfies the directSinker fast path so tileFromParsed can
-// run quantize+codec inline on parser goroutines.
-func (a *appendSink) NewDirectWorker() (*encoder.DirectWorker, error) {
-	return a.ctx.NewDirectAppendWorker()
-}
-
-func runCompact(args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: wmtiles compact <input.wmt> <output.wmt>")
-	}
-	in, out := args[0], args[1]
+func runCompact(c *compactCmd) error {
+	in, out := c.Input, c.Output
 	if _, err := os.Stat(in); err != nil {
 		return err
 	}

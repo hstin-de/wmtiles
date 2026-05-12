@@ -5,13 +5,66 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/hstin-de/wmtiles/internal/scan"
 )
 
-// cliOut is kept as a back-compat hook for the few callers that build bespoke
-// formatted lines (compare.go's fidelity table). It mirrors whatever the
-// renderer is writing to, so test harnesses can still capture output.
+func printVariablePlans(plans []scan.VariablePlan) {
+	if len(plans) == 0 {
+		return
+	}
+	sort.Slice(plans, func(i, j int) bool { return plans[i].Name < plans[j].Name })
+	const maxRows = 20
+	visible := plans
+	hidden := 0
+	if len(plans) > maxRows {
+		sort.SliceStable(plans, func(i, j int) bool { return plans[i].Messages > plans[j].Messages })
+		visible = plans[:maxRows]
+		hidden = len(plans) - maxRows
+		sort.Slice(visible, func(i, j int) bool { return visible[i].Name < visible[j].Name })
+	}
+	rows := make([][]string, 0, len(visible))
+	for _, p := range visible {
+		rows = append(rows, []string{
+			p.Name,
+			emptyAsNA(p.Unit),
+			fmt.Sprintf("%d", p.Messages),
+			formatRange(p.Min, p.Max),
+			formatFloat(p.Precision) + " (" + p.PrecSrc + ")",
+			dtypeBadge(p.DType),
+			formatFloat(p.Step),
+		})
+	}
+	ui.Section("Variables")
+	cliTableAligned([]string{"name", "unit", "msgs", "range", "precision", "dtype", "step"}, rows, "llrllll")
+	if hidden > 0 {
+		ui.KVf("more", "%d variables omitted", hidden)
+	}
+}
+
+func formatTileRate(rate float64) string {
+	switch {
+	case rate >= 1e6:
+		return fmt.Sprintf("%.2fM tiles/s", rate/1e6)
+	case rate >= 1e3:
+		return fmt.Sprintf("%.1fk tiles/s", rate/1e3)
+	}
+	return fmt.Sprintf("%.0f tiles/s", rate)
+}
+
+func formatTileRateString(count int64, d time.Duration) string {
+	if count <= 0 || d <= 0 {
+		return "n/a"
+	}
+	return formatTileRate(float64(count) / d.Seconds())
+}
+
+// compare.go formats its own fidelity table via fmt.Fprintf; the proxy
+// keeps it writing into the renderer's output stream instead of os.Stdout
+// so test harnesses still see one merged stream.
 var cliOut io.Writer = &renderProxy{}
 
 type renderProxy struct{}
@@ -123,7 +176,6 @@ func dtypeCodeName(d uint8) string {
 	}
 }
 
-// dtypeBadge colours the small dtype tag so it pops in tables.
 func dtypeBadge(d string) string {
 	if ui == nil {
 		return d
@@ -139,8 +191,8 @@ func dtypeBadge(d string) string {
 	return d
 }
 
-// captureLines is used by tests that previously redirected cliOut to a buffer.
-// The renderer is paused, output is captured to buf, then resumed.
+// Tests that used to redirect cliOut directly call this instead so the
+// renderer's mutex state stays consistent.
 func captureLines(fn func()) string {
 	var buf bytes.Buffer
 	if ui == nil {

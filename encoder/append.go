@@ -33,8 +33,7 @@ type AppendOptions struct {
 	// callers must drive the context via NewDirectAppendWorker.
 	SkipInternalWorkers bool
 
-	// OnBlockCompressed / OnBlockWritten / OnPhase mirror encoder.Options. Used
-	// to drive the CLI renderer without polling.
+	// See encoder.Options for semantics.
 	OnBlockCompressed func(idx, total int, bytes uint64)
 	OnBlockWritten    func(idx, total int, bytes uint64)
 	OnPhase           func(stage string)
@@ -353,7 +352,12 @@ func (a *AppendCtx) RegisterTimeStep(unixMs int64) (uint32, error) {
 	return uint32(len(a.timeCatalog.TimestampsMs) - 1), nil
 }
 
-// TimeCount returns the number of time steps in the current append catalog.
+// New tiles must match the existing file's tile geometry or readers can't
+// index them.
+func (a *AppendCtx) MinZoom() uint8 { return a.header.MinZoom }
+func (a *AppendCtx) MaxZoom() uint8 { return a.header.MaxZoom }
+func (a *AppendCtx) PixelSize() int { return a.pixelSize }
+
 func (a *AppendCtx) TimeCount() int {
 	a.blockMu.RLock()
 	defer a.blockMu.RUnlock()
@@ -542,6 +546,7 @@ func (a *AppendCtx) Finish() error {
 			bb.release()
 		}
 
+		a.firePhase("write_snapshot")
 		merged := a.mergeBlockTable(newEntries)
 
 		now := a.creationTimeOverride

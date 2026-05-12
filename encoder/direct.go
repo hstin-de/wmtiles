@@ -36,6 +36,12 @@ func (s *StreamingEncoder) NewDirectWorker() (*DirectWorker, error) {
 	}, nil
 }
 
+// Match the StreamingEncoder method name so both types satisfy the
+// encode-package streamSink interface without a wrapper.
+func (a *AppendCtx) NewDirectWorker() (*DirectWorker, error) {
+	return a.NewDirectAppendWorker()
+}
+
 func (a *AppendCtx) NewDirectAppendWorker() (*DirectWorker, error) {
 	tcEnc, err := codec.NewEncoderWithOpts(a.zstdLevel, a.allowDelta)
 	if err != nil {
@@ -136,7 +142,10 @@ func (w *DirectWorker) submitToAppend(t Tile) error {
 // for f32 blocks or non-uniform grids — caller must fall back.
 func (w *DirectWorker) SubmitTileFused(varName string, tIdx uint32, z uint8, x, y uint32, pixSize int, s *tiler.Sampler) (bool, error) {
 	if w.enc == nil {
-		return false, fmt.Errorf("SubmitTileFused requires a streaming encoder worker")
+		// AppendCtx workers can't see the streaming encoder's var specs;
+		// emit the standard fallback sentinel so callers gracefully drop
+		// down to SubmitDirect.
+		return false, errFusedNotSupported
 	}
 	enc := w.enc
 	if err := enc.checkErr(); err != nil {

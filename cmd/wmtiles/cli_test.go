@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/hstin-de/wmtiles/encoder"
 	"github.com/hstin-de/wmtiles/format"
 )
@@ -89,8 +90,8 @@ func TestCLIEncodeUsageIsGRIBOnly(t *testing.T) {
 	if err == nil {
 		t.Fatalf("encode without args succeeded unexpectedly:\n%s", out)
 	}
-	if !bytes.Contains(out, []byte("usage: wmtiles encode <input.grib2> -o <output.wmt>")) {
-		t.Fatalf("encode usage should point at GRIB input:\n%s", out)
+	if !bytes.Contains(bytes.ToLower(out), []byte("usage: wmtiles encode")) {
+		t.Fatalf("encode usage line missing:\n%s", out)
 	}
 	if bytes.Contains(bytes.ToLower(out), []byte("manifest")) {
 		t.Fatalf("encode usage should not mention manifests:\n%s", out)
@@ -106,20 +107,28 @@ func TestCLIEncodeUsageIsGRIBOnly(t *testing.T) {
 }
 
 func TestParseEncodeAllowsInputBeforeFlags(t *testing.T) {
-	flags, in, err := parseGribEncodeFlags("encode", []string{
+	var cli CLI
+	parser, err := kong.New(&cli, kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatalf("kong setup: %v", err)
+	}
+	if _, err := parser.Parse([]string{
+		"encode",
 		"input.grib2",
 		"-o", "out.wmt",
 		"--min-zoom", "1",
 		"--max-zoom=2",
 		"--tile-size-log2", "7",
-	})
-	if err != nil {
-		t.Fatal(err)
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	if in != "input.grib2" {
-		t.Fatalf("input = %q, want input.grib2", in)
+	if got := cli.Encode.Inputs; len(got) != 1 || got[0] != "input.grib2" {
+		t.Fatalf("inputs = %v, want [input.grib2]", got)
 	}
-	if flags.output != "out.wmt" || flags.minZoom != 1 || flags.maxZoom != 2 || flags.tileSizeLog2 != 7 {
-		t.Fatalf("flags parsed incorrectly: %+v", flags)
+	if cli.Encode.Output != "out.wmt" {
+		t.Fatalf("output = %q, want out.wmt", cli.Encode.Output)
+	}
+	if cli.Encode.MinZoom != 1 || cli.Encode.MaxZoom != 2 || cli.Encode.TileSizeLog2 != 7 {
+		t.Fatalf("zoom/tile parsed incorrectly: %+v", cli.Encode)
 	}
 }

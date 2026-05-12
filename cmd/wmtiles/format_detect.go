@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,83 +10,26 @@ import (
 	"github.com/hstin-de/wmtiles/parser"
 )
 
-// detectFormat resolves the source format for `wmtiles encode`. precedence:
-// explicit --format flag, magic bytes on the first existing positional, then
-// extension. Returns the args with --format stripped so the chosen runner can
-// reparse the rest with its own flag set.
-func detectFormat(args []string) (encode.Format, []string, error) {
-	stripped := make([]string, 0, len(args))
-	var explicit string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "--format" || a == "-format":
-			if i+1 >= len(args) {
-				return "", nil, errors.New("--format requires a value (grib2|hdf5)")
-			}
-			explicit = args[i+1]
-			i++
-			continue
-		case strings.HasPrefix(a, "--format="):
-			explicit = strings.TrimPrefix(a, "--format=")
-			continue
-		case strings.HasPrefix(a, "-format="):
-			explicit = strings.TrimPrefix(a, "-format=")
-			continue
-		}
-		stripped = append(stripped, a)
+// Magic bytes beat extension because users sometimes rename files; the
+// extension fallback covers HDF5 directories where opening every file just
+// to peek is wasteful.
+func detectFormatFromPath(path string) (encode.Format, error) {
+	if matches, err := filepath.Glob(path); err == nil && len(matches) > 0 {
+		path = matches[0]
 	}
-	if explicit != "" {
-		f := encode.Format(strings.ToLower(explicit))
-		switch f {
-		case encode.FormatGRIB2, encode.FormatHDF5:
-			return f, stripped, nil
-		default:
-			return "", nil, errors.New("--format must be grib2 or hdf5, got " + explicit)
-		}
+	if f, ok := detectFormatFromFile(path); ok {
+		return f, nil
 	}
-
-	candidate := firstPositional(stripped)
-	if candidate == "" {
-		// no file — defer to the GRIB runner so usage errors keep their wording
-		return encode.FormatGRIB2, stripped, nil
+	if f, ok := detectFormatFromExt(path); ok {
+		return f, nil
 	}
-	resolved := candidate
-	if matches, err := filepath.Glob(candidate); err == nil && len(matches) > 0 {
-		resolved = matches[0]
-	}
-	if f, ok := detectFormatFromFile(resolved); ok {
-		return f, stripped, nil
-	}
-	if f, ok := detectFormatFromExt(resolved); ok {
-		return f, stripped, nil
-	}
-	if _, err := os.Stat(resolved); err == nil {
-		return "", nil, fmt.Errorf(
+	if _, err := os.Stat(path); err == nil {
+		return "", fmt.Errorf(
 			"cannot determine input format of %s: not GRIB2 (missing 'GRIB' magic) "+
-				"and not HDF5 (missing \\x89HDF magic); pass --format grib2|hdf5 to override",
-			resolved)
+				"and not HDF5 (missing \\x89HDF magic); pass --format grib2|hdf5",
+			path)
 	}
-	return encode.FormatGRIB2, stripped, nil
-}
-
-func firstPositional(args []string) string {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") {
-			return a
-		}
-		if strings.Contains(a, "=") {
-			continue
-		}
-		// the encode flag set has -o, --filter, --precision etc. that take a
-		// value as the next token; conservatively step past it unless that
-		// token is itself a flag.
-		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-			i++
-		}
-	}
-	return ""
+	return "", fmt.Errorf("input not found: %s", path)
 }
 
 func detectFormatFromFile(path string) (encode.Format, bool) {

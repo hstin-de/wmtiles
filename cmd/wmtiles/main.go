@@ -6,113 +6,28 @@ import (
 	"os"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/hstin-de/wmtiles/format"
 	"github.com/hstin-de/wmtiles/reader"
 )
 
 func main() {
 	initRenderer()
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-	switch os.Args[1] {
-	case "encode":
-		format, rest, err := detectFormat(os.Args[2:])
-		if err != nil {
-			fatal("encode", err)
-		}
-		switch format {
-		case "hdf5":
-			if err := runEncodeHDF5("encode", rest); err != nil {
-				fatal("encode", err)
-			}
-		default:
-			if err := runEncodeGRIB("encode", rest); err != nil {
-				fatal("encode", err)
-			}
-		}
-	case "encode-grib":
-		if err := runEncodeGRIB("encode-grib", os.Args[2:]); err != nil {
-			fatal("encode-grib", err)
-		}
-	case "encode-hdf5":
-		if err := runEncodeHDF5("encode-hdf5", os.Args[2:]); err != nil {
-			fatal("encode-hdf5", err)
-		}
-	case "extend":
-		if err := runExtend(os.Args[2:]); err != nil {
-			fatal("extend", err)
-		}
-	case "compact":
-		if err := runCompact(os.Args[2:]); err != nil {
-			fatal("compact", err)
-		}
-	case "snapshot-history":
-		if err := runSnapshotHistory(os.Args[2:]); err != nil {
-			fatal("snapshot-history", err)
-		}
-	case "inspect":
-		if err := runInspect(os.Args[2:]); err != nil {
-			fatal("inspect", err)
-		}
-	case "verify":
-		if err := runVerify(os.Args[2:]); err != nil {
-			fatal("verify", err)
-		}
-	case "compare":
-		if err := runCompare(os.Args[2:]); err != nil {
-			fatal("compare", err)
-		}
-	case "serve":
-		if err := runServe(os.Args[2:]); err != nil {
-			fatal("serve", err)
-		}
-	case "-h", "--help", "help":
-		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "error: unknown subcommand %q\n\n", os.Args[1])
-		usage()
-		os.Exit(2)
+	var cli CLI
+	ctx := kong.Parse(&cli,
+		kong.Name("wmtiles"),
+		kong.Description("Cloud optimised tiled weather data format."),
+		kong.UsageOnError(),
+		kong.ConfigureHelp(kong.HelpOptions{Compact: true, NoAppSummary: false}),
+	)
+	if err := ctx.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
 	}
 }
 
-func fatal(command string, err error) {
-	fmt.Fprintf(os.Stderr, "error: %s failed\n", command)
-	fmt.Fprintf(os.Stderr, "  reason: %v\n", err)
-	os.Exit(1)
-}
-
-func usage() {
-	fmt.Fprintln(os.Stderr, `wmtiles: cloud optimised tiled weather data format
-
-usage:
-  wmtiles encode           <input>     -o out.wmt ...  convert GRIB2 or HDF5 (auto-detected) into a fresh .wmt
-  wmtiles encode-grib      <input.grib2> -o out.wmt    force GRIB2 encoder
-  wmtiles encode-hdf5      <input.h5|glob> -o out.wmt  force HDF5 encoder (ODIM_H5 or CF/NetCDF4)
-  wmtiles extend           <file.wmt> <input.grib2>    append blocks for new (variable, time) pairs
-  wmtiles compact          <input.wmt> <output.wmt>    rewrite a file with the snapshot in the cold start window
-  wmtiles snapshot-history <file.wmt>                  list active + previous snapshots
-  wmtiles inspect          <file.wmt>                  dump header + catalog + stats
-  wmtiles verify           <file.wmt>                  structural sanity check (incl. CRC validation)
-  wmtiles compare          <input.grib2> <file.wmt> ... pixel by pixel fidelity report vs. source GRIB
-  wmtiles serve            <file.wmt> [--addr :8080]   launch a web viewer
-
-encode flags:
-  -o PATH                  output .wmt path (required)
-  --format FMT             override input format (grib2|hdf5); default = auto-detect by magic bytes / extension
-  --min-zoom N             minimum zoom (default 0)
-  --max-zoom N             maximum zoom (default 5)
-  --tile-size-log2 N       tile size log2 (default 8 = 256 px; allowed 7..10)
-  --filter SHORTNAMES      comma-separated shortNames to keep (default: all)
-  --precision NAME=K,...   per variable quantisation precision overrides`)
-}
-
-func runInspect(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: wmtiles inspect <file.wmt>")
-	}
-	r, err := reader.Open(args[0])
+func runInspect(path string) error {
+	r, err := reader.Open(path)
 	if err != nil {
 		return err
 	}
@@ -121,10 +36,10 @@ func runInspect(args []string) error {
 	h := r.Header
 	snap := r.Snapshot
 
-	ui.Banner("inspect", args[0])
+	ui.Banner("inspect", path)
 
 	ui.Section("File")
-	if st, _ := os.Stat(args[0]); st != nil {
+	if st, _ := os.Stat(path); st != nil {
 		ui.KV("file size", humanBytes(st.Size()))
 		ui.KV("logical end", humanBytes(int64(h.FileLogicalEnd)))
 	}
@@ -190,7 +105,7 @@ func runInspect(args []string) error {
 	ui.KV("metadata", humanBytes(int64(snap.Header.MetadataLen)))
 	ui.KV("blocks total", humanBytes(int64(totalBytes)))
 
-	st, _ := os.Stat(args[0])
+	st, _ := os.Stat(path)
 	if st != nil {
 		slack := int64(st.Size()) - int64(h.FileLogicalEnd)
 		if slack > 0 {
@@ -200,17 +115,14 @@ func runInspect(args []string) error {
 	return nil
 }
 
-func runVerify(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: wmtiles verify <file.wmt>")
-	}
-	r, err := reader.Open(args[0])
+func runVerify(path string) error {
+	r, err := reader.Open(path)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	ui.Banner("verify", args[0])
+	ui.Banner("verify", path)
 
 	ui.Section("Verify")
 	if err := r.SanityCheck(); err != nil {
@@ -250,18 +162,15 @@ func runVerify(args []string) error {
 	return nil
 }
 
-func runSnapshotHistory(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: wmtiles snapshot-history <file.wmt>")
-	}
-	r, err := reader.Open(args[0])
+func runSnapshotHistory(path string) error {
+	r, err := reader.Open(path)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
 	h := r.Header
-	ui.Banner("snapshot-history", args[0])
+	ui.Banner("snapshot-history", path)
 	ui.Section("Active snapshot")
 	ui.KVf("generation", "%d", h.SnapshotGeneration)
 	ui.KVf("offset", "%d", h.ActiveSnapshotOffset)

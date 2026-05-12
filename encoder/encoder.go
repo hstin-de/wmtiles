@@ -83,18 +83,12 @@ type Options struct {
 	// callers must drive the encoder via DirectWorker.SubmitDirect.
 	SkipInternalWorkers bool
 
-	// OnBlockCompressed fires once per block after finishBlock returns. idx is
-	// the position in the declaration order; total is the full count. bytes is
-	// the final block length including its header. Safe to leave nil.
+	// Block-level callbacks: idx is the declaration-order position, total
+	// the final count, bytes the on-disk length. Fired once each per block.
+	// Hot path stays callback-free, these only feed the CLI renderer.
 	OnBlockCompressed func(idx, total int, bytes uint64)
-
-	// OnBlockWritten fires once per block after its bytes have been streamed to
-	// disk. idx/total mirror OnBlockCompressed; bytes is the on-disk length.
-	OnBlockWritten func(idx, total int, bytes uint64)
-
-	// OnPhase reports the Finish-side stage transitions ("compress_blocks",
-	// "write_blocks", "write_snapshot"). Use it to flip the CLI renderer
-	// without polling.
+	OnBlockWritten    func(idx, total int, bytes uint64)
+	// Stages: "compress_blocks", "write_blocks", "write_snapshot".
 	OnPhase func(stage string)
 }
 

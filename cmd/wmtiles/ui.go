@@ -14,9 +14,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Renderer drives all stderr-side CLI output. It owns one goroutine while a
-// phase is active that rewrites the phase line in place on TTYs; plain mode
-// just emits a fresh line per tick.
+// Output always goes to stderr so `wmtiles inspect | jq` stays clean.
+// While a phase is active a background goroutine rewrites the active line
+// in place on TTYs; non-TTY mode falls back to one line per phase end.
 type Renderer struct {
 	out  io.Writer
 	mu   sync.Mutex
@@ -95,7 +95,7 @@ func detectWidth(f *os.File) int {
 	return 100
 }
 
-// ANSI helpers. styled returns the input unchanged when colour is off.
+// styled is a no-op when colour is off so CI/pipe output stays plain.
 const (
 	ansiReset    = "\x1b[0m"
 	ansiBold     = "\x1b[1m"
@@ -123,8 +123,7 @@ func (r *Renderer) styled(s string, codes ...string) string {
 	return b.String()
 }
 
-// Banner prints the tool header used at the start of every long-running
-// subcommand. Compact on a single line so noisy CI logs don't blow up.
+// Single line so noisy CI logs don't blow up.
 func (r *Renderer) Banner(command, subtitle string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -174,8 +173,7 @@ func (r *Renderer) KVf(label, format string, args ...any) {
 	r.KV(label, fmt.Sprintf(format, args...))
 }
 
-// Table prints a fixed-width table. align is one rune per column: 'l' or 'r'.
-// Empty align falls back to all-left.
+// align is one rune per column: 'l' or 'r'. Anything else defaults to left.
 func (r *Renderer) Table(headers []string, rows [][]string, align string) {
 	r.endPhase("")
 	r.mu.Lock()
@@ -240,7 +238,7 @@ func (r *Renderer) Table(headers []string, rows [][]string, align string) {
 	}
 }
 
-// Log writes a one-off line above the active phase without disturbing it.
+// Inserts a permanent line above the active phase without losing the phase.
 func (r *Renderer) Log(msg string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -253,8 +251,8 @@ func (r *Renderer) Log(msg string) {
 	fmt.Fprintln(r.out, msg)
 }
 
-// Phase is the unit of progress for one logical step (scan, decode, write).
-// SetTotal/SetCurrent/SetExtra are safe to call from any goroutine.
+// Setter methods are goroutine-safe so the tile worker pool can update
+// progress without coordinating with the renderer.
 type Phase struct {
 	r     *Renderer
 	name  string
@@ -265,7 +263,8 @@ type Phase struct {
 	extraV  atomic.Value
 	done    atomic.Bool
 
-	// short moving window used for the ETA so it doesn't lag for the whole run
+	// Last-two-samples ETA: full-run average would underestimate ramp-up
+	// and overestimate steady-state, both ugly.
 	emaMu     sync.Mutex
 	lastTs    time.Time
 	lastCur   int64
@@ -277,8 +276,8 @@ type Phase struct {
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// StartPhase begins a phase; pass total=0 if unknown so the line shows a
-// spinner + counter instead of a bar.
+// total=0 switches the renderer from progress bar to spinner+counter; use
+// it whenever the upper bound isn't known up front.
 func (r *Renderer) StartPhase(name string, total int64) *Phase {
 	r.endPhase("")
 	p := &Phase{r: r, name: name, start: time.Now()}
@@ -333,7 +332,8 @@ func (p *Phase) SetExtra(s string)   { p.extraV.Store(s) }
 func (p *Phase) Current() int64      { return p.current.Load() }
 func (p *Phase) Total() int64        { return p.total.Load() }
 
-// Done marks the phase finished and emits a final permanent line.
+// Final extra wins over the in-flight extra set during polling so the last
+// line reads as a summary, not the latest poll snapshot.
 func (p *Phase) Done(extra string) {
 	if p.done.Swap(true) {
 		return
@@ -452,8 +452,8 @@ func (r *Renderer) renderBar(pct float64, width int) string {
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
 }
 
-// estimateETA uses an exponential moving average of the last two samples so
-// the displayed ETA reacts within ~1s instead of being smeared by the whole run.
+// EMA over recent samples; whole-run average would make ETA lag through the
+// last few percent.
 func (p *Phase) estimateETA(cur, total int64) time.Duration {
 	if cur <= 0 || total <= 0 || cur >= total {
 		return 0
@@ -493,7 +493,6 @@ func (p *Phase) estimateETA(cur, total int64) time.Duration {
 	return time.Duration(remain / p.smoothed * float64(time.Second))
 }
 
-// Summary draws the final box shown after a successful encode.
 func (r *Renderer) Summary(rows [][2]string) {
 	r.endPhase("")
 	r.mu.Lock()
@@ -539,8 +538,8 @@ func formatDurationShort(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", h, m)
 }
 
-// visibleLen approximates the printable width by stripping ANSI escape
-// sequences so coloured cells still align with plain ones.
+// Without ANSI stripping, coloured table cells would shift the column
+// padding so plain cells in the same column don't line up.
 func visibleLen(s string) int {
 	n := 0
 	inEsc := false
