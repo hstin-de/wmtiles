@@ -4,7 +4,41 @@
 
 #include "eccodes.h"
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+
+// codes_get_float_array landed in eccodes 2.30.0. Redeclare the prototype as
+// weak so we can take its address even when the installed eccodes header omits
+// it; &codes_get_float_array resolves to NULL at link time on older releases
+// and we fall back to double + narrow.
+#if defined(__GNUC__) || defined(__clang__)
+extern int codes_get_float_array(const codes_handle *h, const char *key,
+                                 float *vals, size_t *length)
+    __attribute__((weak));
+#  define WMT_HAVE_WEAK_SYMBOLS 1
+#endif
+
+static inline int wmt_get_float_array(codes_handle *h, const char *key,
+                                      float *vals, size_t *len_inout) {
+#ifdef WMT_HAVE_WEAK_SYMBOLS
+    if (codes_get_float_array != NULL) {
+        return codes_get_float_array(h, key, vals, len_inout);
+    }
+#endif
+    if (vals == NULL || len_inout == NULL || *len_inout == 0) {
+        return CODES_INVALID_ARGUMENT;
+    }
+    size_t n = *len_inout;
+    double *tmp = (double *)malloc(n * sizeof(double));
+    if (tmp == NULL) return CODES_OUT_OF_MEMORY;
+    int rc = codes_get_double_array(h, key, tmp, &n);
+    if (rc == CODES_SUCCESS) {
+        for (size_t i = 0; i < n; i++) vals[i] = (float)tmp[i];
+        *len_inout = n;
+    }
+    free(tmp);
+    return rc;
+}
 
 typedef struct wmt_scalars {
     long ni, nj;
@@ -84,7 +118,7 @@ static inline int wmt_decode_full(codes_context *ctx,
         return -2;
     }
     *values_len = want;
-    int rc = codes_get_float_array(h, "values", values, values_len);
+    int rc = wmt_get_float_array(h, "values", values, values_len);
     codes_handle_delete(h);
     return rc;
 }

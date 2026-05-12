@@ -237,7 +237,7 @@ func getFloatArray(gid *C.codes_handle, key string, out []float32) C.int {
 	ckey := C.CString(key)
 	defer C.free(unsafe.Pointer(ckey))
 	n := C.size_t(len(out))
-	return C.codes_get_float_array(gid, ckey, (*C.float)(unsafe.Pointer(&out[0])), &n)
+	return C.wmt_get_float_array(gid, ckey, (*C.float)(unsafe.Pointer(&out[0])), &n)
 }
 
 func getSize(gid *C.codes_handle, key string) (C.size_t, C.int) {
