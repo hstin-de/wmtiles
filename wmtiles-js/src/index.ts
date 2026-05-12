@@ -20,6 +20,8 @@ export {
   type SampleRequest,
   type ForecastRequest,
   type ForecastResult,
+  type ValueRequest,
+  type ValueResult,
 } from "./reader.js";
 
 // Typed errors.

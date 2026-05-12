@@ -121,6 +121,22 @@ export interface ForecastResult {
   readonly values: Readonly<Record<string, Float32Array>>;
 }
 
+export interface ValueRequest {
+  lat: number;
+  lon: number;
+  time: TimeRef;
+  variables: readonly string[];
+  /** Defaults to maxZoom of the file. */
+  z?: number;
+}
+
+export interface ValueResult {
+  /** Resolved absolute time (matters when caller passed a step index). */
+  readonly time: Date;
+  /** NaN marks missing/NoData. Key set equals req.variables. */
+  readonly values: Readonly<Record<string, number>>;
+}
+
 // ---------- Sources ----------
 
 export function httpSource(url: string | URL, init?: RequestInit): ByteSource {
@@ -522,6 +538,27 @@ export class WMT {
     await Promise.all(jobs);
 
     return { times, values };
+  }
+
+  /**
+   * Snapshot of several variables at one point at one time. The dual of
+   * forecast(): same point, single time step, many variables. NaN = missing.
+   */
+  async value(req: ValueRequest): Promise<ValueResult> {
+    const vars = req.variables.map((name) => this.variable(name));
+    const t = this.timeIndexOf(req.time);
+    const z = req.z ?? this._header.maxZoom;
+
+    const values: Record<string, number> = {};
+    await Promise.all(
+      vars.map(async (v) => {
+        const val = await this._sample(v.id, t, req.lat, req.lon, z);
+        // null = out-of-bbox / out-of-range zoom / missing tile → NaN.
+        values[v.name] = val ?? NaN;
+      }),
+    );
+
+    return { time: this.timeAt(t), values };
   }
 
   // ---- Internal: fetch helpers (called by Variable) ----

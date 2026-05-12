@@ -213,6 +213,38 @@ test("WMT.forecast validates inputs and signals missing data with NaN", async ()
   for (const v of fc.values.temp) expect(Number.isNaN(v)).toBe(true);
 });
 
+test("WMT.value returns a snapshot of many variables at one time", async () => {
+  const r = await WMT.open(bytesSource(load("multistep.wmt")));
+
+  // step 2 → temp = 102, wind = 202 (offset + step from fixture)
+  const snap = await r.value({
+    lat: 0, lon: 0, time: 2, variables: ["temp", "wind"],
+  });
+  expect(snap.time.toISOString()).toBe("2026-05-03T02:00:00.000Z");
+  expect(snap.values.temp).toBe(102);
+  expect(snap.values.wind).toBe(202);
+
+  // Date-based time ref must produce the same result.
+  const byDate = await r.value({
+    lat: 0, lon: 0,
+    time: new Date("2026-05-03T02:00:00Z"),
+    variables: ["temp"],
+  });
+  expect(byDate.values.temp).toBe(102);
+
+  // Unknown variable name throws before any I/O.
+  await expect(
+    r.value({ lat: 0, lon: 0, time: 0, variables: ["nope"] }),
+  ).rejects.toBeInstanceOf(UnknownVariableError);
+
+  // Invalid coords → NaN per variable (never null).
+  const oob = await r.value({
+    lat: 91, lon: 0, time: 0, variables: ["temp", "wind"],
+  });
+  expect(Number.isNaN(oob.values.temp)).toBe(true);
+  expect(Number.isNaN(oob.values.wind)).toBe(true);
+});
+
 test("crc_corrupted.wmt falls back to previous snapshot", async () => {
   const r = await WMT.open(bytesSource(load("crc_corrupted.wmt")));
   const names = r.variables.map((v) => v.name).sort();
