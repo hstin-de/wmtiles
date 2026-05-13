@@ -43,6 +43,9 @@ type Appender struct {
 	inputs   []input
 	finished bool
 
+	// See Encoder.arrayVarSeq.
+	arrayVarSeq map[string]int
+
 	// Finish parks the shadow Encoder here so Progress() can read the live
 	// stream counters without aliasing atomics across structs.
 	live atomic.Pointer[Encoder]

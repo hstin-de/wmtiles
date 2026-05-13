@@ -223,6 +223,52 @@ err = enc.Finish()
 variable/time catalog, and writes one fresh `.wmt`. It does not append/extend
 once per input file.
 
+### Raw arrays via `AddArray`
+
+If the data is already in Go memory (custom reader, in-process model output,
+test fixture, …), skip the parser and hand a `[]float32` to `AddArray`. The
+grid is described by a `GridSpec` and the data layout is row-major:
+`data[y*Nx + x]` is the sample at `(Lat0 + y*DY, Lon0 + x*DX)`. `DX` or `DY`
+may be negative for flipped grids.
+
+```go
+import (
+	"math"
+	"time"
+	"github.com/hstin-de/wmtiles/encode"
+)
+
+enc, _ := encode.NewEncoder("custom.wmt", encode.Options{
+	TileSize: 256, MinZoom: 0, MaxZoom: 5,
+	Precision: map[string]float64{"t2m": 0.05},
+})
+
+const nx, ny = 720, 361
+values := make([]float32, nx*ny)
+// fill values[y*nx + x] = sample at (Lat0 + y*DY, Lon0 + x*DX)
+
+err = enc.AddArray(encode.ArrayInput{
+	Variable:      "t2m",
+	Unit:          "K",
+	ReferenceTime: time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC),
+	Grid: encode.GridSpec{
+		Nx: nx, Ny: ny,
+		Lon0: -180, Lat0: -90,
+		DX: 0.5, DY: 0.5,
+		MissingValue: math.NaN(), // zero defaults to NaN
+	},
+	Data: values,
+})
+
+// Same Variable + same Grid across calls → one time series.
+// Different Variable names → separate series in the same file.
+
+err = enc.Finish()
+```
+
+`Appender.AddArray` has the same signature and lets you extend an existing
+`.wmt` from in-memory data the same way.
+
 For appending new variable/time blocks to an existing file the CLI's
 `wmtiles extend` accepts both GRIB2 and HDF5 sources. Programs that need to
 drive the streaming encoder or appender directly can use the lower-level

@@ -104,6 +104,10 @@ type Encoder struct {
 	inputs   []input
 	finished bool
 
+	// Distinct AddArray Variable names need distinct VarKeys but repeated
+	// calls must collapse; a counter does both without hashing collisions.
+	arrayVarSeq map[string]int
+
 	submitted     atomic.Int64
 	skipped       atomic.Int64
 	expectedTiles int64
@@ -128,6 +132,8 @@ type input struct {
 	gribHeaders []parser.GribHeader
 	gribSkip    []bool
 	gribData    []byte
+
+	msgs []parser.GRIBFile
 }
 
 // NewEncoder creates a source-data-to-WMT encoder. Inputs are added with AddFile
@@ -665,6 +671,17 @@ func (in input) forEachHeaderFiltered(want func(shortName string) bool, fn func(
 			return parser.ForEachHDF5HeaderFiltered(in.path, want, fn)
 		}
 		return parser.ForEachHDF5HeaderBytesFiltered(in.data, want, fn)
+	case FormatArray:
+		for i := range in.msgs {
+			h := in.msgs[i].Header
+			if want != nil && !want(h.ShortName) {
+				continue
+			}
+			if err := fn(h); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return unsupportedFormatError(in.format)
 	}
@@ -682,6 +699,17 @@ func (in input) forEachMessageFiltered(want func(*parser.GribHeader) bool, fn fu
 			return parser.ForEachHDF5MessageFiltered(in.path, want, fn)
 		}
 		return parser.ForEachHDF5MessageBytesFiltered(in.data, want, fn)
+	case FormatArray:
+		for i := range in.msgs {
+			msg := in.msgs[i]
+			if want != nil && !want(&msg.Header) {
+				continue
+			}
+			if err := fn(msg); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return unsupportedFormatError(in.format)
 	}
