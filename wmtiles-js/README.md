@@ -32,7 +32,7 @@ wmt.timeAxis;          // { kind: "regular", start, intervalMs, count } | { kind
 
 There are two ways to pull data out of a file:
 
-| You want… | Use | Returns |
+| You want | Use | Returns |
 |---|---|---|
 | The value of a few variables at one (lat, lon, time) | [`wmt.value()`](#point-snapshot-wmtvalue) | scalars per variable |
 | The time series of a few variables at one (lat, lon) | [`wmt.forecast()`](#point-time-series-wmtforecast) | `Float32Array` per variable |
@@ -191,6 +191,115 @@ try {
 }
 ```
 
+## Map rendering
+
+`wmtiles` ships four WebGL2 renderers that turn the tile data into something
+visible on a map. They are framework-agnostic. See [`docs/leaflet.md`](./docs/leaflet.md)
+for the Leaflet integration that wraps them in `L.Layer` instances.
+
+| Renderer | Module | What it does |
+|---|---|---|
+| `HeatmapRenderer` | `wmtiles/render/heatmap` | Colormapped heatmap of one variable. Time-lerp + parent/child tile fallback. |
+| `ParticlesRenderer` | `wmtiles/render/particles` | Animated particles advected through a u/v field. Map-anchored, with trails. |
+| `ArrowsRenderer` | `wmtiles/render/arrows` | Static vector arrows on a per-tile grid. Map-anchored. |
+| `IsobarRenderer` | `wmtiles/render/isobar` | Contour lines for any scalar field. Pyramid-smoothing, optional region fill. |
+
+All four share a `TileSource` (`wmtiles/render/source`) that handles the WMT
+tile cache + batched fetching, so multiple renderers backed by the same WMT
+won't double-fetch.
+
+### Quickstart with Leaflet
+
+```sh
+npm install wmtiles leaflet
+```
+
+```ts
+import { open } from "wmtiles";
+import "wmtiles/leaflet";        // side-effect: adds layer factories to WMT
+import L from "leaflet";
+
+const wmt = await open("/data.wmt");
+
+const map = L.map("map").fitBounds([
+  [wmt.bbox.south, wmt.bbox.west],
+  [wmt.bbox.north, wmt.bbox.east],
+]);
+
+const heatmap = wmt.createHeatmapLayer({
+  variable: "t2m",
+  vmin: 260,
+  vmax: 305,
+  colormap: "viridis",
+}).addTo(map);
+
+const particles = wmt.createParticlesLayer({
+  uVar: "10u",
+  vVar: "10v",
+  colormap: "white",
+  particleSize: 2.5,
+}).addTo(map);
+```
+
+Full adapter API (all four layer factories, options, lifecycle):
+[`docs/leaflet.md`](./docs/leaflet.md).
+
+### Renderer options at a glance
+
+Pass these on the layer factory (`wmt.createHeatmapLayer(options)`) or on
+the raw renderer (`new HeatmapRenderer(canvas, wmt, options)`). The
+defaults are tuned for "looks reasonable out of the box".
+
+**Heatmap**
+- `variable`: name (optional, defaults to first variable)
+- `vmin`, `vmax`: colormap range (optional, default from `variable.range`)
+- `t`: initial time step (default 0)
+- `colormap`: `"viridis"` (default) / `"plasma"` / `"inferno"` / `"gray"` / `"white"` / `"rdbu"` / `"hilow"` / custom
+- `alpha`: 0.85
+- `cacheSize`: 384 tiles
+- `parentFallbackLevels`: 6, `childFallback`: true
+- `prefetchNext`: true, `disableTimeLerp`: false
+
+**Particles**
+- `uVar`, `vVar`: u/v variable names (optional, set via `setState` later if omitted)
+- `t`: initial time step (default 0)
+- `particleCount`: 4096, `particleSize`: 1.5 px, `fadeOpacity`: 0.96
+- `speedFactor`: 0.0005, `maxAgeFrames`: 100
+- `colormap` (for particle color by speed), `speedRange`: `[0, 30]` m/s
+
+**Arrows**
+- `uVar`, `vVar`: u/v variable names (optional)
+- `t`: initial time step (default 0)
+- `arrowsPerTile`: 8 (= 64 arrows per visible tile)
+- `arrowSize`: 16 px, `outlineWidth`: 1.5 px, `outlineColor`: `[0, 0, 0]`
+- `colormap`, `speedRange`: `[0, 30]` m/s
+
+**Isobar**
+- `variable`: name (optional)
+- `t`: initial time step (default 0)
+- `spacing`: contour interval in data units (e.g. 400 for 4 hPa pressure)
+- `lineColor`: `[1, 1, 1]`, `lineWidth`: 1 px, `majorEvery`: 5
+- `smoothness`: 4 (pyramid mip levels, auto-reduced at low zoom), `alpha`: 0.9
+- `fillEnabled`: false, `fillColormap`: `"hilow"`, `fillRange`: `[min, max]` of variable, `fillAlpha`: 0.45
+
+### Custom colormaps
+
+Two flavours of `Colormap`:
+
+```ts
+// As RGB stops, evenly spaced, interpolated in shader
+const myMap = { kind: "stops", stops: [[0, 0, 255], [255, 255, 255], [255, 0, 0]] };
+
+// As raw GLSL, defining `vec3 colormap(float t)`
+const myDiscrete = {
+  kind: "glsl",
+  body: `vec3 colormap(float t) { return t < 0.5 ? vec3(0.1,0.4,0.9) : vec3(0.9,0.2,0.2); }`,
+};
+```
+
+Pass via the `colormap` option of any renderer. Builtins live in
+`wmtiles/colormap`.
+
 ## API surface
 
 | Layer | Exports | When to use |
@@ -198,9 +307,20 @@ try {
 | **Root** | `open`, `WMT`, `Variable`, `httpSource`, `bytesSource`, `ByteSource`, request types | What normal callers want. |
 | **Geo helper** | `latLonToTilePixel` | Point sampling and custom map UIs. |
 | **Errors** | `WMTError`, `SourceError`, `FormatError`, `UnknownVariableError`, `TimeOutOfRangeError` | `instanceof` checks. |
+| **`wmtiles/leaflet`** | Side-effect import: adds `createHeatmapLayer`, `createParticlesLayer`, `createIsobarLayer`, `createArrowsLayer` methods to every `WMT` instance. Also re-exports the same functions as standalone factories taking `(wmt, options)`. See [`docs/leaflet.md`](./docs/leaflet.md). |
+| **`wmtiles/render/heatmap`** | `HeatmapRenderer`, options + state types | Build your own (non-Leaflet) heatmap layer. |
+| **`wmtiles/render/particles`** | `ParticlesRenderer` | Build your own animated particle flow layer. |
+| **`wmtiles/render/arrows`** | `ArrowsRenderer` | Build your own vector arrows layer. |
+| **`wmtiles/render/isobar`** | `IsobarRenderer` | Build your own contour layer. |
+| **`wmtiles/render/source`** | `TileSource` | Shared tile cache/fetcher; pass into multiple renderers. |
+| **`wmtiles/colormap`** | `builtinColormaps`, `resolveColormap`, `Colormap` types | Build / pass custom colormaps. |
 | **`wmtiles/format`** | `parseHeader`, `parseBlockTable`, format constants and structs | Advanced: build your own caching layer. |
 | **`wmtiles/codec`** | `decodeCodec`, `dequantize`, codec constants | Advanced: decode raw tile blobs. |
 | **`wmtiles/tileid`** | `encode3D`, `hilbertXY2D`, `zoomOffset` | Advanced: precompute format tile IDs. |
+
+`leaflet` is an optional peer dependency. Other adapters (MapLibre,
+OpenLayers) are not implemented yet; the framework-agnostic renderers
+expose everything needed to wire them up. Open an issue or PR.
 
 This library is a faithful port of the Go reader in `reader/reader.go`.
 

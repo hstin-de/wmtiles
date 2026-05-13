@@ -40,6 +40,10 @@ node_modules/.stamp: package.json bun.lock wmtiles-js/package.json cmd/wmtiles/w
 	bun install --frozen-lockfile
 	touch $@
 
+# Recursive *.ts under a directory (handles `render/` and `adapters/` subdirs
+# that the flat `wildcard` glob misses).
+rwildcard = $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2) $(filter $(subst *,%,$2),$d))
+
 .PHONY: deps
 deps: node_modules/.stamp
 
@@ -59,7 +63,7 @@ testdata: $(TESTDATA_FILES)
 # point, which resolves to dist just like published consumers do.
 LIB_DIST := wmtiles-js/dist/index.js wmtiles-js/dist/index.cjs wmtiles-js/dist/index.d.ts
 LIB_STAMP := wmtiles-js/.dist.stamp
-LIB_SRC  := $(wildcard wmtiles-js/src/*.ts)
+LIB_SRC  := $(call rwildcard,wmtiles-js/src/,*.ts)
 
 $(LIB_STAMP): node_modules/.stamp $(LIB_SRC)
 	bun -F wmtiles build
@@ -72,8 +76,8 @@ lib: $(LIB_STAMP)
 
 # Viewer bundle. Triggered when viewer or library source changes.
 VIEWER_DIST := cmd/wmtiles/web/dist/viewer.js
-VIEWER_SRC  := $(wildcard cmd/wmtiles/web/src/*.ts cmd/wmtiles/web/index.html) \
-               $(wildcard wmtiles-js/src/*.ts)
+VIEWER_SRC  := $(call rwildcard,cmd/wmtiles/web/src/,*.ts) cmd/wmtiles/web/index.html \
+               $(call rwildcard,wmtiles-js/src/,*.ts)
 
 $(VIEWER_DIST): node_modules/.stamp $(LIB_STAMP) $(VIEWER_SRC)
 	bun -F wmtiles-viewer build

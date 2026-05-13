@@ -11,7 +11,16 @@
     "src/decoder.ts",
     "src/tileid.ts",
     "src/reader.ts",
-    "src/errors.ts"
+    "src/errors.ts",
+    "src/render/colormap.ts",
+    "src/render/shader.ts",
+    "src/render/cache.ts",
+    "src/render/source.ts",
+    "src/render/heatmap.ts",
+    "src/render/particles.ts",
+    "src/render/isobar.ts",
+    "src/render/arrows.ts",
+    "src/adapters/leaflet.ts"
   ],
   "exclude": ["src/**/*.test.ts"]
 }

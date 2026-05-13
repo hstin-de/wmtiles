@@ -1,8 +1,13 @@
 import { open, latLonToTilePixel, type Variable, type WMT } from "wmtiles";
-import { makeWMTLayer, type WMTLayer } from "./layer";
+import type {
+  WMTHeatmapLayer,
+  WMTParticlesLayer,
+  WMTIsobarLayer,
+  WMTArrowsLayer,
+} from "wmtiles/leaflet";
+import "wmtiles/leaflet";
 import { installDebugHud } from "./debug";
-
-declare const L: typeof import("leaflet");
+import L from "leaflet";
 
 const $ = (id: string): HTMLElement => {
   const el = document.getElementById(id);
@@ -22,7 +27,7 @@ interface ClickResult {
 
 async function valueAtClick(
   wmt: WMT,
-  layer: WMTLayer,
+  layer: WMTHeatmapLayer,
   latlng: L.LatLng,
   mapZoom: number,
 ): Promise<ClickResult | null> {
@@ -91,7 +96,16 @@ async function boot(): Promise<void> {
     },
   ).addTo(map);
 
-  const layer = makeWMTLayer(wmt).addTo(map);
+  // ?fmt=r16f|r32f overrides the auto-probe, for diagnosing mobile uniform-colour bugs
+  const urlFmt = new URLSearchParams(location.search).get("fmt");
+  const tileTextureFormat =
+    urlFmt === "r32f" || urlFmt === "r16f" || urlFmt === "auto"
+      ? (urlFmt as "r32f" | "r16f" | "auto")
+      : undefined;
+  let layer: WMTHeatmapLayer = wmt.createHeatmapLayer({
+    tileTextureFormat,
+  }).addTo(map) as WMTHeatmapLayer;
+  let scalarOn = true;
 
   const groups = new Map<string, VarGroup[]>();
   for (const v of wmt.variables) {
@@ -131,6 +145,201 @@ async function boot(): Promise<void> {
   vminEl.disabled = false;
   vmaxEl.disabled = false;
 
+  const windUSel = $("windU") as HTMLSelectElement;
+  const windVSel = $("windV") as HTMLSelectElement;
+  const sortedVars = [...wmt.variables].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+  for (const sel of [windUSel, windVSel]) {
+    for (const v of sortedVars) {
+      const o = document.createElement("option");
+      o.value = v.name;
+      o.textContent = v.name;
+      sel.appendChild(o);
+    }
+    sel.disabled = false;
+  }
+
+  let windLayer: WMTParticlesLayer | null = null;
+  function rebuildWindLayer(): void {
+    const uName = windUSel.value;
+    const vName = windVSel.value;
+    if (windLayer) {
+      map.removeLayer(windLayer);
+      windLayer = null;
+    }
+    if (!uName || !vName) return;
+    if (uName === vName) {
+      console.warn("wmtiles: u and v must differ");
+      return;
+    }
+    try {
+      windLayer = wmt.createParticlesLayer({
+        uVar: uName,
+        vVar: vName,
+        colormap: "white",
+        particleSize: 2.5,
+        speedFactor: 0.0005,
+        tileTextureFormat,
+      }).addTo(map) as WMTParticlesLayer;
+      windLayer.setState({ t: +time.value });
+    } catch (err) {
+      console.error("wmtiles: wind overlay failed", err);
+    }
+  }
+  windUSel.onchange = rebuildWindLayer;
+  windVSel.onchange = rebuildWindLayer;
+
+  const arrowUSel = $("arrowU") as HTMLSelectElement;
+  const arrowVSel = $("arrowV") as HTMLSelectElement;
+  for (const sel of [arrowUSel, arrowVSel]) {
+    for (const v of sortedVars) {
+      const o = document.createElement("option");
+      o.value = v.name;
+      o.textContent = v.name;
+      sel.appendChild(o);
+    }
+    sel.disabled = false;
+  }
+
+  let arrowLayer: WMTArrowsLayer | null = null;
+  function rebuildArrowLayer(): void {
+    const uName = arrowUSel.value;
+    const vName = arrowVSel.value;
+    if (arrowLayer) {
+      map.removeLayer(arrowLayer);
+      arrowLayer = null;
+    }
+    if (!uName || !vName) return;
+    if (uName === vName) {
+      console.warn("wmtiles: arrow u and v must differ");
+      return;
+    }
+    try {
+      arrowLayer = wmt.createArrowsLayer({
+        uVar: uName,
+        vVar: vName,
+        colormap: "viridis",
+        tileTextureFormat,
+      }).addTo(map) as WMTArrowsLayer;
+      arrowLayer.setState({ t: +time.value });
+    } catch (err) {
+      console.error("wmtiles: arrow overlay failed", err);
+    }
+  }
+  arrowUSel.onchange = rebuildArrowLayer;
+  arrowVSel.onchange = rebuildArrowLayer;
+
+  const isoVarSel = $("isoVar") as HTMLSelectElement;
+  const isoSpacingEl = $("isoSpacing") as HTMLInputElement;
+  const isoUnitEl = $("isoUnit");
+  const isoSmoothEl = $("isoSmooth") as HTMLInputElement;
+  const isoSmoothLabelEl = $("isoSmoothLabel");
+  const isoFillEl = $("isoFill") as HTMLInputElement;
+  for (const v of sortedVars) {
+    const o = document.createElement("option");
+    o.value = v.name;
+    o.textContent = v.name;
+    isoVarSel.appendChild(o);
+  }
+  isoVarSel.disabled = false;
+  isoSpacingEl.disabled = false;
+  isoSmoothEl.disabled = false;
+  isoFillEl.disabled = false;
+
+  // Round a raw spacing target to a "nice" number: 1, 2, 5, 10, 20, 50, ...
+  function niceSpacing(raw: number): number {
+    if (!(raw > 0) || !Number.isFinite(raw)) return 1;
+    const exp = Math.floor(Math.log10(raw));
+    const base = Math.pow(10, exp);
+    const r = raw / base;
+    let mult = 1;
+    if (r >= 5) mult = 5;
+    else if (r >= 2) mult = 2;
+    return mult * base;
+  }
+
+  function suggestSpacing(v: Variable): number {
+    const lo = Number.isFinite(v.range.min) ? v.range.min : 0;
+    const hi = Number.isFinite(v.range.max) ? v.range.max : 1;
+    const span = Math.max(hi - lo, 1e-6);
+    // Aim for ~25 contour lines across the data range.
+    return niceSpacing(span / 25);
+  }
+
+  let isoLayer: WMTIsobarLayer | null = null;
+  function updateIsoHint(): void {
+    if (!isoLayer) {
+      isoUnitEl.textContent = "";
+      return;
+    }
+    const unit = isoLayer.state.variable.unit || "";
+    const eff = isoLayer.effectiveSpacing();
+    const base = +isoSpacingEl.value;
+    isoUnitEl.textContent =
+      eff !== base
+        ? `${unit} (eff ${eff})`
+        : unit;
+  }
+  function rebuildIsobarLayer(): void {
+    const name = isoVarSel.value;
+    if (isoLayer) {
+      map.removeLayer(isoLayer);
+      isoLayer = null;
+    }
+    isoUnitEl.textContent = "";
+    if (!name) return;
+    const v = wmt.variable(name);
+    isoUnitEl.textContent = v.unit ? v.unit : "";
+    const spacing = +isoSpacingEl.value;
+    if (!Number.isFinite(spacing) || spacing <= 0) {
+      console.warn("wmtiles: invalid isobar spacing");
+      return;
+    }
+    try {
+      isoLayer = wmt.createIsobarLayer({
+        variable: name,
+        spacing,
+        smoothness: +isoSmoothEl.value,
+        fillEnabled: isoFillEl.checked,
+        tileTextureFormat,
+      }).addTo(map) as WMTIsobarLayer;
+      isoLayer.setState({ t: +time.value });
+      updateIsoHint();
+    } catch (err) {
+      console.error("wmtiles: isobar overlay failed", err);
+    }
+  }
+  map.on("zoomend", updateIsoHint);
+
+  isoSmoothEl.oninput = () => {
+    const s = +isoSmoothEl.value;
+    isoSmoothLabelEl.textContent = String(s);
+    if (isoLayer) isoLayer.setSmoothness(s);
+  };
+  isoFillEl.onchange = () => {
+    if (isoLayer) isoLayer.setFillEnabled(isoFillEl.checked);
+  };
+  isoVarSel.onchange = () => {
+    const name = isoVarSel.value;
+    if (name) {
+      const v = wmt.variable(name);
+      isoSpacingEl.value = String(suggestSpacing(v));
+    }
+    rebuildIsobarLayer();
+  };
+  isoSpacingEl.onchange = () => {
+    if (isoLayer) {
+      const s = +isoSpacingEl.value;
+      if (Number.isFinite(s) && s > 0) {
+        isoLayer.setSpacing(s);
+        updateIsoHint();
+      }
+    } else {
+      rebuildIsobarLayer();
+    }
+  };
+
   const legend = new L.Control({ position: "bottomright" });
   legend.onAdd = () => {
     const div = L.DomUtil.create("div", "legend");
@@ -141,6 +350,26 @@ async function boot(): Promise<void> {
     return div;
   };
   legend.addTo(map);
+
+  const scalarEnabledEl = $("scalarEnabled") as HTMLInputElement;
+  scalarEnabledEl.disabled = false;
+  // Click on the checkbox must not toggle the surrounding <details>.
+  scalarEnabledEl.addEventListener("click", (e) => e.stopPropagation());
+  scalarEnabledEl.onchange = () => {
+    const wantOn = scalarEnabledEl.checked;
+    if (wantOn && !scalarOn) {
+      layer = wmt.createHeatmapLayer({
+        tileTextureFormat,
+      }).addTo(map) as WMTHeatmapLayer;
+      scalarOn = true;
+      legend.addTo(map);
+      refresh();
+    } else if (!wantOn && scalarOn) {
+      map.removeLayer(layer);
+      map.removeControl(legend);
+      scalarOn = false;
+    }
+  };
 
   function currentVar(): Variable | null {
     const list = groups.get(paramSel.value);
@@ -181,7 +410,10 @@ async function boot(): Promise<void> {
     const t = +time.value;
     const vmin = +vminEl.value;
     const vmax = +vmaxEl.value;
-    layer.setState({ variable: v, t, vmin, vmax });
+    if (scalarOn) layer.setState({ variable: v, t, vmin, vmax });
+    if (windLayer) windLayer.setState({ t });
+    if (isoLayer) isoLayer.setState({ t });
+    if (arrowLayer) arrowLayer.setState({ t });
     const maxStep = wmt.timeStepCount - 1;
     const tF = Math.max(0, Math.min(maxStep, Math.floor(t)));
     const tC = Math.min(maxStep, tF + 1);

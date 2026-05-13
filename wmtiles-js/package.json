@@ -32,9 +32,47 @@
       "types": "./dist/errors.d.ts",
       "import": "./dist/errors.js",
       "require": "./dist/errors.cjs"
+    },
+    "./render/heatmap": {
+      "types": "./dist/render/heatmap.d.ts",
+      "import": "./dist/render/heatmap.js",
+      "require": "./dist/render/heatmap.cjs"
+    },
+    "./render/particles": {
+      "types": "./dist/render/particles.d.ts",
+      "import": "./dist/render/particles.js",
+      "require": "./dist/render/particles.cjs"
+    },
+    "./render/isobar": {
+      "types": "./dist/render/isobar.d.ts",
+      "import": "./dist/render/isobar.js",
+      "require": "./dist/render/isobar.cjs"
+    },
+    "./render/arrows": {
+      "types": "./dist/render/arrows.d.ts",
+      "import": "./dist/render/arrows.js",
+      "require": "./dist/render/arrows.cjs"
+    },
+    "./render/source": {
+      "types": "./dist/render/source.d.ts",
+      "import": "./dist/render/source.js",
+      "require": "./dist/render/source.cjs"
+    },
+    "./colormap": {
+      "types": "./dist/render/colormap.d.ts",
+      "import": "./dist/render/colormap.js",
+      "require": "./dist/render/colormap.cjs"
+    },
+    "./leaflet": {
+      "types": "./dist/adapters/leaflet.d.ts",
+      "import": "./dist/adapters/leaflet.js",
+      "require": "./dist/adapters/leaflet.cjs"
     }
   },
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/adapters/leaflet.js",
+    "./dist/adapters/leaflet.cjs"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hstin-de/wmtiles.git",
@@ -52,15 +90,24 @@
     "prepublishOnly": "bun run typecheck && bun run test && bun run build",
     "build": "bun run build:esm && bun run build:cjs",
     "build:esm": "tsc -p tsconfig.build.json",
-    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs && bun build src/format.ts --outfile dist/format.cjs --target node --format cjs && bun build src/decoder.ts --outfile dist/decoder.cjs --target node --format cjs && bun build src/tileid.ts --outfile dist/tileid.cjs --target node --format cjs && bun build src/errors.ts --outfile dist/errors.cjs --target node --format cjs",
+    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs && bun build src/format.ts --outfile dist/format.cjs --target node --format cjs && bun build src/decoder.ts --outfile dist/decoder.cjs --target node --format cjs && bun build src/tileid.ts --outfile dist/tileid.cjs --target node --format cjs && bun build src/errors.ts --outfile dist/errors.cjs --target node --format cjs && bun build src/render/heatmap.ts --outfile dist/render/heatmap.cjs --target browser --format cjs && bun build src/render/particles.ts --outfile dist/render/particles.cjs --target browser --format cjs && bun build src/render/isobar.ts --outfile dist/render/isobar.cjs --target browser --format cjs && bun build src/render/arrows.ts --outfile dist/render/arrows.cjs --target browser --format cjs && bun build src/render/source.ts --outfile dist/render/source.cjs --target browser --format cjs && bun build src/render/colormap.ts --outfile dist/render/colormap.cjs --target browser --format cjs && bun build src/adapters/leaflet.ts --outfile dist/adapters/leaflet.cjs --target browser --format cjs --external leaflet",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
   "dependencies": {
     "fzstd": "^0.1.1"
   },
+  "peerDependencies": {
+    "leaflet": "^1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "leaflet": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "typescript": "^5.5.0",
-    "bun-types": "latest"
+    "bun-types": "latest",
+    "@types/leaflet": "^1.9.0"
   }
 }

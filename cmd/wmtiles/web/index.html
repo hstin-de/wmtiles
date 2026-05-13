@@ -2,17 +2,73 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>wmtiles viewer</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #1a1a1a; color: #ddd; }
-  #top { padding: 8px 12px; background: #222; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #333; min-height: 32px; }
+
+  #top {
+    padding: 8px 12px; background: #222;
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    border-bottom: 1px solid #333; min-height: 32px;
+  }
   #top label { font-size: 12px; color: #aaa; display: inline-flex; align-items: center; gap: 6px; }
-  #top select, #top input[type=number] { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 4px 6px; border-radius: 3px; font-size: 12px; }
-  #top input[type=range] { width: 240px; vertical-align: middle; }
-  #map { position: absolute; left: 0; right: 0; bottom: 0; top: 50px; background: #111; }
+  #top select, #top input[type=number] {
+    background: #2a2a2a; color: #ddd; border: 1px solid #444;
+    padding: 4px 6px; border-radius: 3px; font-size: 12px;
+  }
+  #top input[type=range] { width: 320px; vertical-align: middle; }
   #status { font-size: 11px; color: #888; margin-left: auto; font-family: monospace; }
+
+  #map { position: absolute; left: 0; right: 0; bottom: 0; top: 50px; background: #111; }
+
+  #panel {
+    position: absolute; top: 100px; right: 12px; width: 240px;
+    max-height: calc(100vh - 120px); overflow: auto;
+    background: rgba(34,34,34,.94); border: 1px solid #333; border-radius: 6px;
+    padding: 4px 0; font-size: 12px; z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  }
+  #panel details {
+    border-bottom: 1px solid #333; padding: 0;
+  }
+  #panel details:last-child { border-bottom: none; }
+  #panel summary {
+    cursor: pointer; padding: 8px 12px; color: #ccc; font-weight: 600;
+    user-select: none; list-style: none;
+    display: flex; align-items: center;
+  }
+  #panel summary input[type=checkbox] {
+    margin-left: auto;
+  }
+  #panel summary::-webkit-details-marker { display: none; }
+  #panel summary::before {
+    content: "▸"; display: inline-block; width: 14px; transition: transform .15s;
+    color: #777;
+  }
+  #panel details[open] > summary::before { transform: rotate(90deg); }
+  #panel summary:hover { color: #fff; background: rgba(255,255,255,.03); }
+  #panel .ctrls {
+    padding: 4px 12px 12px 28px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #panel .ctrls label {
+    display: flex; align-items: center; gap: 6px; color: #aaa; font-size: 11px;
+  }
+  #panel .ctrls label > span:first-child {
+    flex: 0 0 60px;
+  }
+  #panel .ctrls select, #panel .ctrls input[type=number] {
+    flex: 1; min-width: 0;
+    background: #2a2a2a; color: #ddd; border: 1px solid #444;
+    padding: 3px 6px; border-radius: 3px; font-size: 11px;
+  }
+  #panel .ctrls input[type=range] {
+    flex: 1; min-width: 0;
+  }
+  #panel .hint { font-size: 10px; color: #888; margin-left: 4px; min-width: 16px; }
+
   .legend { background: rgba(34,34,34,.92); color: #ddd; padding: 6px 10px; border-radius: 4px; font: 11px/1.3 monospace; }
   .legend .bar { width: 160px; height: 12px; margin: 4px 0; background: linear-gradient(to right,
     rgb(68,1,84), rgb(72,35,116), rgb(64,67,135), rgb(52,94,141), rgb(41,121,142),
@@ -25,13 +81,56 @@
 </head>
 <body>
 <div id="top">
-  <label>parameter <select id="param" disabled><option>loading…</option></select></label>
-  <label>height <select id="height" disabled><option>n/a</option></select></label>
   <label>time <input id="time" type="range" min="0" max="0" value="0" step="any" disabled> <span id="timeLabel"></span></label>
-  <label>vmin <input id="vmin" type="number" step="any" style="width:90px" disabled></label>
-  <label>vmax <input id="vmax" type="number" step="any" style="width:90px" disabled></label>
   <span id="status">opening…</span>
 </div>
+
+<div id="panel">
+  <details open>
+    <summary>Heatmap <input id="scalarEnabled" type="checkbox" checked disabled style="margin-left:auto"></summary>
+    <div class="ctrls">
+      <label><span>parameter</span><select id="param" disabled><option>loading…</option></select></label>
+      <label><span>height</span><select id="height" disabled><option>n/a</option></select></label>
+      <label><span>vmin</span><input id="vmin" type="number" step="any" disabled></label>
+      <label><span>vmax</span><input id="vmax" type="number" step="any" disabled></label>
+    </div>
+  </details>
+  <details>
+    <summary>Wind particles</summary>
+    <div class="ctrls">
+      <label><span>u var</span><select id="windU" disabled><option value="">— off —</option></select></label>
+      <label><span>v var</span><select id="windV" disabled><option value="">— off —</option></select></label>
+    </div>
+  </details>
+  <details>
+    <summary>Vector arrows</summary>
+    <div class="ctrls">
+      <label><span>u var</span><select id="arrowU" disabled><option value="">— off —</option></select></label>
+      <label><span>v var</span><select id="arrowV" disabled><option value="">— off —</option></select></label>
+    </div>
+  </details>
+  <details>
+    <summary>Isobars</summary>
+    <div class="ctrls">
+      <label><span>variable</span><select id="isoVar" disabled><option value="">— off —</option></select></label>
+      <label>
+        <span>spacing</span>
+        <input id="isoSpacing" type="number" step="any" value="4" disabled>
+        <span id="isoUnit" class="hint"></span>
+      </label>
+      <label>
+        <span>smooth</span>
+        <input id="isoSmooth" type="range" min="0" max="6" step="1" value="4" disabled>
+        <span id="isoSmoothLabel" class="hint">4</span>
+      </label>
+      <label>
+        <span>fill regions</span>
+        <input id="isoFill" type="checkbox" disabled>
+      </label>
+    </div>
+  </details>
+</div>
+
 <div id="map"></div>
 <script src="/viewer.js"></script>
 </body>
