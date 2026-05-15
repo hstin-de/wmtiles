@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/hstin-de/wmtiles/encoder"
 	"github.com/hstin-de/wmtiles/internal/scan"
 	"github.com/hstin-de/wmtiles/parser"
@@ -15,13 +17,53 @@ import (
 )
 
 // File bytes, message ranges and headers are cached on the input so the
-// streaming pass doesn't re-read the file or re-parse headers.
+// streaming pass doesn't re-read the file or re-parse headers. Bytes come
+// from mmap so multi-file encodes don't pin every file's bytes in RSS;
+// pages stay under the kernel page cache and get reclaimed on munmap.
 func (e *Encoder) scanGRIBFast(in *input, filter map[string]bool, st *scanState) error {
-	data, err := os.ReadFile(in.path)
+	data, mmapped, err := mmapGribFile(in.path)
 	if err != nil {
-		return fmt.Errorf("read grib: %w", err)
+		return fmt.Errorf("open grib: %w", err)
+	}
+	if mmapped {
+		in.gribMmap = data
 	}
 	return e.scanGRIBBytes(in, data, filter, st)
+}
+
+// mmapGribFile maps the file for read; falls back to ReadFile when mmap
+// isn't usable (zero-byte files, non-regular targets like pipes, or kernels
+// that refuse the syscall). Returns (bytes, mmapped, err).
+func mmapGribFile(path string) ([]byte, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	size := fi.Size()
+	if size <= 0 || !fi.Mode().IsRegular() {
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		return raw, false, nil
+	}
+	data, mErr := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ, unix.MAP_SHARED)
+	if mErr != nil {
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		return raw, false, nil
+	}
+	// hint sequential first-touch: the scan pass walks message ranges in
+	// order, and parallel workers in the stream pass don't suffer from it.
+	_ = unix.Madvise(data, unix.MADV_SEQUENTIAL)
+	return data, true, nil
 }
 
 func (e *Encoder) scanGRIBBytesFast(in *input, filter map[string]bool, st *scanState) error {
@@ -115,6 +157,10 @@ func (e *Encoder) streamGRIBFast(in *input, bySig map[scan.VarKey]*scan.VarInfo,
 		in.gribRanges = nil
 		in.gribHeaders = nil
 		in.gribSkip = nil
+		if in.gribMmap != nil {
+			_ = unix.Munmap(in.gribMmap)
+			in.gribMmap = nil
+		}
 	}()
 
 	keepIdx := make([]int, 0, len(ranges))
@@ -296,6 +342,24 @@ func (e *Encoder) streamGRIBFast(in *input, bySig map[scan.VarKey]*scan.VarInfo,
 	}
 	wg.Wait()
 	return getErr()
+}
+
+// releaseGribCaches unmaps any per-input GRIB regions and clears the parse
+// caches. Safe to call multiple times; the second call is a no-op. Used as
+// a defer guard on Finish paths so an error between scanInputs and the end
+// of streamTiles doesn't leave mappings live for the rest of the process.
+func releaseGribCaches(inputs []input) {
+	for i := range inputs {
+		in := &inputs[i]
+		if in.gribMmap != nil {
+			_ = unix.Munmap(in.gribMmap)
+			in.gribMmap = nil
+		}
+		in.gribData = nil
+		in.gribRanges = nil
+		in.gribHeaders = nil
+		in.gribSkip = nil
+	}
 }
 
 // Per-message decode buffers are large; recycle them so the heap doesn't

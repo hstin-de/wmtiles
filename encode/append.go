@@ -127,6 +127,7 @@ func (a *Appender) Finish() error {
 	if len(a.inputs) == 0 {
 		return errors.New("wmtiles/encode: no inputs added")
 	}
+	defer func() { releaseGribCaches(a.inputs) }()
 
 	// Borrow the fresh-Encoder's parallel scan so append and fresh stay in
 	// lockstep on variable naming + bbox math.
@@ -259,6 +260,10 @@ func (a *appendSinkWrap) DeclareBlock(spec encoder.BlockSpec) error {
 
 func (a *appendSinkWrap) NewDirectWorker() (*encoder.DirectWorker, error) {
 	return a.ctx.NewDirectWorker()
+}
+
+func (a *appendSinkWrap) FlushPendingBlocks() error {
+	return a.ctx.FlushPendingBlocks()
 }
 
 func isAlreadyExists(err error) bool {

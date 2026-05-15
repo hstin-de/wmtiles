@@ -67,6 +67,11 @@ type AppendCtx struct {
 	allowReplace   bool
 	existingBlocks map[blockKey]struct{}
 
+	// flushedEntries accumulates block-table entries from incremental flushes
+	// (FlushPendingBlocks) so the final snapshot merges all new blocks even
+	// when the caller drained them per-file to keep peak RAM bounded.
+	flushedEntries []format.BlockTableEntry
+
 	creationTimeOverride time.Time
 
 	timeCatalog format.TimeCatalog
@@ -482,6 +487,67 @@ func (a *AppendCtx) serializer() {
 	}
 }
 
+// FlushPendingBlocks finalizes every currently-declared block, writes it to
+// disk and releases it. Block-table entries collect in a.flushedEntries for
+// the eventual snapshot. Used by the encode-package stream loop to drain
+// after each input file so peak RAM stays at one file's worth of blocks
+// instead of all inputs combined. Silent: no OnPhase / OnBlockCompressed /
+// OnBlockWritten callbacks fire here. Finish handles any residual blocks
+// with the usual phase reporting.
+func (a *AppendCtx) FlushPendingBlocks() error {
+	if err := a.checkErr(); err != nil {
+		return err
+	}
+	a.blockMu.Lock()
+	decls := a.declarations
+	blocks := a.blocks
+	a.declarations = nil
+	a.blocks = make(map[blockKey]*blockBuilder)
+	a.blockMu.Unlock()
+	if len(decls) == 0 {
+		return nil
+	}
+	return a.compressAndWriteBatch(decls, blocks, nil, nil)
+}
+
+// compressAndWriteBatch finishes the given blocks in parallel, writes them
+// sequentially at a.cursor, accumulates block-table entries into
+// a.flushedEntries and releases each block's memory after its write. Callers
+// own the slice/map (FlushPendingBlocks snapshots them under blockMu first;
+// Finish runs after workers stop and owns them directly).
+func (a *AppendCtx) compressAndWriteBatch(
+	decls []blockKey,
+	blocks map[blockKey]*blockBuilder,
+	compressCb func(int, uint64),
+	writeCb func(idx int, total int, n uint64),
+) error {
+	comp := a.header.InternalCompression
+	dictOpts := defaultDictOptions()
+	dictOpts.enabled = a.enableTileDict
+	if err := finishBlocksParallel(decls, blocks, comp, dictOpts, compressCb); err != nil {
+		return err
+	}
+	if _, err := a.out.Seek(int64(a.cursor), 0); err != nil {
+		return fmt.Errorf("seek: %w", err)
+	}
+	total := len(decls)
+	for i, k := range decls {
+		bb := blocks[k]
+		off := a.cursor
+		n, err := bb.writeBlockTo(a.out)
+		if err != nil {
+			return fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, err)
+		}
+		a.cursor += uint64(n)
+		a.flushedEntries = append(a.flushedEntries, bb.blockTableEntry(off))
+		if writeCb != nil {
+			writeCb(i, total, uint64(n))
+		}
+		bb.release()
+	}
+	return nil
+}
+
 // Finish ordering matters for crash safety: blocks → snapshot → trailer → fsync →
 // header swap → fsync → truncate. Until the header swap is durable, readers see the
 // previous active snapshot; the new bytes past file_logical_end are invisible
@@ -500,54 +566,45 @@ func (a *AppendCtx) Finish() error {
 			a.cleanupOnErr()
 			return
 		}
-		if len(a.declarations) == 0 {
+		// Drain whatever the caller didn't FlushPendingBlocks already. With
+		// per-file flushing this is typically the final file's blocks; with
+		// no incremental flushing this is everything, exactly like before.
+		residual := len(a.declarations)
+		if residual > 0 {
+			a.firePhase("compress_blocks")
+			var compressCb func(int, uint64)
+			if a.onBlockCompressed != nil {
+				compressCb = func(idx int, bytes uint64) {
+					a.onBlockCompressed(idx, residual, bytes)
+				}
+			}
+			a.firePhase("write_blocks")
+			var writeCb func(idx int, total int, n uint64)
+			if a.onBlockWritten != nil {
+				writeCb = func(idx, total int, n uint64) {
+					a.onBlockWritten(idx, total, n)
+				}
+			}
+			decls := a.declarations
+			blocks := a.blocks
+			a.declarations = nil
+			a.blocks = make(map[blockKey]*blockBuilder)
+			if e := a.compressAndWriteBatch(decls, blocks, compressCb, writeCb); e != nil {
+				err = e
+				a.cleanupOnErr()
+				return
+			}
+		}
+
+		newEntries := a.flushedEntries
+		if len(newEntries) == 0 {
 			err = a.out.Close()
 			return
 		}
 
-		comp := a.header.InternalCompression
-		dictOpts := defaultDictOptions()
-		dictOpts.enabled = a.enableTileDict
-		totalBlocks := len(a.declarations)
-		a.firePhase("compress_blocks")
-		var compressCb func(int, uint64)
-		if a.onBlockCompressed != nil {
-			compressCb = func(idx int, bytes uint64) {
-				a.onBlockCompressed(idx, totalBlocks, bytes)
-			}
-		}
-		if e := finishBlocksParallel(a.declarations, a.blocks, comp, dictOpts, compressCb); e != nil {
-			err = e
-			a.cleanupOnErr()
-			return
-		}
-
-		newEntries := make([]format.BlockTableEntry, 0, len(a.declarations))
-		if _, e := a.out.Seek(int64(a.cursor), 0); e != nil {
-			err = fmt.Errorf("seek: %w", e)
-			a.cleanupOnErr()
-			return
-		}
-		a.firePhase("write_blocks")
-		for i, k := range a.declarations {
-			bb := a.blocks[k]
-			off := a.cursor
-			n, e := bb.writeBlockTo(a.out)
-			if e != nil {
-				err = fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, e)
-				a.cleanupOnErr()
-				return
-			}
-			a.cursor += uint64(n)
-			newEntries = append(newEntries, bb.blockTableEntry(off))
-			if a.onBlockWritten != nil {
-				a.onBlockWritten(i, totalBlocks, uint64(n))
-			}
-			bb.release()
-		}
-
 		a.firePhase("write_snapshot")
 		merged := a.mergeBlockTable(newEntries)
+		comp := a.header.InternalCompression
 
 		now := a.creationTimeOverride
 		if now.IsZero() {

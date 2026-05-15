@@ -132,6 +132,7 @@ type input struct {
 	gribHeaders []parser.GribHeader
 	gribSkip    []bool
 	gribData    []byte
+	gribMmap []byte
 
 	msgs []parser.GRIBFile
 }
@@ -203,6 +204,7 @@ func (e *Encoder) Finish() error {
 	if len(e.inputs) == 0 {
 		return errors.New("wmtiles/encode: no inputs added")
 	}
+	defer releaseGribCaches(e.inputs)
 
 	bySig, times, bounds, _, kept, err := e.scanInputs()
 	if err != nil {
@@ -487,10 +489,15 @@ type vtKey struct {
 type streamSink interface {
 	DeclareBlock(encoder.BlockSpec) error
 	NewDirectWorker() (*encoder.DirectWorker, error)
+	// FlushPendingBlocks finalizes every currently-declared block and writes
+	// it to disk. Called between input files so peak RAM stays at one
+	// file's worth of blocks instead of all-files'.
+	FlushPendingBlocks() error
 }
 
 // Cached GRIB inputs go through the parallel fast path; HDF5 and byte
-// buffers stay on the sequential eccodes path.
+// buffers stay on the sequential eccodes path. After each input the sink is
+// flushed so blocks don't pile up in RAM across multi-file runs.
 func (e *Encoder) streamTiles(
 	bySig map[scan.VarKey]*scan.VarInfo,
 	timeIdxByTime map[time.Time]uint32,
@@ -507,6 +514,9 @@ func (e *Encoder) streamTiles(
 		}
 		if err != nil {
 			return fmt.Errorf("wmtiles/encode: stream %s: %w", in.name, err)
+		}
+		if err := sink.FlushPendingBlocks(); err != nil {
+			return fmt.Errorf("wmtiles/encode: flush after %s: %w", in.name, err)
 		}
 	}
 	return nil

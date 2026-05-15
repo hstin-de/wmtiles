@@ -305,6 +305,60 @@ func (s *StreamingEncoder) firePhase(stage string) {
 	}
 }
 
+// FlushPendingBlocks finalizes every currently-declared block, writes it at
+// the active cursor, and releases it. Block-table entries accumulate in
+// s.blockTable for the eventual snapshot. Silent: no OnPhase /
+// OnBlockCompressed / OnBlockWritten callbacks fire. Finish still reports
+// phases for the residual batch.
+func (s *StreamingEncoder) FlushPendingBlocks() error {
+	if err := s.checkErr(); err != nil {
+		return err
+	}
+	s.blockMu.Lock()
+	decls := s.declarations
+	blocks := s.blocks
+	s.declarations = nil
+	s.blocks = make(map[blockKey]*blockBuilder)
+	s.blockMu.Unlock()
+	if len(decls) == 0 {
+		return nil
+	}
+	return s.compressAndWriteBatch(decls, blocks, nil, nil)
+}
+
+func (s *StreamingEncoder) compressAndWriteBatch(
+	decls []blockKey,
+	blocks map[blockKey]*blockBuilder,
+	compressCb func(int, uint64),
+	writeCb func(idx, total int, n uint64),
+) error {
+	dictOpts := defaultDictOptions()
+	dictOpts.enabled = s.opts.EnableTileDict
+	dictOpts.level = s.opts.ZstdLevel
+	if err := finishBlocksParallel(decls, blocks, s.opts.InternalCompression, dictOpts, compressCb); err != nil {
+		return err
+	}
+	if _, err := s.out.Seek(int64(s.cursor), 0); err != nil {
+		return fmt.Errorf("seek to block region: %w", err)
+	}
+	total := len(decls)
+	for i, k := range decls {
+		bb := blocks[k]
+		off := s.cursor
+		n, err := bb.writeBlockTo(s.out)
+		if err != nil {
+			return fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, err)
+		}
+		s.cursor += uint64(n)
+		s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
+		if writeCb != nil {
+			writeCb(i, total, uint64(n))
+		}
+		bb.release()
+	}
+	return nil
+}
+
 func (s *StreamingEncoder) Finish() error {
 	var err error
 	s.finishing.Do(func() {
@@ -322,44 +376,35 @@ func (s *StreamingEncoder) Finish() error {
 			return
 		}
 
-		dictOpts := defaultDictOptions()
-		dictOpts.enabled = s.opts.EnableTileDict
-		dictOpts.level = s.opts.ZstdLevel
-		totalBlocks := len(s.declarations)
-		s.firePhase("compress_blocks")
-		var compressCb func(int, uint64)
-		if s.opts.OnBlockCompressed != nil {
-			compressCb = func(idx int, bytes uint64) {
-				s.opts.OnBlockCompressed(idx, totalBlocks, bytes)
+		// Drain whatever's left after any per-input FlushPendingBlocks calls.
+		// With per-file flushing this is typically empty or just the last
+		// file's blocks; the no-flush path lands every block here, exactly
+		// like the pre-flush behaviour.
+		residual := len(s.declarations)
+		if residual > 0 {
+			s.firePhase("compress_blocks")
+			var compressCb func(int, uint64)
+			if s.opts.OnBlockCompressed != nil {
+				compressCb = func(idx int, bytes uint64) {
+					s.opts.OnBlockCompressed(idx, residual, bytes)
+				}
 			}
-		}
-		if e := finishBlocksParallel(s.declarations, s.blocks, s.opts.InternalCompression, dictOpts, compressCb); e != nil {
-			err = e
-			s.cleanupOnErr()
-			return
-		}
-
-		if _, e := s.out.Seek(int64(s.cursor), 0); e != nil {
-			err = fmt.Errorf("seek to block region: %w", e)
-			s.cleanupOnErr()
-			return
-		}
-		s.firePhase("write_blocks")
-		for i, k := range s.declarations {
-			bb := s.blocks[k]
-			off := s.cursor
-			n, e := bb.writeBlockTo(s.out)
-			if e != nil {
-				err = fmt.Errorf("write block (var=%d t=%d): %w", k.variableID, k.timeID, e)
+			s.firePhase("write_blocks")
+			var writeCb func(idx, total int, n uint64)
+			if s.opts.OnBlockWritten != nil {
+				writeCb = func(idx, total int, n uint64) {
+					s.opts.OnBlockWritten(idx, total, n)
+				}
+			}
+			decls := s.declarations
+			blocks := s.blocks
+			s.declarations = nil
+			s.blocks = make(map[blockKey]*blockBuilder)
+			if e := s.compressAndWriteBatch(decls, blocks, compressCb, writeCb); e != nil {
+				err = e
 				s.cleanupOnErr()
 				return
 			}
-			s.cursor += uint64(n)
-			s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
-			if s.opts.OnBlockWritten != nil {
-				s.opts.OnBlockWritten(i, totalBlocks, uint64(n))
-			}
-			bb.release()
 		}
 
 		for i := range s.variables {
