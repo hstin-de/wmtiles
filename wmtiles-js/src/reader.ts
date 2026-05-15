@@ -35,6 +35,27 @@ import {
   TimeOutOfRangeError,
   UnknownVariableError,
 } from "./errors.js";
+import {
+  WMTLayerImpl,
+  type ArrowsLayerOptions,
+  type ArrowsRendererState,
+  type HeatmapLayerOptions,
+  type HeatmapRendererState,
+  type IsobarLayerOptions,
+  type IsobarRendererState,
+  type ParticlesLayerOptions,
+  type ParticlesRendererState,
+  type SymbolLayerOptions,
+  type SymbolRendererState,
+  type HatchLayerOptions,
+  type HatchRendererState,
+  type WMTArrowsLayer,
+  type WMTHeatmapLayer,
+  type WMTIsobarLayer,
+  type WMTParticlesLayer,
+  type WMTSymbolLayer,
+  type WMTHatchLayer,
+} from "./layers.js";
 
 // ---------- Public types ----------
 
@@ -252,16 +273,7 @@ export interface Variable {
   readonly precisionHint: number;
   /** Fetch one tile of pixels. Returns null if the tile is missing/out of range. */
   tile(req: TileRequest): Promise<Float32Array | null>;
-  /**
-   * Fetch many tiles for the same time step in coalesced range requests.
-   * Out-of-range or missing tiles are returned as NaN-filled arrays at their
-   * position, so output length matches input length.
-   */
   tiles(req: TilesRequest): Promise<Float32Array[]>;
-  /**
-   * Sample the nearest pixel value at (lat, lon). Returns null on invalid
-   * coords or out-of-range zoom; NaN if the file marks NoData at that pixel.
-   */
   sample(req: SampleRequest): Promise<number | null>;
 }
 
@@ -273,7 +285,6 @@ class WMTVariable implements Variable {
     private readonly _fetchTiles: TilesFetcher,
     private readonly _sample: Sampler,
     private readonly _maxZoom: number,
-    /** Numeric ID assigned by the encoder. */
     readonly id: number,
     readonly name: string,
     readonly unit: string,
@@ -282,26 +293,16 @@ class WMTVariable implements Variable {
     readonly precisionHint: number,
   ) {}
 
-  /** Fetch one tile of pixels. Returns null if the tile is missing/out of range. */
   async tile(req: TileRequest): Promise<Float32Array | null> {
     const t = this._timeIndexOf(req.time);
     return this._fetchTile(this.id, t, req.z, req.x, req.y);
   }
 
-  /**
-   * Fetch many tiles for the same time step in 1–2 coalesced range requests.
-   * Out-of-range or missing tiles are returned as NaN-filled arrays at their
-   * position (never null), so output length matches input length.
-   */
   async tiles(req: TilesRequest): Promise<Float32Array[]> {
     const t = this._timeIndexOf(req.time);
     return this._fetchTiles(this.id, t, req.coords, req.coalesce);
   }
 
-  /**
-   * Sample the nearest pixel value at (lat, lon). Returns null on invalid
-   * coords or out-of-range zoom; NaN if the file marks NoData at that pixel.
-   */
   async sample(req: SampleRequest): Promise<number | null> {
     const t = this._timeIndexOf(req.time);
     const z = req.z ?? this._maxZoom;
@@ -338,9 +339,6 @@ export class WMT {
   private _coldBuf: Uint8Array | null = null;
 
   private constructor(src: ByteSource) {
-    // Wrap once: when a debug sink is registered, each uncached read emits a
-    // timed event. The wrapper itself is one async hop; if the sink is null
-    // we skip the performance.now() calls entirely.
     this._src = {
       async read(offset, length) {
         if (!debugSink()) return src.read(offset, length);
@@ -439,10 +437,6 @@ export class WMT {
     return new Date(ms);
   }
 
-  /**
-   * Resolve a TimeRef to its step index. Numbers are treated as indices;
-   * Dates must match a step exactly. Throws TimeOutOfRangeError otherwise.
-   */
   timeIndexOf(ref: TimeRef): number {
     const tc = this._timeCatalog;
     if (typeof ref === "number") {
@@ -493,11 +487,6 @@ export class WMT {
     );
   }
 
-  /**
-   * Sample one or more variables at a point across the time axis. Returns a
-   * Float32Array per variable; NaN marks slots where the point falls outside
-   * the file, the tile is missing, or the pixel is NoData.
-   */
   async forecast(req: ForecastRequest): Promise<ForecastResult> {
     // Resolve names eagerly so UnknownVariableError fires before any I/O.
     const vars = req.variables.map((name) => this.variable(name));
@@ -540,10 +529,6 @@ export class WMT {
     return { times, values };
   }
 
-  /**
-   * Snapshot of several variables at one point at one time. The dual of
-   * forecast(): same point, single time step, many variables. NaN = missing.
-   */
   async value(req: ValueRequest): Promise<ValueResult> {
     const vars = req.variables.map((name) => this.variable(name));
     const t = this.timeIndexOf(req.time);
@@ -559,6 +544,32 @@ export class WMT {
     );
 
     return { time: this.timeAt(t), values };
+  }
+
+  // ---- Layers ----
+
+  createHeatmapLayer(options?: HeatmapLayerOptions): WMTHeatmapLayer {
+    return new WMTLayerImpl<HeatmapRendererState>(this, "heatmap", options);
+  }
+
+  createParticlesLayer(options?: ParticlesLayerOptions): WMTParticlesLayer {
+    return new WMTLayerImpl<ParticlesRendererState>(this, "particles", options);
+  }
+
+  createIsobarLayer(options?: IsobarLayerOptions): WMTIsobarLayer {
+    return new WMTLayerImpl<IsobarRendererState>(this, "isobar", options);
+  }
+
+  createArrowsLayer(options?: ArrowsLayerOptions): WMTArrowsLayer {
+    return new WMTLayerImpl<ArrowsRendererState>(this, "arrows", options);
+  }
+
+  createSymbolLayer(options?: SymbolLayerOptions): WMTSymbolLayer {
+    return new WMTLayerImpl<SymbolRendererState>(this, "symbol", options);
+  }
+
+  createHatchLayer(options?: HatchLayerOptions): WMTHatchLayer {
+    return new WMTLayerImpl<HatchRendererState>(this, "hatch", options);
   }
 
   // ---- Internal: fetch helpers (called by Variable) ----

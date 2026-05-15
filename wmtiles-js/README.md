@@ -194,8 +194,10 @@ try {
 ## Map rendering
 
 `wmtiles` ships four WebGL2 renderers that turn the tile data into something
-visible on a map. They are framework-agnostic. See [`docs/leaflet.md`](./docs/leaflet.md)
-for the Leaflet integration that wraps them in `L.Layer` instances.
+visible on a map. They are framework-agnostic. First-party adapters are
+available for Leaflet and MapLibre:
+[`docs/leaflet.md`](./docs/leaflet.md) and
+[`docs/maplibre.md`](./docs/maplibre.md).
 
 | Renderer | Module | What it does |
 |---|---|---|
@@ -216,7 +218,7 @@ npm install wmtiles leaflet
 
 ```ts
 import { open } from "wmtiles";
-import "wmtiles/leaflet";        // side-effect: adds layer factories to WMT
+import "wmtiles/leaflet"; // side-effect: registers the Leaflet backend
 import L from "leaflet";
 
 const wmt = await open("/data.wmt");
@@ -241,14 +243,66 @@ const particles = wmt.createParticlesLayer({
 }).addTo(map);
 ```
 
+The layer factories are adapter-neutral: `wmt.createHeatmapLayer(...)` returns a
+handle, and `addTo(map)` picks the backend that matches the map. Import
+`wmtiles/leaflet` or `wmtiles/maplibre` (or both) to register backends. To skip
+auto-detection, pass `backend: "leaflet" | "maplibre"` in the layer options.
+
 Full adapter API (all four layer factories, options, lifecycle):
 [`docs/leaflet.md`](./docs/leaflet.md).
 
+### Quickstart with MapLibre
+
+```sh
+npm install wmtiles maplibre-gl
+```
+
+```ts
+import maplibregl from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import { open } from "wmtiles";
+import "wmtiles/maplibre"; // side-effect: registers the MapLibre backend
+
+const wmt = await open("/data.wmt");
+
+const map = new maplibregl.Map({
+  container: "map",
+  style: "https://demotiles.maplibre.org/style.json",
+  bounds: [
+    [wmt.bbox.west, wmt.bbox.south],
+    [wmt.bbox.east, wmt.bbox.north],
+  ],
+});
+
+map.on("load", () => {
+  const heatmap = wmt.createHeatmapLayer({
+    variable: "t2m",
+    vmin: 260,
+    vmax: 305,
+    colormap: "viridis",
+  }).addTo(map);
+
+  const particles = wmt.createParticlesLayer({
+    uVar: "10u",
+    vVar: "10v",
+    colormap: "white",
+    particleSize: 2.5,
+  }).addTo(map);
+});
+```
+
+Same `wmt.create*Layer` calls as the Leaflet example: only the import and the
+map object differ.
+
+Full adapter API:
+[`docs/maplibre.md`](./docs/maplibre.md).
+
 ### Renderer options at a glance
 
-Pass these on the layer factory (`wmt.createHeatmapLayer(options)`) or on
-the raw renderer (`new HeatmapRenderer(canvas, wmt, options)`). The
-defaults are tuned for "looks reasonable out of the box".
+Pass these on a layer factory (`wmt.createHeatmapLayer(options)`) or on the raw
+renderer
+(`new HeatmapRenderer(canvas, wmt, options)`). The defaults are tuned for
+"looks reasonable out of the box".
 
 **Heatmap**
 - `variable`: name (optional, defaults to first variable)
@@ -307,8 +361,9 @@ Pass via the `colormap` option of any renderer. Builtins live in
 | **Root** | `open`, `WMT`, `Variable`, `httpSource`, `bytesSource`, `ByteSource`, request types | What normal callers want. |
 | **Geo helper** | `latLonToTilePixel` | Point sampling and custom map UIs. |
 | **Errors** | `WMTError`, `SourceError`, `FormatError`, `UnknownVariableError`, `TimeOutOfRangeError` | `instanceof` checks. |
-| **`wmtiles/leaflet`** | Side-effect import: adds `createHeatmapLayer`, `createParticlesLayer`, `createIsobarLayer`, `createArrowsLayer` methods to every `WMT` instance. Also re-exports the same functions as standalone factories taking `(wmt, options)`. See [`docs/leaflet.md`](./docs/leaflet.md). |
-| **`wmtiles/render/heatmap`** | `HeatmapRenderer`, options + state types | Build your own (non-Leaflet) heatmap layer. |
+| **`wmtiles/leaflet`** | Side-effect import: registers the Leaflet backend so `wmt.create*Layer(...).addTo(leafletMap)` renders into Leaflet's `overlayPane`. See [`docs/leaflet.md`](./docs/leaflet.md). |
+| **`wmtiles/maplibre`** | Side-effect import: registers the MapLibre backend so `wmt.create*Layer(...).addTo(maplibreMap)` renders as MapLibre custom layers. Import alongside `wmtiles/leaflet` if you use both. See [`docs/maplibre.md`](./docs/maplibre.md). |
+| **`wmtiles/render/heatmap`** | `HeatmapRenderer`, options + state types | Build your own custom heatmap layer. |
 | **`wmtiles/render/particles`** | `ParticlesRenderer` | Build your own animated particle flow layer. |
 | **`wmtiles/render/arrows`** | `ArrowsRenderer` | Build your own vector arrows layer. |
 | **`wmtiles/render/isobar`** | `IsobarRenderer` | Build your own contour layer. |
@@ -318,9 +373,9 @@ Pass via the `colormap` option of any renderer. Builtins live in
 | **`wmtiles/codec`** | `decodeCodec`, `dequantize`, codec constants | Advanced: decode raw tile blobs. |
 | **`wmtiles/tileid`** | `encode3D`, `hilbertXY2D`, `zoomOffset` | Advanced: precompute format tile IDs. |
 
-`leaflet` is an optional peer dependency. Other adapters (MapLibre,
-OpenLayers) are not implemented yet; the framework-agnostic renderers
-expose everything needed to wire them up. Open an issue or PR.
+`leaflet` and `maplibre-gl` are optional peer dependencies. The
+framework-agnostic renderers expose everything needed to wire up other map
+frameworks.
 
 This library is a faithful port of the Go reader in `reader/reader.go`.
 

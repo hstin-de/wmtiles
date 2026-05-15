@@ -1,49 +1,44 @@
 import type * as leaflet from "leaflet";
 import L from "leaflet";
-import { WMT } from "../reader.js";
+import type { WMT } from "../reader.js";
+import {
+  type BackendLayer,
+  type LayerBackend,
+  registerLayerBackend,
+} from "../layers.js";
+import type {
+  ArrowsLayerOptions,
+  HatchLayerOptions,
+  HeatmapLayerOptions,
+  IsobarLayerOptions,
+  ParticlesLayerOptions,
+  SymbolLayerOptions,
+} from "../layers.js";
 import {
   HeatmapRenderer,
-  type HeatmapRendererOptions,
   type HeatmapRendererState,
   type TileDrawRect,
 } from "../render/heatmap.js";
 import {
   ParticlesRenderer,
-  type ParticlesRendererOptions,
   type ParticlesRendererState,
 } from "../render/particles.js";
 import {
   IsobarRenderer,
-  type IsobarRendererOptions,
   type IsobarRendererState,
 } from "../render/isobar.js";
 import {
   ArrowsRenderer,
-  type ArrowsRendererOptions,
   type ArrowsRendererState,
 } from "../render/arrows.js";
-
-export type {
-  HeatmapRendererOptions,
-  HeatmapRendererState,
-} from "../render/heatmap.js";
-export type {
-  ParticlesRendererOptions,
-  ParticlesRendererState,
-} from "../render/particles.js";
-export type {
-  IsobarRendererOptions,
-  IsobarRendererState,
-} from "../render/isobar.js";
-export type {
-  ArrowsRendererOptions,
-  ArrowsRendererState,
-} from "../render/arrows.js";
-
-export interface WMTHeatmapLayer extends leaflet.Layer {
-  readonly state: HeatmapRendererState;
-  setState(patch: Partial<HeatmapRendererState>): void;
-}
+import {
+  SymbolRenderer,
+  type SymbolRendererState,
+} from "../render/symbols.js";
+import {
+  HatchRenderer,
+  type HatchRendererState,
+} from "../render/hatch.js";
 
 interface CanvasRig {
   canvas: HTMLCanvasElement;
@@ -152,17 +147,10 @@ function zoomAnimTransform(
   L.DomUtil.setTransform(canvas, offset, scale);
 }
 
-export type HeatmapLayerOptions = HeatmapRendererOptions & {
-  variable?: string;
-  vmin?: number;
-  vmax?: number;
-  t?: number;
-};
-
-export function createHeatmapLayer(
+function createHeatmapLayer(
   wmt: WMT,
   options?: HeatmapLayerOptions,
-): WMTHeatmapLayer {
+): BackendLayer {
   const variable = options?.variable !== undefined
     ? wmt.variables.find((v) => v.name === options.variable)
     : undefined;
@@ -194,7 +182,13 @@ export function createHeatmapLayer(
       this.map = map;
       const rig = attachCanvas(map);
       this.canvas = rig.canvas;
-      this.renderer = new HeatmapRenderer(this.canvas, wmt, options);
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: false,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new HeatmapRenderer(gl, wmt, options);
 
       const init: Partial<HeatmapRendererState> = {};
       if (variable) {
@@ -227,9 +221,11 @@ export function createHeatmapLayer(
     }
 
     private refresh(): void {
-      this.dpr = resetCanvas(this.map, this.canvas, (w, h) =>
-        this.renderer.resize(w, h),
-      );
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
       this.renderer.setView(computeTileView(this.map, wmt, this.dpr));
     }
   }
@@ -237,23 +233,91 @@ export function createHeatmapLayer(
   return new WMTHeatmapLayerImpl();
 }
 
-export interface WMTParticlesLayer extends leaflet.Layer {
-  readonly state: ParticlesRendererState;
-  setState(patch: Partial<ParticlesRendererState>): void;
+function createHatchLayer(
+  wmt: WMT,
+  options?: HatchLayerOptions,
+): BackendLayer {
+  const variable = options?.variable !== undefined
+    ? wmt.variables.find((v) => v.name === options.variable)
+    : undefined;
+  if (options?.variable !== undefined && !variable) {
+    throw new Error(`wmtiles: unknown variable "${options.variable}"`);
+  }
+
+  class WMTHatchLayerImpl extends L.Layer {
+    private renderer!: HatchRenderer;
+    private canvas!: HTMLCanvasElement;
+    private map!: leaflet.Map;
+    private dpr = 1;
+
+    private onMove = (): void => this.refresh();
+    private onResize = (): void => this.refresh();
+    private onZoomAnim = (e: leaflet.ZoomAnimEvent): void => {
+      zoomAnimTransform(this.map, this.canvas, e);
+    };
+
+    get state(): HatchRendererState {
+      return this.renderer.state;
+    }
+
+    setState(patch: Partial<HatchRendererState>): void {
+      this.renderer.setState(patch);
+    }
+
+    onAdd(map: leaflet.Map): this {
+      this.map = map;
+      const rig = attachCanvas(map);
+      this.canvas = rig.canvas;
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: false,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new HatchRenderer(gl, wmt, options);
+
+      const init: Partial<HatchRendererState> = {};
+      if (variable) init.variable = variable;
+      if (options?.t !== undefined) init.t = options.t;
+      if (Object.keys(init).length > 0) this.renderer.setState(init);
+
+      map.on("move", this.onMove);
+      map.on("zoomend viewreset", this.onMove);
+      map.on("resize", this.onResize);
+      map.on("zoomanim", this.onZoomAnim);
+
+      this.refresh();
+      return this;
+    }
+
+    onRemove(map: leaflet.Map): this {
+      map.off("move", this.onMove);
+      map.off("zoomend viewreset", this.onMove);
+      map.off("resize", this.onResize);
+      map.off("zoomanim", this.onZoomAnim);
+      this.renderer.dispose();
+      this.canvas.remove();
+      return this;
+    }
+
+    private refresh(): void {
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
+      this.renderer.setPixelRatio(this.dpr);
+      this.renderer.setView(computeTileView(this.map, wmt, this.dpr));
+    }
+  }
+
+  return new WMTHatchLayerImpl();
 }
 
-export type ParticlesLayerOptions = ParticlesRendererOptions & {
-  uVar?: string;
-  vVar?: string;
-  t?: number;
-};
-
-// Two-variable (u, v) layer with a renderer-owned rAF loop; the adapter only
-// feeds view updates and starts/stops on map add/remove.
-export function createParticlesLayer(
+function createParticlesLayer(
   wmt: WMT,
   options?: ParticlesLayerOptions,
-): WMTParticlesLayer {
+): BackendLayer {
   const uVar = options?.uVar !== undefined
     ? wmt.variables.find((v) => v.name === options.uVar)
     : undefined;
@@ -302,7 +366,13 @@ export function createParticlesLayer(
       this.map = map;
       const rig = attachCanvas(map);
       this.canvas = rig.canvas;
-      this.renderer = new ParticlesRenderer(this.canvas, wmt, options);
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: false,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new ParticlesRenderer(gl, wmt, options);
 
       const init: Partial<ParticlesRendererState> = {};
       if (uVar) init.uVar = uVar;
@@ -335,9 +405,11 @@ export function createParticlesLayer(
     }
 
     private refresh(): void {
-      this.dpr = resetCanvas(this.map, this.canvas, (w, h) =>
-        this.renderer.resize(w, h),
-      );
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
       this.renderer.setView(computeTileView(this.map, wmt, this.dpr));
     }
   }
@@ -345,29 +417,10 @@ export function createParticlesLayer(
   return new WMTParticlesLayerImpl();
 }
 
-export interface WMTIsobarLayer extends leaflet.Layer {
-  readonly state: IsobarRendererState;
-  setState(patch: Partial<IsobarRendererState>): void;
-  setSpacing(spacing: number): void;
-  setSmoothness(smoothness: number): void;
-  setFillEnabled(enabled: boolean): void;
-  setFillRange(range: [number, number] | null): void;
-  setFillAlpha(alpha: number): void;
-  // Spacing in use at the current zoom, differs from `spacing` when
-  // referenceZoom auto-scaling kicks in.
-  effectiveSpacing(): number;
-}
-
-export type IsobarLayerOptions = IsobarRendererOptions & {
-  variable?: string;
-  t?: number;
-};
-
-// Contour lines for any scalar. Redraws on state/view change only.
-export function createIsobarLayer(
+function createIsobarLayer(
   wmt: WMT,
   options?: IsobarLayerOptions,
-): WMTIsobarLayer {
+): BackendLayer {
   const variable = options?.variable !== undefined
     ? wmt.variables.find((v) => v.name === options.variable)
     : undefined;
@@ -423,7 +476,13 @@ export function createIsobarLayer(
       this.map = map;
       const rig = attachCanvas(map);
       this.canvas = rig.canvas;
-      this.renderer = new IsobarRenderer(this.canvas, wmt, options);
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: false,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new IsobarRenderer(gl, wmt, options);
 
       const init: Partial<IsobarRendererState> = {};
       if (variable) init.variable = variable;
@@ -450,9 +509,11 @@ export function createIsobarLayer(
     }
 
     private refresh(): void {
-      this.dpr = resetCanvas(this.map, this.canvas, (w, h) =>
-        this.renderer.resize(w, h),
-      );
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
       const dz = options?.dataZoom;
       const boost = options?.dataZoomBoost ?? 0;
       let baseZ: number;
@@ -469,22 +530,10 @@ export function createIsobarLayer(
   return new WMTIsobarLayerImpl();
 }
 
-export interface WMTArrowsLayer extends leaflet.Layer {
-  readonly state: ArrowsRendererState;
-  setState(patch: Partial<ArrowsRendererState>): void;
-}
-
-export type ArrowsLayerOptions = ArrowsRendererOptions & {
-  uVar?: string;
-  vVar?: string;
-  t?: number;
-};
-
-// Static screen-grid of arrow glyphs over the same u/v atlas as particles.
-export function createArrowsLayer(
+function createArrowsLayer(
   wmt: WMT,
   options?: ArrowsLayerOptions,
-): WMTArrowsLayer {
+): BackendLayer {
   const uVar = options?.uVar !== undefined
     ? wmt.variables.find((v) => v.name === options.uVar)
     : undefined;
@@ -522,7 +571,13 @@ export function createArrowsLayer(
       this.map = map;
       const rig = attachCanvas(map);
       this.canvas = rig.canvas;
-      this.renderer = new ArrowsRenderer(this.canvas, wmt, options);
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: true,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new ArrowsRenderer(gl, wmt, options);
 
       const init: Partial<ArrowsRendererState> = {};
       if (uVar) init.uVar = uVar;
@@ -550,9 +605,11 @@ export function createArrowsLayer(
     }
 
     private refresh(): void {
-      this.dpr = resetCanvas(this.map, this.canvas, (w, h) =>
-        this.renderer.resize(w, h),
-      );
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
       this.renderer.setView(computeTileView(this.map, wmt, this.dpr));
     }
   }
@@ -560,26 +617,108 @@ export function createArrowsLayer(
   return new WMTArrowsLayerImpl();
 }
 
-// Side-effect import attaches factories as methods on WMT, e.g.
-//   wmt.createHeatmapLayer(options).addTo(map)
-declare module "../reader.js" {
-  interface WMT {
-    createHeatmapLayer(options?: HeatmapLayerOptions): WMTHeatmapLayer;
-    createParticlesLayer(options?: ParticlesLayerOptions): WMTParticlesLayer;
-    createIsobarLayer(options?: IsobarLayerOptions): WMTIsobarLayer;
-    createArrowsLayer(options?: ArrowsLayerOptions): WMTArrowsLayer;
+function createSymbolLayer(
+  wmt: WMT,
+  options?: SymbolLayerOptions,
+): BackendLayer {
+  const variable = options?.variable !== undefined
+    ? wmt.variables.find((v) => v.name === options.variable)
+    : undefined;
+  if (options?.variable !== undefined && !variable) {
+    throw new Error(`wmtiles: unknown variable "${options.variable}"`);
   }
+
+  class WMTSymbolLayerImpl extends L.Layer {
+    private renderer!: SymbolRenderer;
+    private canvas!: HTMLCanvasElement;
+    private map!: leaflet.Map;
+    private dpr = 1;
+
+    private onMove = (): void => this.refresh();
+    private onResize = (): void => this.refresh();
+    private onZoomAnim = (e: leaflet.ZoomAnimEvent): void => {
+      zoomAnimTransform(this.map, this.canvas, e);
+    };
+
+    get state(): SymbolRendererState {
+      return this.renderer.state;
+    }
+
+    setState(patch: Partial<SymbolRendererState>): void {
+      this.renderer.setState(patch);
+    }
+
+    onAdd(map: leaflet.Map): this {
+      this.map = map;
+      const rig = attachCanvas(map);
+      this.canvas = rig.canvas;
+      const gl = this.canvas.getContext("webgl2", {
+        premultipliedAlpha: false,
+        antialias: true,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) throw new Error("WebGL2 not supported");
+      this.renderer = new SymbolRenderer(gl, wmt, options);
+
+      const init: Partial<SymbolRendererState> = {};
+      if (variable) init.variable = variable;
+      if (options?.t !== undefined) init.t = options.t;
+      if (Object.keys(init).length > 0) this.renderer.setState(init);
+
+      map.on("move", this.onMove);
+      map.on("zoomend viewreset", this.onMove);
+      map.on("resize", this.onResize);
+      map.on("zoomanim", this.onZoomAnim);
+
+      this.refresh();
+      return this;
+    }
+
+    onRemove(map: leaflet.Map): this {
+      map.off("move", this.onMove);
+      map.off("zoomend viewreset", this.onMove);
+      map.off("resize", this.onResize);
+      map.off("zoomanim", this.onZoomAnim);
+      this.renderer.dispose();
+      this.canvas.remove();
+      return this;
+    }
+
+    private refresh(): void {
+      this.dpr = resetCanvas(this.map, this.canvas, (w, h) => {
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        this.renderer.setViewport(w, h);
+      });
+      this.renderer.setView(computeTileView(this.map, wmt, this.dpr));
+    }
+  }
+
+  return new WMTSymbolLayerImpl();
 }
 
-WMT.prototype.createHeatmapLayer = function (options) {
-  return createHeatmapLayer(this, options);
+// Registered on import. detect() keys off getPanes, a Leaflet-only Map method,
+// so it never matches a MapLibre map even when both adapters are imported.
+const leafletBackend: LayerBackend = {
+  name: "leaflet",
+  detect: (map) =>
+    typeof (map as { getPanes?: unknown }).getPanes === "function",
+  build: (wmt, kind, options) => {
+    switch (kind) {
+      case "heatmap":
+        return createHeatmapLayer(wmt, options as HeatmapLayerOptions);
+      case "particles":
+        return createParticlesLayer(wmt, options as ParticlesLayerOptions);
+      case "isobar":
+        return createIsobarLayer(wmt, options as IsobarLayerOptions);
+      case "arrows":
+        return createArrowsLayer(wmt, options as ArrowsLayerOptions);
+      case "symbol":
+        return createSymbolLayer(wmt, options as SymbolLayerOptions);
+      case "hatch":
+        return createHatchLayer(wmt, options as HatchLayerOptions);
+    }
+  },
 };
-WMT.prototype.createParticlesLayer = function (options) {
-  return createParticlesLayer(this, options);
-};
-WMT.prototype.createIsobarLayer = function (options) {
-  return createIsobarLayer(this, options);
-};
-WMT.prototype.createArrowsLayer = function (options) {
-  return createArrowsLayer(this, options);
-};
+
+registerLayerBackend(leafletBackend);

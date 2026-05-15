@@ -1,19 +1,272 @@
 import { open, latLonToTilePixel, type Variable, type WMT } from "wmtiles";
 import type {
-  WMTHeatmapLayer,
-  WMTParticlesLayer,
-  WMTIsobarLayer,
-  WMTArrowsLayer,
-} from "wmtiles/leaflet";
+  HeatmapRendererOptions,
+  HeatmapRendererState,
+  ParticlesRendererOptions,
+  ParticlesRendererState,
+  ArrowsRendererOptions,
+  ArrowsRendererState,
+  IsobarRendererOptions,
+  IsobarRendererState,
+  HatchRendererOptions,
+  HatchRendererState,
+  HatchPattern,
+  HatchBand,
+} from "wmtiles";
+// Side-effect imports: each registers its layer backend. wmt.createHeatmapLayer
+// etc. then work for both, and addTo(map) picks the right one per map.
 import "wmtiles/leaflet";
+import "wmtiles/maplibre";
 import { installDebugHud } from "./debug";
 import L from "leaflet";
+import maplibregl from "maplibre-gl";
 
 const $ = (id: string): HTMLElement => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`missing #${id}`);
   return el;
 };
+
+// SVG sprites for hatch icon-fill, keyed by the "icon:<name>" dropdown values
+const svgIcon = (body: string): string =>
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">${body}</svg>`,
+  );
+const HATCH_ICONS: Record<string, string> = {
+  warning: svgIcon(
+    '<path d="M12 2 L22 21 H2 Z" fill="#ff5a3c" stroke="#7a1a08" ' +
+      'stroke-width="1.5" stroke-linejoin="round"/>' +
+      '<rect x="11" y="9" width="2" height="6" fill="#fff"/>' +
+      '<rect x="11" y="17" width="2" height="2" fill="#fff"/>',
+  ),
+  dot: svgIcon('<circle cx="12" cy="12" r="7" fill="#ff5a5a"/>'),
+};
+
+type RendererName = "leaflet" | "maplibre";
+
+function resolveRenderer(): RendererName {
+  const fromUrl = new URLSearchParams(location.search).get("renderer");
+  if (fromUrl === "maplibre" || fromUrl === "leaflet") return fromUrl;
+  return "leaflet";
+}
+
+interface LayerWrap<S> {
+  readonly state: S;
+  setState(patch: Partial<S>): void;
+  remove(): void;
+}
+
+interface IsobarWrap extends LayerWrap<IsobarRendererState> {
+  setSpacing(s: number): void;
+  setSmoothness(s: number): void;
+  setFillEnabled(e: boolean): void;
+  effectiveSpacing(): number;
+}
+
+type HeatmapOpts = HeatmapRendererOptions;
+type ParticlesOpts = ParticlesRendererOptions & { uVar: string; vVar: string };
+type ArrowsOpts = ArrowsRendererOptions & { uVar: string; vVar: string };
+type IsobarOpts = IsobarRendererOptions & {
+  variable: string;
+  spacing: number;
+  smoothness: number;
+  fillEnabled: boolean;
+};
+type HatchOpts = HatchRendererOptions & { variable: string };
+
+interface Backend {
+  readonly name: RendererName;
+  getZoom(): number;
+  onZoomEnd(cb: () => void): void;
+  onClick(cb: (lat: number, lng: number) => void): void;
+  openPopup(lat: number, lng: number, html: string): void;
+  addHeatmap(opts?: HeatmapOpts): LayerWrap<HeatmapRendererState>;
+  addParticles(opts: ParticlesOpts): LayerWrap<ParticlesRendererState>;
+  addArrows(opts: ArrowsOpts): LayerWrap<ArrowsRendererState>;
+  addIsobar(opts: IsobarOpts): IsobarWrap;
+  addHatch(opts: HatchOpts): LayerWrap<HatchRendererState>;
+}
+
+function makeLeafletBackend(wmt: WMT): Backend {
+  const map = L.map("map", { worldCopyJump: true }).fitBounds([
+    [wmt.bbox.south, wmt.bbox.west],
+    [wmt.bbox.north, wmt.bbox.east],
+  ]);
+  L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    {
+      attribution: "© OpenStreetMap, © CARTO",
+      subdomains: "abcd",
+      maxZoom: 19,
+    },
+  ).addTo(map);
+
+  return {
+    name: "leaflet",
+    getZoom: () => map.getZoom(),
+    onZoomEnd: (cb) => map.on("zoomend", cb),
+    onClick: (cb) =>
+      map.on("click", (ev: L.LeafletMouseEvent) =>
+        cb(ev.latlng.lat, ev.latlng.lng),
+      ),
+    openPopup: (lat, lng, html) =>
+      L.popup().setLatLng([lat, lng]).setContent(html).openOn(map),
+    addHeatmap: (opts) => {
+      const layer = wmt.createHeatmapLayer(opts).addTo(map);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addParticles: (opts) => {
+      const layer = wmt.createParticlesLayer(opts).addTo(map);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addArrows: (opts) => {
+      const layer = wmt.createArrowsLayer(opts).addTo(map);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addIsobar: (opts) => {
+      const layer = wmt.createIsobarLayer(opts).addTo(map);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+        setSpacing: (s) => layer.setSpacing(s),
+        setSmoothness: (s) => layer.setSmoothness(s),
+        setFillEnabled: (e) => layer.setFillEnabled(e),
+        effectiveSpacing: () => layer.effectiveSpacing(),
+      };
+    },
+    addHatch: (opts) => {
+      const layer = wmt.createHatchLayer(opts).addTo(map);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+  };
+}
+
+function makeMapLibreBackend(wmt: WMT): Backend {
+  const style: maplibregl.StyleSpecification = {
+    version: 8,
+    sources: {
+      carto: {
+        type: "raster",
+        tiles: [
+          "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+        ],
+        tileSize: 256,
+        attribution: "© OpenStreetMap, © CARTO",
+      },
+    },
+    layers: [{ id: "carto", type: "raster", source: "carto" }],
+  };
+
+  const map = new maplibregl.Map({
+    container: "map",
+    style,
+    bounds: [
+      [wmt.bbox.west, wmt.bbox.south],
+      [wmt.bbox.east, wmt.bbox.north],
+    ],
+    fitBoundsOptions: { padding: 0, animate: false },
+    attributionControl: { compact: true },
+  });
+
+  const ready = new Promise<void>((resolve) => {
+    if (map.loaded()) resolve();
+    else map.once("load", () => resolve());
+  });
+
+  function addWhenReady<T extends { addTo: (m: maplibregl.Map) => unknown }>(
+    layer: T,
+  ): T {
+    ready.then(() => {
+      map.setProjection({ type: "globe" });
+      layer.addTo(map);
+    });
+    return layer;
+  }
+
+  return {
+    name: "maplibre",
+    getZoom: () => map.getZoom(),
+    onZoomEnd: (cb) => map.on("zoomend", cb),
+    onClick: (cb) =>
+      map.on("click", (ev) => cb(ev.lngLat.lat, ev.lngLat.lng)),
+    openPopup: (lat, lng, html) => {
+      new maplibregl.Popup({ closeButton: true })
+        .setLngLat([lng, lat])
+        .setHTML(html)
+        .addTo(map);
+    },
+    addHeatmap: (opts) => {
+      const layer = wmt.createHeatmapLayer(opts);
+      addWhenReady(layer);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addParticles: (opts) => {
+      const layer = wmt.createParticlesLayer(opts);
+      addWhenReady(layer);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addArrows: (opts) => {
+      const layer = wmt.createArrowsLayer(opts);
+      addWhenReady(layer);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+    addIsobar: (opts) => {
+      const layer = wmt.createIsobarLayer(opts);
+      addWhenReady(layer);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+        setSpacing: (s) => layer.setSpacing(s),
+        setSmoothness: (s) => layer.setSmoothness(s),
+        setFillEnabled: (e) => layer.setFillEnabled(e),
+        effectiveSpacing: () => layer.effectiveSpacing(),
+      };
+    },
+    addHatch: (opts) => {
+      const layer = wmt.createHatchLayer(opts);
+      addWhenReady(layer);
+      return {
+        get state() { return layer.state; },
+        setState: (p) => layer.setState(p),
+        remove: () => layer.remove(),
+      };
+    },
+  };
+}
 
 interface ClickResult {
   value?: number;
@@ -27,20 +280,16 @@ interface ClickResult {
 
 async function valueAtClick(
   wmt: WMT,
-  layer: WMTHeatmapLayer,
-  latlng: L.LatLng,
+  layer: LayerWrap<HeatmapRendererState>,
+  lat: number,
+  lng: number,
   mapZoom: number,
 ): Promise<ClickResult | null> {
   const z = Math.min(
     Math.max(mapZoom | 0, wmt.zoomRange.min),
     wmt.zoomRange.max,
   );
-  const px = latLonToTilePixel(
-    z,
-    latlng.lat,
-    latlng.lng,
-    wmt.tileSize,
-  );
+  const px = latLonToTilePixel(z, lat, lng, wmt.tileSize);
   if (!px) return null;
   const pixels = await layer.state.variable.tile({
     time: layer.state.t,
@@ -74,37 +323,46 @@ interface VarGroup {
   variable: Variable;
 }
 
+function ensureLegendEl(): HTMLElement {
+  let el = document.getElementById("legend-floating");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "legend-floating";
+  el.innerHTML =
+    '<div id="legTitle"></div><div class="bar"></div>' +
+    '<div class="row"><span id="legMin"></span><span id="legMax"></span></div>';
+  document.body.appendChild(el);
+  return el;
+}
+
 async function boot(): Promise<void> {
   const status = $("status");
   status.textContent = "fetching header…";
 
-  // installs sink before open() so the open event is captured
+  const rendererName = resolveRenderer();
+  const rendererSel = $("renderer") as HTMLSelectElement;
+  rendererSel.value = rendererName;
+  rendererSel.onchange = () => {
+    const url = new URL(location.href);
+    url.searchParams.set("renderer", rendererSel.value);
+    location.assign(url.toString());
+  };
+
   installDebugHud();
 
   const wmt = await open("/wmt");
 
-  const map = L.map("map", { worldCopyJump: true }).fitBounds([
-    [wmt.bbox.south, wmt.bbox.west],
-    [wmt.bbox.north, wmt.bbox.east],
-  ]);
-  L.tileLayer(
-    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    {
-      attribution: "© OpenStreetMap, © CARTO",
-      subdomains: "abcd",
-      maxZoom: 19,
-    },
-  ).addTo(map);
+  const backend: Backend =
+    rendererName === "maplibre"
+      ? makeMapLibreBackend(wmt)
+      : makeLeafletBackend(wmt);
 
-  // ?fmt=r16f|r32f overrides the auto-probe, for diagnosing mobile uniform-colour bugs
   const urlFmt = new URLSearchParams(location.search).get("fmt");
   const tileTextureFormat =
     urlFmt === "r32f" || urlFmt === "r16f" || urlFmt === "auto"
       ? (urlFmt as "r32f" | "r16f" | "auto")
       : undefined;
-  let layer: WMTHeatmapLayer = wmt.createHeatmapLayer({
-    tileTextureFormat,
-  }).addTo(map) as WMTHeatmapLayer;
+  let layer = backend.addHeatmap({ tileTextureFormat });
   let scalarOn = true;
 
   const groups = new Map<string, VarGroup[]>();
@@ -160,12 +418,12 @@ async function boot(): Promise<void> {
     sel.disabled = false;
   }
 
-  let windLayer: WMTParticlesLayer | null = null;
+  let windLayer: LayerWrap<ParticlesRendererState> | null = null;
   function rebuildWindLayer(): void {
     const uName = windUSel.value;
     const vName = windVSel.value;
     if (windLayer) {
-      map.removeLayer(windLayer);
+      windLayer.remove();
       windLayer = null;
     }
     if (!uName || !vName) return;
@@ -174,14 +432,14 @@ async function boot(): Promise<void> {
       return;
     }
     try {
-      windLayer = wmt.createParticlesLayer({
+      windLayer = backend.addParticles({
         uVar: uName,
         vVar: vName,
         colormap: "white",
         particleSize: 2.5,
         speedFactor: 0.0005,
         tileTextureFormat,
-      }).addTo(map) as WMTParticlesLayer;
+      });
       windLayer.setState({ t: +time.value });
     } catch (err) {
       console.error("wmtiles: wind overlay failed", err);
@@ -192,6 +450,7 @@ async function boot(): Promise<void> {
 
   const arrowUSel = $("arrowU") as HTMLSelectElement;
   const arrowVSel = $("arrowV") as HTMLSelectElement;
+  const arrowStyleSel = $("arrowStyle") as HTMLSelectElement;
   for (const sel of [arrowUSel, arrowVSel]) {
     for (const v of sortedVars) {
       const o = document.createElement("option");
@@ -202,12 +461,12 @@ async function boot(): Promise<void> {
     sel.disabled = false;
   }
 
-  let arrowLayer: WMTArrowsLayer | null = null;
+  let arrowLayer: LayerWrap<ArrowsRendererState> | null = null;
   function rebuildArrowLayer(): void {
     const uName = arrowUSel.value;
     const vName = arrowVSel.value;
     if (arrowLayer) {
-      map.removeLayer(arrowLayer);
+      arrowLayer.remove();
       arrowLayer = null;
     }
     if (!uName || !vName) return;
@@ -216,12 +475,14 @@ async function boot(): Promise<void> {
       return;
     }
     try {
-      arrowLayer = wmt.createArrowsLayer({
+      arrowLayer = backend.addArrows({
         uVar: uName,
         vVar: vName,
+        // style is compiled into the renderer, so switching it rebuilds
+        style: arrowStyleSel.value as "arrow" | "barb",
         colormap: "viridis",
         tileTextureFormat,
-      }).addTo(map) as WMTArrowsLayer;
+      });
       arrowLayer.setState({ t: +time.value });
     } catch (err) {
       console.error("wmtiles: arrow overlay failed", err);
@@ -229,6 +490,7 @@ async function boot(): Promise<void> {
   }
   arrowUSel.onchange = rebuildArrowLayer;
   arrowVSel.onchange = rebuildArrowLayer;
+  arrowStyleSel.onchange = rebuildArrowLayer;
 
   const isoVarSel = $("isoVar") as HTMLSelectElement;
   const isoSpacingEl = $("isoSpacing") as HTMLInputElement;
@@ -247,7 +509,6 @@ async function boot(): Promise<void> {
   isoSmoothEl.disabled = false;
   isoFillEl.disabled = false;
 
-  // Round a raw spacing target to a "nice" number: 1, 2, 5, 10, 20, 50, ...
   function niceSpacing(raw: number): number {
     if (!(raw > 0) || !Number.isFinite(raw)) return 1;
     const exp = Math.floor(Math.log10(raw));
@@ -263,11 +524,10 @@ async function boot(): Promise<void> {
     const lo = Number.isFinite(v.range.min) ? v.range.min : 0;
     const hi = Number.isFinite(v.range.max) ? v.range.max : 1;
     const span = Math.max(hi - lo, 1e-6);
-    // Aim for ~25 contour lines across the data range.
     return niceSpacing(span / 25);
   }
 
-  let isoLayer: WMTIsobarLayer | null = null;
+  let isoLayer: IsobarWrap | null = null;
   function updateIsoHint(): void {
     if (!isoLayer) {
       isoUnitEl.textContent = "";
@@ -284,7 +544,7 @@ async function boot(): Promise<void> {
   function rebuildIsobarLayer(): void {
     const name = isoVarSel.value;
     if (isoLayer) {
-      map.removeLayer(isoLayer);
+      isoLayer.remove();
       isoLayer = null;
     }
     isoUnitEl.textContent = "";
@@ -297,20 +557,20 @@ async function boot(): Promise<void> {
       return;
     }
     try {
-      isoLayer = wmt.createIsobarLayer({
+      isoLayer = backend.addIsobar({
         variable: name,
         spacing,
         smoothness: +isoSmoothEl.value,
         fillEnabled: isoFillEl.checked,
         tileTextureFormat,
-      }).addTo(map) as WMTIsobarLayer;
+      });
       isoLayer.setState({ t: +time.value });
       updateIsoHint();
     } catch (err) {
       console.error("wmtiles: isobar overlay failed", err);
     }
   }
-  map.on("zoomend", updateIsoHint);
+  backend.onZoomEnd(updateIsoHint);
 
   isoSmoothEl.oninput = () => {
     const s = +isoSmoothEl.value;
@@ -340,33 +600,85 @@ async function boot(): Promise<void> {
     }
   };
 
-  const legend = new L.Control({ position: "bottomright" });
-  legend.onAdd = () => {
-    const div = L.DomUtil.create("div", "legend");
-    div.id = "legend";
-    div.innerHTML =
-      '<div id="legTitle"></div><div class="bar"></div>' +
-      '<div class="row"><span id="legMin"></span><span id="legMax"></span></div>';
-    return div;
+  const hatchVarSel = $("hatchVar") as HTMLSelectElement;
+  const hatchModeSel = $("hatchMode") as HTMLSelectElement;
+  const hatchThresholdEl = $("hatchThreshold") as HTMLInputElement;
+  const hatchPatternSel = $("hatchPattern") as HTMLSelectElement;
+  const hatchIconFileEl = $("hatchIconFile") as HTMLInputElement;
+  // backs the "icon:upload" pattern option
+  let uploadedIconUrl: string | null = null;
+  for (const v of sortedVars) {
+    const o = document.createElement("option");
+    o.value = v.name;
+    o.textContent = v.name;
+    hatchVarSel.appendChild(o);
+  }
+  hatchVarSel.disabled = false;
+  hatchThresholdEl.disabled = false;
+
+  let hatchLayer: LayerWrap<HatchRendererState> | null = null;
+  function rebuildHatchLayer(): void {
+    const name = hatchVarSel.value;
+    if (hatchLayer) {
+      hatchLayer.remove();
+      hatchLayer = null;
+    }
+    if (!name) return;
+    const threshold = +hatchThresholdEl.value;
+    const t = Number.isFinite(threshold) ? threshold : 0;
+    const range: [number, number] =
+      hatchModeSel.value === "below" ? [-Infinity, t] : [t, Infinity];
+    const pat = hatchPatternSel.value;
+    let band: HatchBand;
+    if (pat.startsWith("icon:")) {
+      const key = pat.slice(5);
+      const iconUrl = key === "upload" ? uploadedIconUrl : HATCH_ICONS[key];
+      if (!iconUrl) return; // "upload" picked but no file chosen yet
+      band = { range, icon: iconUrl, spacing: 30, iconSize: 22 };
+    } else {
+      band = { range, pattern: pat as HatchPattern, color: [255, 90, 90] };
+    }
+    try {
+      // bands are baked into the shader, so any band change rebuilds the layer
+      hatchLayer = backend.addHatch({
+        variable: name,
+        bands: [band],
+        tileTextureFormat,
+      });
+      hatchLayer.setState({ t: +time.value });
+    } catch (err) {
+      console.error("wmtiles: hatch overlay failed", err);
+    }
+  }
+  hatchVarSel.onchange = rebuildHatchLayer;
+  hatchModeSel.onchange = rebuildHatchLayer;
+  hatchThresholdEl.onchange = rebuildHatchLayer;
+  hatchPatternSel.onchange = rebuildHatchLayer;
+  hatchIconFileEl.onchange = () => {
+    const file = hatchIconFileEl.files?.[0];
+    if (!file) return;
+    if (uploadedIconUrl) URL.revokeObjectURL(uploadedIconUrl);
+    uploadedIconUrl = URL.createObjectURL(file);
+    hatchPatternSel.value = "icon:upload";
+    rebuildHatchLayer();
   };
-  legend.addTo(map);
+
+  ensureLegendEl();
 
   const scalarEnabledEl = $("scalarEnabled") as HTMLInputElement;
   scalarEnabledEl.disabled = false;
-  // Click on the checkbox must not toggle the surrounding <details>.
   scalarEnabledEl.addEventListener("click", (e) => e.stopPropagation());
   scalarEnabledEl.onchange = () => {
     const wantOn = scalarEnabledEl.checked;
+    const legendEl = document.getElementById("legend-floating");
     if (wantOn && !scalarOn) {
-      layer = wmt.createHeatmapLayer({
-        tileTextureFormat,
-      }).addTo(map) as WMTHeatmapLayer;
+      layer = backend.addHeatmap({ tileTextureFormat });
       scalarOn = true;
-      legend.addTo(map);
+      if (legendEl) legendEl.style.display = "";
       refresh();
     } else if (!wantOn && scalarOn) {
-      map.removeLayer(layer);
-      map.removeControl(legend);
+      layer.remove();
+      if (legendEl) legendEl.style.display = "none";
       scalarOn = false;
     }
   };
@@ -414,6 +726,7 @@ async function boot(): Promise<void> {
     if (windLayer) windLayer.setState({ t });
     if (isoLayer) isoLayer.setState({ t });
     if (arrowLayer) arrowLayer.setState({ t });
+    if (hatchLayer) hatchLayer.setState({ t });
     const maxStep = wmt.timeStepCount - 1;
     const tF = Math.max(0, Math.min(maxStep, Math.floor(t)));
     const tC = Math.min(maxStep, tF + 1);
@@ -427,7 +740,7 @@ async function boot(): Promise<void> {
     $("legMin").textContent = (+vminEl.value).toPrecision(5);
     $("legMax").textContent = (+vmaxEl.value).toPrecision(5);
     status.textContent =
-      `${wmt.variables.length} var · ${wmt.timeStepCount} steps · ` +
+      `${backend.name} · ${wmt.variables.length} var · ${wmt.timeStepCount} steps · ` +
       `z${wmt.zoomRange.min}-${wmt.zoomRange.max} · gen ${wmt.snapshotGeneration}`;
   }
 
@@ -447,8 +760,8 @@ async function boot(): Promise<void> {
   applyRangeForVar();
   refresh();
 
-  map.on("click", async (ev: L.LeafletMouseEvent) => {
-    const result = await valueAtClick(wmt, layer, ev.latlng, map.getZoom());
+  backend.onClick(async (lat, lng) => {
+    const result = await valueAtClick(wmt, layer, lat, lng, backend.getZoom());
     const v = currentVar();
     let body: string;
     if (!result) body = "<i>out of range</i>";
@@ -461,10 +774,11 @@ async function boot(): Promise<void> {
     if (result && !(result.missing && result.value === undefined)) {
       body += `<br><small>z=${result.z} tile=(${result.x},${result.y}) px=(${result.col},${result.row})</small>`;
     }
-    L.popup().setLatLng(ev.latlng).setContent(body).openOn(map);
+    backend.openPopup(lat, lng, body);
   });
 
   console.log("wmtiles loaded", {
+    renderer: backend.name,
     bbox: wmt.bbox,
     zoomRange: wmt.zoomRange,
     variables: wmt.variables,

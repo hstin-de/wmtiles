@@ -1,4 +1,3 @@
-// High-level reader — what most users want.
 export {
   WMT,
   open,
@@ -24,7 +23,6 @@ export {
   type ValueResult,
 } from "./reader.js";
 
-// Typed errors.
 export {
   WMTError,
   FormatError,
@@ -33,8 +31,47 @@ export {
   TimeOutOfRangeError,
 } from "./errors.js";
 
-// Geo helper for point sampling UIs.
 export { latLonToTilePixel, type TilePixel } from "./tileid.js";
+
+export { registerLayerBackend } from "./layers.js";
+export type {
+  WMTLayer,
+  WMTHeatmapLayer,
+  WMTParticlesLayer,
+  WMTIsobarLayer,
+  WMTArrowsLayer,
+  WMTSymbolLayer,
+  WMTHatchLayer,
+  HeatmapLayerOptions,
+  ParticlesLayerOptions,
+  IsobarLayerOptions,
+  ArrowsLayerOptions,
+  SymbolLayerOptions,
+  HatchLayerOptions,
+  LayerBackend,
+  LayerBackendName,
+  BackendLayer,
+  LayerKind,
+  HeatmapRendererOptions,
+  HeatmapRendererState,
+  ParticlesRendererOptions,
+  ParticlesRendererState,
+  IsobarRendererOptions,
+  IsobarRendererState,
+  ArrowsRendererOptions,
+  ArrowsRendererState,
+  SymbolRendererOptions,
+  SymbolRendererState,
+  HatchRendererOptions,
+  HatchRendererState,
+  HatchBand,
+  HatchPatternBand,
+  HatchIconBand,
+  HatchPattern,
+  GlyphSprite,
+  SpriteSheet,
+  SpriteIcons,
+} from "./layers.js";
 
 // Opt-in instrumentation. setDebugSink(fn) starts receiving phase-timed
 // events; setDebugSink(null) disables.

@@ -1,6 +1,5 @@
 import type { TileCoord, Variable, WMT } from "../reader.js";
 import {
-  colormapToGLSL,
   resolveColormap,
   type BuiltinColormapName,
   type Colormap,
@@ -9,30 +8,49 @@ import { TileSource, type TileSourceOptions } from "./source.js";
 import { MISSING_GLSL_PREAMBLE } from "./missing.js";
 import { computeTimeWindow, type TimeWindow } from "./time.js";
 import {
+  buildQuadVAO,
   createFBO,
   createTexture,
   linkProgram,
   VS_ATLAS_SLOT,
 } from "./gl.js";
 import type { TileDrawRect } from "./heatmap.js";
+import type { GlobeProjectionData, GlobeShaderData } from "./globe.js";
+import {
+  GlyphRenderer,
+  type AtlasLayout,
+  type GlyphAtlas,
+  type GlyphSprite,
+} from "./glyphs.js";
 
 export type { TileDrawRect } from "./heatmap.js";
 
 export interface ArrowsRendererOptions extends TileSourceOptions {
+  style?: "arrow" | "barb";
   // arrowsPerTile² total per visible tile, anchored to tile coords so they
   // stay locked to world position across pan/zoom
   arrowsPerTile?: number;
-  arrowSize?: number; // px
+  arrowSize?: number; // px; default 16 for arrows, 52 for barbs
   // 0 disables. Outline pass redraws slightly larger in a dark colour so
-  // arrows stay legible on bright backgrounds.
+  // arrows stay legible on bright backgrounds. Ignored for barbs.
   outlineWidth?: number;
   outlineColor?: [number, number, number];
   colormap?: Colormap | BuiltinColormapName;
-  speedRange?: [number, number]; // m/s, normalises colormap
+  speedRange?: [number, number]; // m/s, normalises colormap; ignored for barbs
   alpha?: number;
   disableTimeLerp?: boolean;
   prefetchNext?: boolean;
+  speedToKnots?: number;
+  // Barb style only. CSS colour of the drawn barbs. Default "#202020".
+  barbColor?: string;
+  flat?: boolean;
   onFrame?: (frameMs: number) => void; // cpu time per draw
+  // When true: caller drives drawing via draw(matrix, ...), tile rects are
+  // mercator world units (0..1), and no internal rAF loop runs.
+  matrixMode?: boolean;
+  // Matrix mode only. Fires when the next draw() would produce a different
+  // result (state change, new view, tile arrival). Wire to map.triggerRepaint().
+  onRedraw?: () => void;
 }
 
 export interface ArrowsRendererState {
@@ -42,12 +60,7 @@ export interface ArrowsRendererState {
 }
 
 const DEFAULTS = {
-  arrowsPerTile: 8,
-  arrowSize: 16,
-  outlineWidth: 1.5,
-  outlineColor: [0, 0, 0] as [number, number, number],
   speedRange: [0, 30] as [number, number],
-  alpha: 0.95,
   disableTimeLerp: false,
   prefetchNext: true,
 } as const;
@@ -65,7 +78,145 @@ const ARROW_GEOM = new Float32Array([
    0.6,   0.0,
    0.15,  0.28,
 ]);
-const VERTS_PER_ARROW = 9;
+
+const WIND_RULE_GLSL = `
+vec4 glyphRule(vec4 texel) {
+  vec2 wind = texel.rg;
+  bool dead = isMissing(wind.x) || isMissing(wind.y)
+           || (wind.x == 0.0 && wind.y == 0.0);
+  return vec4(atan(-wind.y, wind.x), length(wind), dead ? 0.0 : 1.0, 0.0);
+}`;
+
+function buildBarbRule(speedToKnots: number, perHemi: number): string {
+  return `
+vec4 glyphRule(vec4 texel) {
+  vec2 wind = texel.rg;
+  bool dead = isMissing(wind.x) || isMissing(wind.y);
+  float knots = length(wind) * ${speedToKnots.toFixed(6)};
+  float idx = clamp(floor(knots / 5.0 + 0.5), 0.0, ${(perHemi - 1).toFixed(1)});
+  if (g_glyphLat < 0.0) idx += ${perHemi.toFixed(1)};
+  return vec4(atan(wind.y, -wind.x), length(wind), dead ? 0.0 : 1.0, idx);
+}`;
+}
+
+function buildWindBarbSheet(
+  color: string,
+  maxKnots = 150,
+  cellPx = 80,
+): {
+  canvas: HTMLCanvasElement;
+  cols: number;
+  rows: number;
+  count: number;
+  perHemi: number;
+} {
+  const perHemi = Math.floor(maxKnots / 5) + 1;
+  const count = perHemi * 2;
+  const cols = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / cols);
+  const canvas = document.createElement("canvas");
+  canvas.width = cols * cellPx;
+  canvas.height = rows * cellPx;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("2d canvas context unavailable");
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const L = cellPx * 0.44; // staff length: plotting point -> tip
+  const B = cellPx * 0.18; // full barb / pennant height (~0.4 of the staff)
+  const slotBase = cellPx * 0.075; // nominal spacing of elements along the staff
+  const leanXBase = cellPx * 0.045; // nominal element lean-back along the staff
+  const lw = cellPx * 0.035;
+
+  const drawGlyph = (
+    ox: number,
+    oy: number,
+    knots: number,
+    dir: number,
+  ): void => {
+    if (knots < 5) {
+      ctx.beginPath();
+      ctx.arc(ox, oy, cellPx * 0.07, 0, Math.PI * 2);
+      ctx.stroke();
+      return;
+    }
+    const tipX = ox + L;
+
+    let rem = knots;
+    const pennants = Math.floor(rem / 50);
+    rem -= pennants * 50;
+    const fullBarbs = Math.floor(rem / 10);
+    rem -= fullBarbs * 10;
+    const halfBarbs = Math.floor(rem / 5);
+    // a lone half barb sits set in from the tip, per convention
+    const loneHalf = halfBarbs > 0 && fullBarbs === 0 && pennants === 0;
+
+    // total staff slots the elements occupy; on fast barbs the nominal spacing
+    // would push elements past the plotting point, so shrink it to fit L
+    const span =
+      pennants + (pennants > 0 ? 0.5 : 0) + fullBarbs +
+      (loneHalf ? 1 : 0) + halfBarbs;
+    const slot = span * slotBase > L ? L / span : slotBase;
+    const leanX = leanXBase * (slot / slotBase);
+    // sink the barb/pennant roots half a staff-width into the staff so their
+    // round caps stay buried under it instead of poking out the far side
+    const rootY = oy - dir * (lw / 2);
+
+    // place elements from the tip inward; barbs lean back (-x) and go off the
+    // staff on the `dir` side
+    let pos = tipX;
+    const tick = (atX: number, len: number): void => {
+      ctx.beginPath();
+      ctx.moveTo(atX, rootY);
+      ctx.lineTo(atX - leanX * (len / B), oy - dir * len);
+      ctx.stroke();
+    };
+    for (let p = 0; p < pennants; p++) {
+      ctx.beginPath();
+      ctx.moveTo(pos, rootY);
+      ctx.lineTo(pos - slot * 0.9, rootY);
+      ctx.lineTo(pos - leanX, oy - dir * B);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      pos -= slot;
+    }
+    if (pennants > 0) pos -= slot * 0.5; // gap after pennants
+    for (let b = 0; b < fullBarbs; b++) {
+      tick(pos, B);
+      pos -= slot;
+    }
+    if (loneHalf) pos -= slot;
+    for (let h = 0; h < halfBarbs; h++) {
+      tick(pos, B * 0.5);
+      pos -= slot;
+    }
+
+    // staff last so it sits over the sunk-in barb/pennant roots, hiding the
+    // last sliver of their caps
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(tipX, oy);
+    ctx.stroke();
+  };
+
+  for (let i = 0; i < count; i++) {
+    const ox = (i % cols) * cellPx + cellPx / 2; // plotting point = cell centre
+    const oy = ((i / cols) | 0) * cellPx + cellPx / 2;
+    const knots = (i % perHemi) * 5;
+    const dir = i < perHemi ? 1 : -1; // northern block first, then mirrored
+    // light halo underneath, final colour on top
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.lineWidth = lw + cellPx * 0.04;
+    drawGlyph(ox, oy, knots, dir);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = lw;
+    drawGlyph(ox, oy, knots, dir);
+  }
+  return { canvas, cols, rows, count, perHemi };
+}
 
 const FS_ATLAS = `#version 300 es
 precision highp float;
@@ -104,134 +255,43 @@ void main() {
   outColor = packRG(lerpR(uA, uB, u_lerp), lerpR(vA, vB, u_lerp));
 }`;
 
-const VS_ARROW = `#version 300 es
-precision highp float;
-
-layout(location=0) in vec2 a_local;
-layout(location=1) in vec4 a_inst;  // atlasU, atlasV, sx, sy
-
-uniform sampler2D u_atlas;
-uniform vec2  u_screen;       // canvas in device px
-uniform float u_arrowSize;    // px
-uniform float u_sizeBoost;    // 1 for fill, >1 for outline
-uniform vec2  u_speedRange;
-
-flat out int v_alive;
-out float v_t;
-
-${MISSING_GLSL_PREAMBLE}
-
-void main() {
-  vec2 atlasUV = a_inst.xy;
-  vec2 screenCenter = a_inst.zw;
-
-  vec2 wind = texture(u_atlas, atlasUV).rg;
-  bool dead = isMissing(wind.x) || isMissing(wind.y)
-           || (wind.x == 0.0 && wind.y == 0.0);
-  if (dead) {
-    v_alive = 0;
-    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    return;
-  }
-  v_alive = 1;
-
-  float speed = length(wind);
-  v_t = clamp((speed - u_speedRange.x) / max(u_speedRange.y - u_speedRange.x, 1e-30), 0.0, 1.0);
-
-  // u east -> +x, v north -> -y on a y-down canvas
-  float angle = atan(-wind.y, wind.x);
-  float c = cos(angle), s = sin(angle);
-
-  vec2 local = a_local * u_arrowSize * u_sizeBoost;
-  vec2 rotated = vec2(local.x * c - local.y * s, local.x * s + local.y * c);
-  vec2 px = screenCenter + rotated;
-  vec2 ndc = vec2(px.x / u_screen.x * 2.0 - 1.0, 1.0 - px.y / u_screen.y * 2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-}`;
-
-const FS_OUTLINE = `#version 300 es
-precision highp float;
-flat in int v_alive;
-in float v_t;
-out vec4 outColor;
-uniform vec3 u_color;
-uniform float u_alpha;
-void main() {
-  if (v_alive == 0) discard;
-  outColor = vec4(u_color, u_alpha);
-}`;
-
-function buildFillFS(colormap: Colormap): string {
-  return `#version 300 es
-precision highp float;
-flat in int v_alive;
-in float v_t;
-out vec4 outColor;
-
-${colormapToGLSL(colormap)}
-
-uniform float u_alpha;
-void main() {
-  if (v_alive == 0) discard;
-  outColor = vec4(colormap(v_t), u_alpha);
-}`;
-}
-
 export class ArrowsRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly source: TileSource;
   private readonly ownsSource: boolean;
   private readonly wmt: WMT;
+  private readonly glyphs: GlyphRenderer;
 
   private readonly opts: Required<
     Pick<
       ArrowsRendererOptions,
-      | "arrowsPerTile"
-      | "arrowSize"
-      | "outlineWidth"
-      | "outlineColor"
-      | "speedRange"
-      | "alpha"
-      | "disableTimeLerp"
-      | "prefetchNext"
+      "speedRange" | "disableTimeLerp" | "prefetchNext"
     >
   >;
-  private readonly onFrame?: (frameMs: number) => void;
 
   private readonly progAtlas: WebGLProgram;
   private readonly progAtlasLerp: WebGLProgram;
-  private readonly progOutline: WebGLProgram;
-  private readonly progFill: WebGLProgram;
   private readonly quadVAO: WebGLVertexArrayObject;
-  private readonly arrowVAO: WebGLVertexArrayObject;
-  private readonly instanceVBO: WebGLBuffer;
-  private instanceCount = 0;
 
-  private atlasTex!: WebGLTexture;
-  private atlasFBO!: WebGLFramebuffer;
+  private atlasTex: WebGLTexture | null = null;
+  private atlasFBO: WebGLFramebuffer | null = null;
   private atlasTileW = 0;
   private atlasTileH = 0;
-  private canvasW = 1;
-  private canvasH = 1;
 
-  private view: TileDrawRect[] = [];
-  private raf = 0;
+  // atlas depends on vars/time/tile-set, not on pan/zoom/tilt. Keeping the
+  // cached atlas through a pure pan is what keeps this layer feeling tight.
+  private atlasDirty = true;
+  private atlasReady = false;
   private disposed = false;
 
   state: ArrowsRendererState;
 
   constructor(
-    private readonly canvas: HTMLCanvasElement,
+    gl: WebGL2RenderingContext,
     wmt: WMT,
     options: ArrowsRendererOptions = {},
     source?: TileSource,
   ) {
-    const gl = canvas.getContext("webgl2", {
-      premultipliedAlpha: false,
-      antialias: true,
-      preserveDrawingBuffer: true,
-    }) as WebGL2RenderingContext | null;
-    if (!gl) throw new Error("WebGL2 not supported");
     if (!gl.getExtension("EXT_color_buffer_float")) {
       throw new Error("EXT_color_buffer_float not supported");
     }
@@ -239,17 +299,10 @@ export class ArrowsRenderer {
     this.wmt = wmt;
 
     this.opts = {
-      arrowsPerTile: Math.max(1, options.arrowsPerTile ?? DEFAULTS.arrowsPerTile),
-      arrowSize: options.arrowSize ?? DEFAULTS.arrowSize,
-      outlineWidth: options.outlineWidth ?? DEFAULTS.outlineWidth,
-      outlineColor: options.outlineColor ?? DEFAULTS.outlineColor,
       speedRange: options.speedRange ?? DEFAULTS.speedRange,
-      alpha: options.alpha ?? DEFAULTS.alpha,
-      disableTimeLerp:
-        options.disableTimeLerp ?? DEFAULTS.disableTimeLerp,
+      disableTimeLerp: options.disableTimeLerp ?? DEFAULTS.disableTimeLerp,
       prefetchNext: options.prefetchNext ?? DEFAULTS.prefetchNext,
     };
-    this.onFrame = options.onFrame;
 
     const colormap = resolveColormap(options.colormap);
 
@@ -259,48 +312,51 @@ export class ArrowsRenderer {
     } else {
       this.source = new TileSource(gl, wmt, {
         ...options,
-        onUpdate: () => this.scheduleDraw(),
+        onUpdate: () => {
+          this.atlasDirty = true;
+          this.glyphs.schedule();
+        },
       });
       this.ownsSource = true;
     }
 
     this.progAtlas = linkProgram(gl, VS_ATLAS_SLOT, FS_ATLAS);
     this.progAtlasLerp = linkProgram(gl, VS_ATLAS_SLOT, FS_ATLAS_LERP);
-    this.progOutline = linkProgram(gl, VS_ARROW, FS_OUTLINE);
-    this.progFill = linkProgram(gl, VS_ARROW, buildFillFS(colormap));
+    this.quadVAO = buildQuadVAO(gl);
 
-    const qvbo = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, qvbo);
-    gl.bufferData(
-      gl.ARRAY_BUFFER,
-      new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]),
-      gl.STATIC_DRAW,
-    );
-    const qvao = gl.createVertexArray();
-    if (!qvao) throw new Error("createVertexArray failed");
-    gl.bindVertexArray(qvao);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    this.quadVAO = qvao;
+    // barb style swaps the colormap-shaded arrow geometry for a generated
+    // sprite sheet of meteorological wind barbs, indexed by speed
+    let rule = WIND_RULE_GLSL;
+    let sprite: GlyphSprite | undefined;
+    let glyphSize = options.arrowSize;
+    if (options.style === "barb") {
+      const sheet = buildWindBarbSheet(options.barbColor ?? "#202020");
+      sprite = { image: sheet.canvas, cols: sheet.cols, rows: sheet.rows };
+      rule = buildBarbRule(options.speedToKnots ?? 1.94384, sheet.perHemi);
+      glyphSize = options.arrowSize ?? 52;
+    }
 
-    const avbo = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, avbo);
-    gl.bufferData(gl.ARRAY_BUFFER, ARROW_GEOM, gl.STATIC_DRAW);
-    const ivbo = gl.createBuffer();
-    if (!ivbo) throw new Error("createBuffer failed");
-    this.instanceVBO = ivbo;
-    const avao = gl.createVertexArray();
-    if (!avao) throw new Error("createVertexArray failed");
-    gl.bindVertexArray(avao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, avbo);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, ivbo);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
-    gl.vertexAttribDivisor(1, 1);
-
-    this.arrowVAO = avao;
+    this.glyphs = new GlyphRenderer(gl, {
+      geometry: ARROW_GEOM,
+      rule,
+      sprite,
+      texelsPerTile: wmt.tileSize,
+      // wind direction is geographic, so arrows turn with the map
+      rotateWithMap: true,
+      // a wind field reads naturally lying on the map surface
+      flat: options.flat ?? true,
+      glyphsPerTile: options.arrowsPerTile,
+      glyphSize,
+      outlineWidth: options.outlineWidth,
+      outlineColor: options.outlineColor,
+      colormap,
+      valueRange: this.opts.speedRange,
+      alpha: options.alpha,
+      matrixMode: options.matrixMode,
+      onRedraw: options.onRedraw,
+      onFrame: options.onFrame,
+      prepareAtlas: () => this.prepareAtlas(),
+    });
 
     this.state = {
       uVar: wmt.variables[0],
@@ -313,83 +369,89 @@ export class ArrowsRenderer {
     if (this.disposed) return;
     Object.assign(this.state, patch);
     this.source.invalidate();
-    this.scheduleDraw();
+    this.atlasDirty = true;
+    this.glyphs.schedule();
   }
 
   setView(tiles: TileDrawRect[]): void {
     if (this.disposed) return;
-    // canonical world only, no wrap copies
-    this.view = tiles.filter((t) => t.worldX === t.x);
-    this.ensureAtlas(this.view);
-    this.scheduleDraw();
+    // GlyphRenderer fingerprints the tile set; only rebuild the atlas when it
+    // actually changed
+    if (this.glyphs.setView(tiles)) this.atlasDirty = true;
   }
 
-  resize(widthDevPx: number, heightDevPx: number): void {
+  setViewport(widthDevPx: number, heightDevPx: number): void {
     if (this.disposed) return;
-    const w = Math.max(1, widthDevPx | 0);
-    const h = Math.max(1, heightDevPx | 0);
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
-    this.canvasW = w;
-    this.canvasH = h;
-    this.gl.viewport(0, 0, w, h);
-    this.scheduleDraw();
+    this.glyphs.setViewport(widthDevPx, heightDevPx);
+  }
+
+  draw(
+    projData: GlobeProjectionData,
+    shaderData: GlobeShaderData,
+    viewportWPx: number,
+    viewportHPx: number,
+    bearingRad = 0,
+    worldSize = 0,
+  ): void {
+    if (this.disposed) return;
+    this.glyphs.draw(
+      projData,
+      shaderData,
+      viewportWPx,
+      viewportHPx,
+      bearingRad,
+      worldSize,
+    );
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
+    this.glyphs.dispose();
     const gl = this.gl;
     if (this.atlasTex) gl.deleteTexture(this.atlasTex);
     if (this.atlasFBO) gl.deleteFramebuffer(this.atlasFBO);
     gl.deleteVertexArray(this.quadVAO);
-    gl.deleteVertexArray(this.arrowVAO);
-    gl.deleteBuffer(this.instanceVBO);
     gl.deleteProgram(this.progAtlas);
     gl.deleteProgram(this.progAtlasLerp);
-    gl.deleteProgram(this.progOutline);
-    gl.deleteProgram(this.progFill);
     if (this.ownsSource) this.source.dispose();
   }
 
-  private scheduleDraw(): void {
-    if (this.raf || this.disposed) return;
-    this.raf = requestAnimationFrame(() => {
-      this.raf = 0;
-      if (!this.disposed) this.draw();
-    });
+  // per-frame data handoff for GlyphRenderer: builds/reuses the RG atlas
+  private prepareAtlas(): GlyphAtlas | null {
+    const layout = this.glyphs.getAtlasLayout();
+    if (!layout) return null;
+    this.ensureAtlas(layout);
+    const { tF, tC, frac, tP } = this.timeWindow();
+    this.requestMissingTiles(tF, tC, tP);
+    if (this.atlasDirty) {
+      this.atlasReady = this.buildAtlas(layout, tF, tC, frac);
+      this.atlasDirty = false;
+    }
+    if (!this.atlasTex) return null;
+    return { tex: this.atlasTex, ready: this.atlasReady };
   }
 
-  private ensureAtlas(tiles: TileDrawRect[]): void {
-    if (tiles.length === 0) return;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const t of tiles) {
-      if (t.x < minX) minX = t.x;
-      if (t.y < minY) minY = t.y;
-      if (t.x > maxX) maxX = t.x;
-      if (t.y > maxY) maxY = t.y;
-    }
-    const tilesW = maxX - minX + 1;
-    const tilesH = maxY - minY + 1;
-    if (tilesW === this.atlasTileW && tilesH === this.atlasTileH && this.atlasTex) {
+  private ensureAtlas(layout: AtlasLayout): void {
+    if (
+      layout.tileW === this.atlasTileW &&
+      layout.tileH === this.atlasTileH &&
+      this.atlasTex
+    ) {
       return;
     }
     const gl = this.gl;
     if (this.atlasTex) gl.deleteTexture(this.atlasTex);
     if (this.atlasFBO) gl.deleteFramebuffer(this.atlasFBO);
     const ts = this.wmt.tileSize;
-    this.atlasTex = createTexture(gl, tilesW * ts, tilesH * ts, {
+    this.atlasTex = createTexture(gl, layout.tileW * ts, layout.tileH * ts, {
       internalFormat: gl.RG32F,
       format: gl.RG,
       type: gl.FLOAT,
     });
     this.atlasFBO = createFBO(gl, this.atlasTex);
-    this.atlasTileW = tilesW;
-    this.atlasTileH = tilesH;
+    this.atlasTileW = layout.tileW;
+    this.atlasTileH = layout.tileH;
   }
 
   private timeWindow(): TimeWindow {
@@ -398,10 +460,11 @@ export class ArrowsRenderer {
 
   private requestMissingTiles(tF: number, tC: number, tP: number): void {
     const { uVar, vVar } = this.state;
+    const view = this.glyphs.getView();
     const missing = (t: number, vari: Variable): TileCoord[] => {
       const out: TileCoord[] = [];
       const seen = new Set<string>();
-      for (const r of this.view) {
+      for (const r of view) {
         if (this.source.hasExact(vari, t, r.z, r.x, r.y)) continue;
         const k = `${r.z}|${r.x}|${r.y}`;
         if (seen.has(k)) continue;
@@ -428,25 +491,23 @@ export class ArrowsRenderer {
     }
   }
 
-  private buildAtlas(tF: number, tC: number, frac: number): boolean {
-    if (!this.atlasTex) return false;
+  private buildAtlas(
+    layout: AtlasLayout,
+    tF: number,
+    tC: number,
+    frac: number,
+  ): boolean {
+    if (!this.atlasTex || !this.atlasFBO) return false;
     const gl = this.gl;
     const ts = this.wmt.tileSize;
-    const aw = this.atlasTileW * ts;
-    const ah = this.atlasTileH * ts;
+    const aw = layout.tileW * ts;
+    const ah = layout.tileH * ts;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.atlasFBO);
     gl.viewport(0, 0, aw, ah);
     gl.clearColor(NaN, NaN, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
-
-    const tiles = this.view;
-    let minX = Infinity, minY = Infinity;
-    for (const t of tiles) {
-      if (t.x < minX) minX = t.x;
-      if (t.y < minY) minY = t.y;
-    }
 
     const { uVar, vVar } = this.state;
     const lerp = frac > 0 && tF !== tC;
@@ -455,7 +516,7 @@ export class ArrowsRenderer {
     gl.bindVertexArray(this.quadVAO);
 
     let drawn = 0;
-    for (const tile of tiles) {
+    for (const tile of this.glyphs.getView()) {
       const refUA = this.source.findTex(uVar, tF, tile.z, tile.x, tile.y);
       const refVA = this.source.findTex(vVar, tF, tile.z, tile.x, tile.y);
       if (!refUA || !refVA) continue;
@@ -466,12 +527,12 @@ export class ArrowsRenderer {
         ? this.source.findTex(vVar, tC, tile.z, tile.x, tile.y) ?? refVA
         : null;
 
-      const cx = tile.x - minX;
-      const cy = tile.y - minY;
-      const x0 = (cx / this.atlasTileW) * 2 - 1;
-      const y0 = (cy / this.atlasTileH) * 2 - 1;
-      const x1 = ((cx + 1) / this.atlasTileW) * 2 - 1;
-      const y1 = ((cy + 1) / this.atlasTileH) * 2 - 1;
+      const cx = tile.x - layout.minX;
+      const cy = tile.y - layout.minY;
+      const x0 = (cx / layout.tileW) * 2 - 1;
+      const y0 = (cy / layout.tileH) * 2 - 1;
+      const x1 = ((cx + 1) / layout.tileW) * 2 - 1;
+      const y1 = ((cy + 1) / layout.tileH) * 2 - 1;
       gl.uniform4f(gl.getUniformLocation(prog, "u_slot"), x0, y0, x1, y1);
 
       if (lerp && refUB && refVB) {
@@ -506,128 +567,5 @@ export class ArrowsRenderer {
       drawn++;
     }
     return drawn > 0;
-  }
-
-  // Per-instance buffer, anchored at fixed fractional tile coords so arrows pan with the map
-  private uploadInstances(): number {
-    const N = this.opts.arrowsPerTile;
-    const view = this.view;
-    if (view.length === 0) return 0;
-    let minX = Infinity, minY = Infinity;
-    for (const t of view) {
-      if (t.x < minX) minX = t.x;
-      if (t.y < minY) minY = t.y;
-    }
-    const total = view.length * N * N;
-    const buf = new Float32Array(total * 4);
-    let i = 0;
-    for (const t of view) {
-      const tx = t.x - minX;
-      const ty = t.y - minY;
-      const dx = t.sx1 - t.sx0;
-      const dy = t.sy1 - t.sy0;
-      for (let fy = 0; fy < N; fy++) {
-        const fv = (fy + 0.5) / N;
-        const sy = t.sy0 + fv * dy;
-        for (let fx = 0; fx < N; fx++) {
-          const fu = (fx + 0.5) / N;
-          buf[i++] = (tx + fu) / this.atlasTileW;
-          buf[i++] = (ty + fv) / this.atlasTileH;
-          buf[i++] = t.sx0 + fu * dx;
-          buf[i++] = sy;
-        }
-      }
-    }
-    const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceVBO);
-    gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
-    return total;
-  }
-
-  private drawArrows(): void {
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvasW, this.canvasH);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-    this.instanceCount = this.uploadInstances();
-    if (this.instanceCount === 0) return;
-
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const arrowSizeDev = this.opts.arrowSize * dpr;
-
-    // outline first, fill on top
-    if (this.opts.outlineWidth > 0) {
-      const boost =
-        1.0 + (this.opts.outlineWidth * 2) / Math.max(1, this.opts.arrowSize);
-      gl.useProgram(this.progOutline);
-      gl.bindVertexArray(this.arrowVAO);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
-      gl.uniform1i(gl.getUniformLocation(this.progOutline, "u_atlas"), 0);
-      gl.uniform2f(gl.getUniformLocation(this.progOutline, "u_screen"), this.canvasW, this.canvasH);
-      gl.uniform1f(gl.getUniformLocation(this.progOutline, "u_arrowSize"), arrowSizeDev);
-      gl.uniform1f(gl.getUniformLocation(this.progOutline, "u_sizeBoost"), boost);
-      gl.uniform2f(
-        gl.getUniformLocation(this.progOutline, "u_speedRange"),
-        this.opts.speedRange[0],
-        this.opts.speedRange[1],
-      );
-      gl.uniform3f(
-        gl.getUniformLocation(this.progOutline, "u_color"),
-        this.opts.outlineColor[0],
-        this.opts.outlineColor[1],
-        this.opts.outlineColor[2],
-      );
-      gl.uniform1f(gl.getUniformLocation(this.progOutline, "u_alpha"), this.opts.alpha);
-      gl.drawArraysInstanced(gl.TRIANGLES, 0, VERTS_PER_ARROW, this.instanceCount);
-    }
-
-    gl.useProgram(this.progFill);
-    gl.bindVertexArray(this.arrowVAO);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
-    gl.uniform1i(gl.getUniformLocation(this.progFill, "u_atlas"), 0);
-    gl.uniform2f(gl.getUniformLocation(this.progFill, "u_screen"), this.canvasW, this.canvasH);
-    gl.uniform1f(gl.getUniformLocation(this.progFill, "u_arrowSize"), arrowSizeDev);
-    gl.uniform1f(gl.getUniformLocation(this.progFill, "u_sizeBoost"), 1.0);
-    gl.uniform2f(
-      gl.getUniformLocation(this.progFill, "u_speedRange"),
-      this.opts.speedRange[0],
-      this.opts.speedRange[1],
-    );
-    gl.uniform1f(gl.getUniformLocation(this.progFill, "u_alpha"), this.opts.alpha);
-    gl.drawArraysInstanced(gl.TRIANGLES, 0, VERTS_PER_ARROW, this.instanceCount);
-  }
-
-  private clearCanvas(): void {
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvasW, this.canvasH);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-  }
-
-  private draw(): void {
-    if (this.disposed) return;
-    if (this.canvasW <= 1 || this.canvasH <= 1) return;
-    const tStart = performance.now();
-    if (this.view.length === 0) {
-      this.clearCanvas();
-      this.onFrame?.(performance.now() - tStart);
-      return;
-    }
-    const { tF, tC, frac, tP } = this.timeWindow();
-    this.requestMissingTiles(tF, tC, tP);
-    if (!this.buildAtlas(tF, tC, frac)) {
-      this.clearCanvas();
-      this.onFrame?.(performance.now() - tStart);
-      return;
-    }
-    this.drawArrows();
-    this.onFrame?.(performance.now() - tStart);
   }
 }

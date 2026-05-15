@@ -16,6 +16,24 @@ import {
   VS_FULLSCREEN,
 } from "./gl.js";
 import type { TileDrawRect } from "./heatmap.js";
+import {
+  buildSubdividedQuadVAO,
+  setProjectionUniforms,
+  getProjectionUniformLocs,
+  type GlobeProjectionData,
+  type GlobeShaderData,
+  type ProjectionUniformLocs,
+} from "./globe.js";
+import { beginHostFrame, VariantProgramCache } from "./backend.js";
+
+const GLOBE_SEGMENTS = 16; // subdivision per composite step, for globe curvature
+
+// screen mode: fullscreen blit. matrix mode: reprojects the trail buffer via
+// projectTile()
+interface CompositeProgram {
+  program: WebGLProgram;
+  proj: ProjectionUniformLocs; // all-null in screen mode
+}
 
 export type { TileDrawRect } from "./heatmap.js";
 
@@ -31,6 +49,10 @@ export interface ParticlesRendererOptions extends TileSourceOptions {
   prefetchNext?: boolean;
   // cpu time per tick, skipped on early-exit frames
   onFrame?: (frameMs: number) => void;
+  // When true: caller drives drawing via draw(matrix, ...), tile rects are
+  // mercator (0..1), and no internal rAF loop runs.
+  matrixMode?: boolean;
+  onRedraw?: () => void;
 }
 
 export interface ParticlesRendererState {
@@ -89,61 +111,59 @@ void main() {
   outColor = packRG(lerpR(uA, uB, u_lerp), lerpR(vA, vB, u_lerp));
 }`;
 
-// Particles live in fractional tile coords at u_refZoom (file's max zoom),
-// anchoring them to world positions instead of drifting with the atlas UV
-// frame as the view changes.
 const FS_PARTICLE_UPDATE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 uniform sampler2D u_state;
 uniform sampler2D u_atlas;
-uniform float u_speed;
+uniform float u_stepFactor;     // tile-units / frame / unit wind
 uniform float u_ageStep;
 uniform float u_rand;
-uniform float u_curZoom;
-uniform float u_refZoom;
-uniform vec2  u_atlasMinTile;  // atlas origin in current zoom tile coords
-uniform vec2  u_atlasTileSize; // atlasTileW, atlasTileH at curZoom
+uniform vec2  u_atlasTileSize;  // atlas size in tile units (e.g. 1..4)
+uniform float u_atlasZoomScale; // 2^(curZoom - prevCurZoom), 1 if unchanged
+uniform vec2  u_atlasDelta;     // newMin - oldMin * scale, in tile units
 
 ${MISSING_GLSL_PREAMBLE}
 
-float hash(vec2 p) {
-  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+// "Hash without sine" by David Hoskins; FP16-safe (every intermediate is in
+// low single-digit magnitude where FP16 has 4-5 digits of resolution).
+vec3 hash33(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yxx) * p3.zyx);
 }
 
 void main() {
   vec4 s = texture(u_state, v_uv);
-  vec2 refPos = s.xy;
+  // Rebase atlas-relative position from previous frame's atlas to current
+  // frame's atlas. For an unchanged atlas, scale=1 and delta=0 → pos = s.xy.
+  vec2 pos = s.xy * u_atlasZoomScale - u_atlasDelta;
   float age = s.z;
 
-  float zf = exp2(u_curZoom - u_refZoom);
-  vec2 curPos = refPos * zf;
-  vec2 atlasUV = (curPos - u_atlasMinTile) / u_atlasTileSize;
+  vec2 atlasUV = pos / u_atlasTileSize;
   bool inAtlas = atlasUV.x >= 0.0 && atlasUV.x <= 1.0
               && atlasUV.y >= 0.0 && atlasUV.y <= 1.0;
   vec2 wind = inAtlas ? texture(u_atlas, atlasUV).rg : vec2(0.0);
   bool noData = !inAtlas || isMissing(wind.x) || isMissing(wind.y);
 
-  // Advect in refZoom tile units. Flip v (texture-up vs canvas-down), divide
-  // by zf so screen-pixel motion stays zoom-invariant.
-  vec2 step = noData ? vec2(0.0) : vec2(wind.x, -wind.y) * u_speed / zf;
-  vec2 newRef = refPos + step;
+  // advect in tile units. Flip v: wind is north-positive, mercator y is
+  // south-positive
+  vec2 step = noData ? vec2(0.0) : vec2(wind.x, -wind.y) * u_stepFactor;
+  vec2 newPos = pos + step;
   age += u_ageStep;
   bool dead = age >= 1.0 || noData;
   if (dead) {
-    // respawn anywhere in atlas extent, convert back to refZoom
-    vec2 randCur = vec2(
-      u_atlasMinTile.x + hash(v_uv + vec2(u_rand))         * u_atlasTileSize.x,
-      u_atlasMinTile.y + hash(v_uv + vec2(u_rand + 1.0))   * u_atlasTileSize.y
-    );
-    newRef = randCur / zf;
-    age = hash(v_uv + vec2(u_rand + 2.0)) * 0.5;
+    vec3 r = hash33(v_uv * 17.0 + vec2(u_rand + s.w * 7.13, u_rand * 3.7));
+    newPos = r.xy * u_atlasTileSize;
+    age = r.z * 0.5;
   }
-  outColor = vec4(newRef, age, s.w);
+  outColor = vec4(newPos, age, s.w);
 }`;
 
-const VS_PARTICLE_DRAW = `#version 300 es
+// Screen-mode draw. Particle state is in atlas-relative tile coords.
+// atlasUV is just pos / atlasTileSize. Map to canvas pixels via u_atlasRect.
+const VS_PARTICLE_DRAW_SCREEN = `#version 300 es
 precision highp float;
 uniform sampler2D u_state;
 uniform sampler2D u_atlas;
@@ -152,10 +172,7 @@ uniform vec4 u_atlasRect;
 uniform vec2 u_screen;
 uniform float u_pointSize;
 uniform vec2 u_speedRange;
-uniform float u_curZoom;
-uniform float u_refZoom;
-uniform vec2  u_atlasMinTile;
-uniform vec2  u_atlasTileSize;
+uniform vec2 u_atlasTileSize;
 out float v_t;
 out float v_age;
 flat out int v_alive;
@@ -167,11 +184,9 @@ void main() {
   int x = i % u_texSize;
   int y = i / u_texSize;
   vec4 s = texelFetch(u_state, ivec2(x, y), 0);
-  vec2 refPos = s.xy;
+  vec2 pos = s.xy;
 
-  float zf = exp2(u_curZoom - u_refZoom);
-  vec2 curPos = refPos * zf;
-  vec2 atlasUV = (curPos - u_atlasMinTile) / u_atlasTileSize;
+  vec2 atlasUV = pos / u_atlasTileSize;
   bool outOfAtlas = atlasUV.x < 0.0 || atlasUV.x > 1.0
                  || atlasUV.y < 0.0 || atlasUV.y > 1.0;
   vec2 wind = outOfAtlas ? vec2(0.0) : texture(u_atlas, atlasUV).rg;
@@ -191,7 +206,63 @@ void main() {
   gl_PointSize = u_pointSize;
 }`;
 
-function buildParticleFS(colormap: Colormap): string {
+const VS_PARTICLE_DRAW_MATRIX = `#version 300 es
+precision highp float;
+uniform sampler2D u_state;
+uniform sampler2D u_atlas;
+uniform int u_texSize;
+uniform float u_pointSize;
+uniform vec2 u_speedRange;
+uniform vec2 u_atlasTileSize;
+out float v_t;
+out float v_age;
+flat out int v_alive;
+
+${MISSING_GLSL_PREAMBLE}
+
+void main() {
+  int i = gl_VertexID;
+  int x = i % u_texSize;
+  int y = i / u_texSize;
+  vec4 s = texelFetch(u_state, ivec2(x, y), 0);
+  vec2 pos = s.xy;
+
+  vec2 atlasUV = pos / u_atlasTileSize;
+  bool outOfAtlas = atlasUV.x < 0.0 || atlasUV.x > 1.0
+                 || atlasUV.y < 0.0 || atlasUV.y > 1.0;
+  vec2 wind = outOfAtlas ? vec2(0.0) : texture(u_atlas, atlasUV).rg;
+  bool noData = outOfAtlas || isMissing(wind.x) || isMissing(wind.y);
+  v_alive = noData ? 0 : 1;
+  float speed = length(wind);
+  v_t = clamp((speed - u_speedRange.x) / max(u_speedRange.y - u_speedRange.x, 1e-30), 0.0, 1.0);
+  v_age = s.z;
+  if (noData) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 0.0;
+    return;
+  }
+  gl_Position = vec4(atlasUV * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = u_pointSize;
+}`;
+
+// matrix-mode composite: draw a subdivided quad over the trail buffer's
+// mercator extent and let projectTile() do the screen projection
+function buildMatrixCompositeVS(shaderData: GlobeShaderData): string {
+  return `#version 300 es
+precision highp float;
+${shaderData.vertexShaderPrelude}
+${shaderData.define}
+layout(location=0) in vec2 a_pos;
+uniform vec4 u_mercExtent;
+out vec2 v_uv;
+void main() {
+  v_uv = a_pos;
+  vec2 merc = mix(u_mercExtent.xy, u_mercExtent.zw, a_pos);
+  gl_Position = projectTile(merc);
+}`;
+}
+
+function buildParticleFS(colormap: Colormap, premultiply: boolean): string {
   return `#version 300 es
 precision highp float;
 in float v_t;
@@ -208,25 +279,29 @@ void main() {
   if (d > 0.25) discard;
   float fade = smoothstep(0.25, 0.08, d);
   vec3 col = colormap(v_t);
-  outColor = vec4(col, fade);
+  ${premultiply
+    ? "outColor = vec4(col * fade, fade);"
+    : "outColor = vec4(col, fade);"}
 }`;
 }
 
-// Trail buffer is canvas-pixel space but the canvas stays pinned at (0,0).
-// Sampling the previous trail at uv minus pan-delta keeps trails world-locked.
 const FS_TRAIL_FADE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 uniform sampler2D u_prev;
 uniform float u_fade;
-uniform vec2  u_panDelta;   // canvas-pixel space (Y down)
+uniform mat3 u_warp;
 void main() {
-  vec2 size = vec2(textureSize(u_prev, 0));
-  // v_uv Y-up vs panDelta Y-down
-  vec2 delta = vec2(u_panDelta.x, -u_panDelta.y);
-  vec2 shifted = v_uv - delta / size;
-  // out-of-buffer UV: treat as empty, otherwise CLAMP_TO_EDGE smears edges
+  vec3 h = u_warp * vec3(v_uv, 1.0);
+  // points behind the camera (or projecting through the camera origin) have
+  // non-positive w after the warp; treat as no previous content.
+  if (h.z <= 0.0) {
+    outColor = vec4(0.0);
+    return;
+  }
+  vec2 shifted = h.xy / h.z;
+  // out-of-buffer: treat as empty so we don't smear with CLAMP_TO_EDGE.
   if (shifted.x < 0.0 || shifted.x > 1.0 || shifted.y < 0.0 || shifted.y > 1.0) {
     outColor = vec4(0.0);
     return;
@@ -250,11 +325,49 @@ interface PingPong {
   i: 0 | 1;
 }
 
+function probeRgba32fFbo(gl: WebGL2RenderingContext): boolean {
+  const tex = gl.createTexture();
+  const fbo = gl.createFramebuffer();
+  if (!tex || !fbo) {
+    if (tex) gl.deleteTexture(tex);
+    if (fbo) gl.deleteFramebuffer(fbo);
+    return false;
+  }
+  const prevTexBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+  let ok = false;
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA32F, 4, 4, 0, gl.RGBA, gl.FLOAT, null,
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0,
+    );
+    ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  } finally {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+    gl.bindTexture(gl.TEXTURE_2D, prevTexBinding);
+    gl.deleteFramebuffer(fbo);
+    gl.deleteTexture(tex);
+  }
+  return ok;
+}
+
+// column-major 3x3, the shape the trail-fade shader expects for u_warp
+type Mat3 = Float32Array;
+const IDENTITY3: Mat3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+
 export class ParticlesRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly source: TileSource;
   private readonly ownsSource: boolean;
   private readonly wmt: WMT;
+  private readonly matrixMode: boolean;
+  private readonly onRedraw?: () => void;
 
   private readonly opts: Required<
     Pick<
@@ -272,13 +385,22 @@ export class ParticlesRenderer {
   private readonly colormap: Colormap;
   private readonly texSize: number;
   private readonly onFrame?: (frameMs: number) => void;
+  // GPU can't reliably render FP32 particle state, so storage falls back to
+  // RGBA16F (see probeRgba32fFbo)
+  private readonly fp16State: boolean;
 
   private readonly progAtlas: WebGLProgram;
   private readonly progAtlasLerp: WebGLProgram;
   private readonly progParticleUpdate: WebGLProgram;
+  // screen-space NDC output (screen) vs mercator-space trail buffer (matrix)
   private readonly progParticleDraw: WebGLProgram;
   private readonly progTrailFade: WebGLProgram;
-  private readonly progComposite: WebGLProgram;
+  private readonly compositePrograms: VariantProgramCache<CompositeProgram>;
+  // set once in screen mode, refreshed per draw() in matrix mode
+  private currentComposite: CompositeProgram | null = null;
+  // subdivided quad so the matrix composite curves on globe
+  private readonly compositeMatrixVAO: WebGLVertexArrayObject | null;
+  private readonly compositeMatrixIndexCount: number;
 
   private readonly quadVAO: WebGLVertexArrayObject;
   private readonly emptyVAO: WebGLVertexArrayObject;
@@ -300,23 +422,22 @@ export class ParticlesRenderer {
   private disposed = false;
   private firstFrame = true;
   private prevViewZoom = -1;
+  // see computeWarp
+  private warp: Mat3 = new Float32Array(IDENTITY3);
   private prevLayerOrigin: [number, number] | null = null;
-  private panDelta: [number, number] = [0, 0];
+  private prevMercExtent: [number, number, number, number] | null = null;
+  // previous frame's atlas min-tile / zoom, for the rebase uniforms
+  private prevAtlasMinTile: [number, number] | null = null;
+  private prevAtlasCurZoom: number | null = null;
 
   state: ParticlesRendererState;
 
   constructor(
-    private readonly canvas: HTMLCanvasElement,
+    gl: WebGL2RenderingContext,
     wmt: WMT,
     options: ParticlesRendererOptions = {},
     source?: TileSource,
   ) {
-    const gl = canvas.getContext("webgl2", {
-      premultipliedAlpha: false,
-      antialias: false,
-      preserveDrawingBuffer: true,
-    }) as WebGL2RenderingContext | null;
-    if (!gl) throw new Error("WebGL2 not supported");
     if (!gl.getExtension("EXT_color_buffer_float")) {
       throw new Error("EXT_color_buffer_float not supported");
     }
@@ -324,6 +445,8 @@ export class ParticlesRenderer {
     gl.getExtension("OES_texture_float_linear");
     this.gl = gl;
     this.wmt = wmt;
+    this.matrixMode = options.matrixMode ?? false;
+    this.onRedraw = options.onRedraw;
 
     this.opts = {
       particleCount: options.particleCount ?? DEFAULTS.particleCount,
@@ -338,6 +461,7 @@ export class ParticlesRenderer {
     };
     this.onFrame = options.onFrame;
     this.colormap = resolveColormap(options.colormap);
+    this.fp16State = !probeRgba32fFbo(gl);
 
     if (source) {
       this.source = source;
@@ -354,11 +478,34 @@ export class ParticlesRenderer {
     this.progParticleUpdate = linkProgram(gl, VS_FULLSCREEN, FS_PARTICLE_UPDATE);
     this.progParticleDraw = linkProgram(
       gl,
-      VS_PARTICLE_DRAW,
-      buildParticleFS(this.colormap),
+      this.matrixMode ? VS_PARTICLE_DRAW_MATRIX : VS_PARTICLE_DRAW_SCREEN,
+      buildParticleFS(this.colormap, false),
     );
     this.progTrailFade = linkProgram(gl, VS_FULLSCREEN, FS_TRAIL_FADE);
-    this.progComposite = linkProgram(gl, VS_FULLSCREEN, FS_COMPOSITE);
+    this.compositePrograms = new VariantProgramCache<CompositeProgram>(
+      gl,
+      this.matrixMode,
+      {
+        buildScreen: (g) => {
+          const program = linkProgram(g, VS_FULLSCREEN, FS_COMPOSITE);
+          return { program, proj: getProjectionUniformLocs(g, program) };
+        },
+        buildMatrix: (g, sd) => {
+          const program = linkProgram(g, buildMatrixCompositeVS(sd), FS_COMPOSITE);
+          return { program, proj: getProjectionUniformLocs(g, program) };
+        },
+        destroy: (g, p) => g.deleteProgram(p.program),
+      },
+    );
+    if (!this.matrixMode) this.currentComposite = this.compositePrograms.get(null);
+    if (this.matrixMode) {
+      const sub = buildSubdividedQuadVAO(gl, GLOBE_SEGMENTS);
+      this.compositeMatrixVAO = sub.vao;
+      this.compositeMatrixIndexCount = sub.indexCount;
+    } else {
+      this.compositeMatrixVAO = null;
+      this.compositeMatrixIndexCount = 0;
+    }
 
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -397,10 +544,14 @@ export class ParticlesRenderer {
 
   setView(tiles: TileDrawRect[]): void {
     if (this.disposed) return;
-    // Trails survive pans (Leaflet re-translates the canvas) but not zoom
-    // changes since the canvas-px to world mapping scales.
+    // screen mode trails don't survive a zoom change (canvas-px to world
+    // mapping scales); matrix mode's mercator warp handles zoom, so no clear
     const newZoom = tiles[0]?.z ?? -1;
-    if (newZoom !== this.prevViewZoom && this.prevViewZoom !== -1) {
+    if (
+      !this.matrixMode &&
+      newZoom !== this.prevViewZoom &&
+      this.prevViewZoom !== -1
+    ) {
       this.firstFrame = true;
     }
     this.prevViewZoom = newZoom;
@@ -429,27 +580,56 @@ export class ParticlesRenderer {
     this.ensureAtlas(uniq);
   }
 
-  resize(widthDevPx: number, heightDevPx: number): void {
+  setViewport(widthDevPx: number, heightDevPx: number): void {
     if (this.disposed) return;
     const w = Math.max(1, widthDevPx | 0);
     const h = Math.max(1, heightDevPx | 0);
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
+    if (this.canvasW === w && this.canvasH === h) return;
     this.canvasW = w;
     this.canvasH = h;
-    this.gl.viewport(0, 0, w, h);
+    if (!this.matrixMode) {
+      this.gl.viewport(0, 0, w, h);
+    }
     this.ensureTrails(w, h);
+    // Resizing invalidates the trail buffer; clear next frame.
+    this.firstFrame = true;
+  }
+
+  // Matrix-mode entry point. Call from the host's render() hook each frame.
+  draw(
+    projData: GlobeProjectionData,
+    shaderData: GlobeShaderData,
+    viewportWPx: number,
+    viewportHPx: number,
+  ): void {
+    if (this.disposed || !this.matrixMode) return;
+    const w = Math.max(1, viewportWPx | 0);
+    const h = Math.max(1, viewportHPx | 0);
+    if (w !== this.canvasW || h !== this.canvasH) {
+      this.canvasW = w;
+      this.canvasH = h;
+      this.ensureTrails(w, h);
+      this.firstFrame = true;
+    }
+    // composite is the only pass that needs the projection prelude
+    this.currentComposite = this.compositePrograms.get(shaderData);
+    this.tick(projData);
+    // Keep the animation going. Adapter wires onRedraw to map.triggerRepaint.
+    if (this.running) this.onRedraw?.();
   }
 
   start(): void {
     if (this.disposed || this.running) return;
     this.running = true;
     this.firstFrame = true;
+    if (this.matrixMode) {
+      // Host drives draw() per frame; just kick the first repaint.
+      this.onRedraw?.();
+      return;
+    }
     const loop = (): void => {
       if (!this.running || this.disposed) return;
-      this.tick();
+      this.tick(null);
       this.raf = requestAnimationFrame(loop);
     };
     this.raf = requestAnimationFrame(loop);
@@ -476,48 +656,82 @@ export class ParticlesRenderer {
     if (this.atlasFBO) gl.deleteFramebuffer(this.atlasFBO);
     gl.deleteVertexArray(this.quadVAO);
     gl.deleteVertexArray(this.emptyVAO);
+    if (this.compositeMatrixVAO) gl.deleteVertexArray(this.compositeMatrixVAO);
     gl.deleteProgram(this.progAtlas);
     gl.deleteProgram(this.progAtlasLerp);
     gl.deleteProgram(this.progParticleUpdate);
     gl.deleteProgram(this.progParticleDraw);
     gl.deleteProgram(this.progTrailFade);
-    gl.deleteProgram(this.progComposite);
+    this.compositePrograms.dispose();
     if (this.ownsSource) this.source.dispose();
   }
 
-  // --- frame ---
+  private computeWarp(): void {
+    if (this.firstFrame) {
+      this.warp.set(IDENTITY3);
+      return;
+    }
+    if (this.matrixMode && this.prevMercExtent) {
+      const c = this.atlasRectDevPx; // current mercExtent (in matrix mode)
+      const p = this.prevMercExtent;
+      const cw = c[2] - c[0];
+      const ch = c[3] - c[1];
+      const pw = p[2] - p[0];
+      const ph = p[3] - p[1];
+      if (cw <= 0 || ch <= 0 || pw <= 0 || ph <= 0) {
+        this.warp.set(IDENTITY3);
+        return;
+      }
+      // old_uv = a * new_uv + b, per axis
+      const ax = cw / pw;
+      const bx = (c[0] - p[0]) / pw;
+      const ay = ch / ph;
+      const by = (c[1] - p[1]) / ph;
+      this.warp.set([ax, 0, 0, 0, ay, 0, bx, by, 1]);
+      return;
+    }
+    if (!this.matrixMode && this.prevLayerOrigin && this.view.length > 0) {
+      const ref = this.view[0];
+      const tilePxW = ref.sx1 - ref.sx0;
+      const tilePxH = ref.sy1 - ref.sy0;
+      const lx = ref.sx0 - ref.x * tilePxW;
+      const ly = ref.sy0 - ref.y * tilePxH;
+      const dx = -(lx - this.prevLayerOrigin[0]) / this.canvasW;
+      const dy = (ly - this.prevLayerOrigin[1]) / this.canvasH;
+      this.warp.set([1, 0, 0, 0, 1, 0, dx, dy, 1]);
+      return;
+    }
+    this.warp.set(IDENTITY3);
+  }
 
-  private tick(): void {
+  private tick(projData: GlobeProjectionData | null): void {
     if (this.canvasW <= 1 || this.canvasH <= 1) return;
     if (this.view.length === 0) return;
     const tStart = performance.now();
 
-    // Delta of layer-origin in canvas px since last tick, used by the trail
-    // fade to keep trails world-locked.
-    const ref = this.view[0];
-    const tilePxW = ref.sx1 - ref.sx0;
-    const tilePxH = ref.sy1 - ref.sy0;
-    const layerOrigin: [number, number] = [
-      ref.sx0 - ref.x * tilePxW,
-      ref.sy0 - ref.y * tilePxH,
-    ];
-    if (this.prevLayerOrigin && !this.firstFrame) {
-      this.panDelta = [
-        layerOrigin[0] - this.prevLayerOrigin[0],
-        layerOrigin[1] - this.prevLayerOrigin[1],
+    this.computeWarp();
+
+    // Stash this frame's mercExtent / layer origin for next frame's warp.
+    if (this.matrixMode) {
+      const c = this.atlasRectDevPx;
+      this.prevMercExtent = [c[0], c[1], c[2], c[3]];
+    } else if (this.view.length > 0) {
+      const ref = this.view[0];
+      const tilePxW = ref.sx1 - ref.sx0;
+      const tilePxH = ref.sy1 - ref.sy0;
+      this.prevLayerOrigin = [
+        ref.sx0 - ref.x * tilePxW,
+        ref.sy0 - ref.y * tilePxH,
       ];
-    } else {
-      this.panDelta = [0, 0];
     }
-    this.prevLayerOrigin = layerOrigin;
 
     const { tF, tC, frac, tP } = this.timeWindow();
     this.requestMissingTiles(tF, tC, tP);
     if (!this.buildAtlas(tF, tC, frac)) return;
 
     this.updateParticles();
-    this.drawTrailAndParticles();
-    this.compositeToCanvas();
+    this.drawTrailAndParticles(projData);
+    this.compositeToHost(projData);
     this.firstFrame = false;
     this.onFrame?.(performance.now() - tStart);
   }
@@ -562,16 +776,17 @@ export class ParticlesRenderer {
     const gl = this.gl;
     const n = this.texSize;
     const init = new Float32Array(n * n * 4);
-    // spread across the whole refZoom grid; out-of-atlas particles respawn on first update
-    const range = 1 << this.wmt.zoomRange.max;
+    // age near 1.0: particles die on the first update and respawn inside the
+    // real atlas, since atlasTileSize isn't known yet. s.w seeds the respawn
     for (let i = 0; i < n * n; i++) {
-      init[i * 4 + 0] = Math.random() * range;
-      init[i * 4 + 1] = Math.random() * range;
-      init[i * 4 + 2] = Math.random();
+      init[i * 4 + 0] = Math.random();
+      init[i * 4 + 1] = Math.random();
+      init[i * 4 + 2] = 0.99 + Math.random() * 0.01;
       init[i * 4 + 3] = Math.random();
     }
+    const internalFormat = this.fp16State ? gl.RGBA16F : gl.RGBA32F;
     const texOpts = {
-      internalFormat: gl.RGBA32F,
+      internalFormat,
       format: gl.RGBA,
       type: gl.FLOAT,
     } as const;
@@ -592,8 +807,9 @@ export class ParticlesRenderer {
       internalFormat: gl.RGBA8,
       format: gl.RGBA,
       type: gl.UNSIGNED_BYTE,
-      filter: "linear", // sub-pixel sampling in the fade pass
-
+      // nearest: bilinear would compound into blur on each non-pixel-aligned
+      // warp; snapping to whole pixels is fine for the fade effect
+      filter: "nearest",
     } as const;
     const t0 = createTexture(gl, w, h, trailOpts);
     const t1 = createTexture(gl, w, h, trailOpts);
@@ -728,28 +944,10 @@ export class ParticlesRenderer {
     return drawn > 0;
   }
 
-  // Atlas origin in current-zoom tile coords, used by the shaders to map
-  // refZoom particle state into atlas UV and screen space.
-  private viewAtlasMeta(): {
-    curZoom: number;
-    minTileX: number;
-    minTileY: number;
-    sizeW: number;
-    sizeH: number;
-  } | null {
-    if (this.view.length === 0) return null;
-    let minX = Infinity, minY = Infinity;
-    for (const t of this.view) {
-      if (t.x < minX) minX = t.x;
-      if (t.y < minY) minY = t.y;
-    }
-    return {
-      curZoom: this.view[0].z,
-      minTileX: minX,
-      minTileY: minY,
-      sizeW: this.atlasTileW,
-      sizeH: this.atlasTileH,
-    };
+  // advection per unit wind, in atlas-relative tile coords per frame. Zoom-
+  // independent: visual mercator speed still scales as tile-speed / 2^zoom.
+  private tileStepFactor(): number {
+    return this.opts.speedFactor;
   }
 
   private updateParticles(): void {
@@ -768,8 +966,8 @@ export class ParticlesRenderer {
     gl.uniform1i(gl.getUniformLocation(this.progParticleUpdate, "u_state"), 0);
     gl.uniform1i(gl.getUniformLocation(this.progParticleUpdate, "u_atlas"), 1);
     gl.uniform1f(
-      gl.getUniformLocation(this.progParticleUpdate, "u_speed"),
-      this.opts.speedFactor,
+      gl.getUniformLocation(this.progParticleUpdate, "u_stepFactor"),
+      this.tileStepFactor(),
     );
     gl.uniform1f(
       gl.getUniformLocation(this.progParticleUpdate, "u_ageStep"),
@@ -779,32 +977,49 @@ export class ParticlesRenderer {
       gl.getUniformLocation(this.progParticleUpdate, "u_rand"),
       Math.random(),
     );
-    const meta = this.viewAtlasMeta();
-    if (meta) {
-      gl.uniform1f(
-        gl.getUniformLocation(this.progParticleUpdate, "u_curZoom"),
-        meta.curZoom,
-      );
-      gl.uniform1f(
-        gl.getUniformLocation(this.progParticleUpdate, "u_refZoom"),
-        this.wmt.zoomRange.max,
-      );
-      gl.uniform2f(
-        gl.getUniformLocation(this.progParticleUpdate, "u_atlasMinTile"),
-        meta.minTileX,
-        meta.minTileY,
-      );
-      gl.uniform2f(
-        gl.getUniformLocation(this.progParticleUpdate, "u_atlasTileSize"),
-        meta.sizeW,
-        meta.sizeH,
-      );
-    }
+    gl.uniform2f(
+      gl.getUniformLocation(this.progParticleUpdate, "u_atlasTileSize"),
+      this.atlasTileW,
+      this.atlasTileH,
+    );
+    const rebase = this.computeAtlasRebase();
+    gl.uniform1f(
+      gl.getUniformLocation(this.progParticleUpdate, "u_atlasZoomScale"),
+      rebase.scale,
+    );
+    gl.uniform2f(
+      gl.getUniformLocation(this.progParticleUpdate, "u_atlasDelta"),
+      rebase.deltaX,
+      rebase.deltaY,
+    );
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.particles.i = dst;
   }
 
-  private drawTrailAndParticles(): void {
+  // rebase from the previous frame's atlas coords to this frame's. Computed
+  // in JS (FP64) so the shader only sees small pre-computed numbers.
+  private computeAtlasRebase(): { scale: number; deltaX: number; deltaY: number } {
+    if (this.view.length === 0) return { scale: 1, deltaX: 0, deltaY: 0 };
+    const curZoom = this.view[0].z;
+    let minX = Infinity, minY = Infinity;
+    for (const t of this.view) {
+      if (t.x < minX) minX = t.x;
+      if (t.y < minY) minY = t.y;
+    }
+    if (this.prevAtlasMinTile === null || this.prevAtlasCurZoom === null) {
+      this.prevAtlasMinTile = [minX, minY];
+      this.prevAtlasCurZoom = curZoom;
+      return { scale: 1, deltaX: 0, deltaY: 0 };
+    }
+    const scale = Math.pow(2, curZoom - this.prevAtlasCurZoom);
+    const deltaX = minX - this.prevAtlasMinTile[0] * scale;
+    const deltaY = minY - this.prevAtlasMinTile[1] * scale;
+    this.prevAtlasMinTile = [minX, minY];
+    this.prevAtlasCurZoom = curZoom;
+    return { scale, deltaX, deltaY };
+  }
+
+  private drawTrailAndParticles(_projData: GlobeProjectionData | null): void {
     const gl = this.gl;
     const src = this.trails.i;
     const dst = (src ^ 1) as 0 | 1;
@@ -821,85 +1036,100 @@ export class ParticlesRenderer {
       gl.getUniformLocation(this.progTrailFade, "u_fade"),
       this.firstFrame ? 0 : this.opts.fadeOpacity,
     );
-    gl.uniform2f(
-      gl.getUniformLocation(this.progTrailFade, "u_panDelta"),
-      this.panDelta[0],
-      this.panDelta[1],
+    gl.uniformMatrix3fv(
+      gl.getUniformLocation(this.progTrailFade, "u_warp"),
+      false,
+      this.warp,
     );
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
+    const drawProg = this.progParticleDraw;
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(this.progParticleDraw);
+    gl.useProgram(drawProg);
     gl.bindVertexArray(this.emptyVAO);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.particles.texs[this.particles.i]);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
-    gl.uniform1i(gl.getUniformLocation(this.progParticleDraw, "u_state"), 0);
-    gl.uniform1i(gl.getUniformLocation(this.progParticleDraw, "u_atlas"), 1);
+    gl.uniform1i(gl.getUniformLocation(drawProg, "u_state"), 0);
+    gl.uniform1i(gl.getUniformLocation(drawProg, "u_atlas"), 1);
     gl.uniform1i(
-      gl.getUniformLocation(this.progParticleDraw, "u_texSize"),
+      gl.getUniformLocation(drawProg, "u_texSize"),
       this.texSize,
     );
-    gl.uniform4f(
-      gl.getUniformLocation(this.progParticleDraw, "u_atlasRect"),
-      ...this.atlasRectDevPx,
-    );
-    gl.uniform2f(
-      gl.getUniformLocation(this.progParticleDraw, "u_screen"),
-      this.canvasW,
-      this.canvasH,
-    );
+    if (!this.matrixMode) {
+      gl.uniform4f(
+        gl.getUniformLocation(drawProg, "u_atlasRect"),
+        ...this.atlasRectDevPx,
+      );
+      gl.uniform2f(
+        gl.getUniformLocation(drawProg, "u_screen"),
+        this.canvasW,
+        this.canvasH,
+      );
+    }
     gl.uniform1f(
-      gl.getUniformLocation(this.progParticleDraw, "u_pointSize"),
+      gl.getUniformLocation(drawProg, "u_pointSize"),
       this.opts.particleSize *
         (Math.min(window.devicePixelRatio || 1, 2)),
     );
     gl.uniform2f(
-      gl.getUniformLocation(this.progParticleDraw, "u_speedRange"),
+      gl.getUniformLocation(drawProg, "u_speedRange"),
       this.opts.speedRange[0],
       this.opts.speedRange[1],
     );
-    const meta = this.viewAtlasMeta();
-    if (meta) {
-      gl.uniform1f(
-        gl.getUniformLocation(this.progParticleDraw, "u_curZoom"),
-        meta.curZoom,
-      );
-      gl.uniform1f(
-        gl.getUniformLocation(this.progParticleDraw, "u_refZoom"),
-        this.wmt.zoomRange.max,
-      );
-      gl.uniform2f(
-        gl.getUniformLocation(this.progParticleDraw, "u_atlasMinTile"),
-        meta.minTileX,
-        meta.minTileY,
-      );
-      gl.uniform2f(
-        gl.getUniformLocation(this.progParticleDraw, "u_atlasTileSize"),
-        meta.sizeW,
-        meta.sizeH,
-      );
-    }
+    gl.uniform2f(
+      gl.getUniformLocation(drawProg, "u_atlasTileSize"),
+      this.atlasTileW,
+      this.atlasTileH,
+    );
     gl.drawArrays(gl.POINTS, 0, this.texSize * this.texSize);
     this.trails.i = dst;
   }
 
-  private compositeToCanvas(): void {
+  private compositeToHost(projData: GlobeProjectionData | null): void {
     const gl = this.gl;
+    const composite = this.currentComposite;
+    if (!composite) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvasW, this.canvasH);
-    gl.disable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(this.progComposite);
-    gl.bindVertexArray(this.quadVAO);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.trails.texs[this.trails.i]);
-    gl.uniform1i(gl.getUniformLocation(this.progComposite, "u_tex"), 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (this.matrixMode) {
+      // trail buffer is non-premultiplied -> straight SRC_ALPHA
+      beginHostFrame(gl, this.canvasW, this.canvasH, "straight");
+    } else {
+      gl.viewport(0, 0, this.canvasW, this.canvasH);
+      gl.disable(gl.BLEND);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+    if (this.matrixMode && projData && this.compositeMatrixVAO) {
+      const prog = composite.program;
+      gl.useProgram(prog);
+      gl.bindVertexArray(this.compositeMatrixVAO);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.trails.texs[this.trails.i]);
+      gl.uniform1i(gl.getUniformLocation(prog, "u_tex"), 0);
+      gl.uniform4f(
+        gl.getUniformLocation(prog, "u_mercExtent"),
+        ...this.atlasRectDevPx,
+      );
+      setProjectionUniforms(gl, composite.proj, projData);
+      gl.drawElements(
+        gl.TRIANGLES,
+        this.compositeMatrixIndexCount,
+        gl.UNSIGNED_SHORT,
+        0,
+      );
+    } else {
+      const prog = composite.program;
+      gl.useProgram(prog);
+      gl.bindVertexArray(this.quadVAO);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.trails.texs[this.trails.i]);
+      gl.uniform1i(gl.getUniformLocation(prog, "u_tex"), 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
   }
 }

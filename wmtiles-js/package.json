@@ -1,7 +1,7 @@
 {
   "name": "wmtiles",
-  "version": "0.4.0",
-  "description": "Pure-TypeScript reader plus WebGL2 renderers (heatmap, animated particles, vector arrows, isobars) and an optional Leaflet adapter for the WMTiles single-file weather data format. Reader runs in browsers, Node, Bun, and Cloudflare Workers; renderers need a WebGL2 canvas.",
+  "version": "0.5.0",
+  "description": "Pure-TypeScript reader plus WebGL2 renderers (heatmap, animated particles, vector arrows, isobars) and optional Leaflet/MapLibre adapters for the WMTiles single-file weather data format. Reader runs in browsers, Node, Bun, and Cloudflare Workers; renderers need a WebGL2 canvas.",
   "keywords": [
     "wmtiles",
     "weather",
@@ -12,6 +12,8 @@
     "webgl",
     "webgl2",
     "leaflet",
+    "maplibre",
+    "maplibre-gl",
     "heatmap",
     "particles",
     "isobars",
@@ -71,6 +73,16 @@
       "import": "./dist/render/arrows.js",
       "require": "./dist/render/arrows.cjs"
     },
+    "./render/symbols": {
+      "types": "./dist/render/symbols.d.ts",
+      "import": "./dist/render/symbols.js",
+      "require": "./dist/render/symbols.cjs"
+    },
+    "./render/hatch": {
+      "types": "./dist/render/hatch.d.ts",
+      "import": "./dist/render/hatch.js",
+      "require": "./dist/render/hatch.cjs"
+    },
     "./render/source": {
       "types": "./dist/render/source.d.ts",
       "import": "./dist/render/source.js",
@@ -85,11 +97,18 @@
       "types": "./dist/adapters/leaflet.d.ts",
       "import": "./dist/adapters/leaflet.js",
       "require": "./dist/adapters/leaflet.cjs"
+    },
+    "./maplibre": {
+      "types": "./dist/adapters/maplibre.d.ts",
+      "import": "./dist/adapters/maplibre.js",
+      "require": "./dist/adapters/maplibre.cjs"
     }
   },
   "sideEffects": [
     "./dist/adapters/leaflet.js",
-    "./dist/adapters/leaflet.cjs"
+    "./dist/adapters/leaflet.cjs",
+    "./dist/adapters/maplibre.js",
+    "./dist/adapters/maplibre.cjs"
   ],
   "repository": {
     "type": "git",
@@ -102,13 +121,14 @@
   "homepage": "https://github.com/hstin-de/wmtiles/tree/main/wmtiles-js#readme",
   "files": [
     "dist",
+    "docs",
     "README.md"
   ],
   "scripts": {
     "prepublishOnly": "bun run typecheck && bun run test && bun run build",
     "build": "bun run build:esm && bun run build:cjs",
     "build:esm": "tsc -p tsconfig.build.json",
-    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs && bun build src/format.ts --outfile dist/format.cjs --target node --format cjs && bun build src/decoder.ts --outfile dist/decoder.cjs --target node --format cjs && bun build src/tileid.ts --outfile dist/tileid.cjs --target node --format cjs && bun build src/errors.ts --outfile dist/errors.cjs --target node --format cjs && bun build src/render/heatmap.ts --outfile dist/render/heatmap.cjs --target browser --format cjs && bun build src/render/particles.ts --outfile dist/render/particles.cjs --target browser --format cjs && bun build src/render/isobar.ts --outfile dist/render/isobar.cjs --target browser --format cjs && bun build src/render/arrows.ts --outfile dist/render/arrows.cjs --target browser --format cjs && bun build src/render/source.ts --outfile dist/render/source.cjs --target browser --format cjs && bun build src/render/colormap.ts --outfile dist/render/colormap.cjs --target browser --format cjs && bun build src/adapters/leaflet.ts --outfile dist/adapters/leaflet.cjs --target browser --format cjs --external leaflet",
+    "build:cjs": "bun build src/index.ts --outfile dist/index.cjs --target node --format cjs && bun build src/format.ts --outfile dist/format.cjs --target node --format cjs && bun build src/decoder.ts --outfile dist/decoder.cjs --target node --format cjs && bun build src/tileid.ts --outfile dist/tileid.cjs --target node --format cjs && bun build src/errors.ts --outfile dist/errors.cjs --target node --format cjs && bun build src/render/heatmap.ts --outfile dist/render/heatmap.cjs --target browser --format cjs && bun build src/render/particles.ts --outfile dist/render/particles.cjs --target browser --format cjs && bun build src/render/isobar.ts --outfile dist/render/isobar.cjs --target browser --format cjs && bun build src/render/arrows.ts --outfile dist/render/arrows.cjs --target browser --format cjs && bun build src/render/symbols.ts --outfile dist/render/symbols.cjs --target browser --format cjs && bun build src/render/hatch.ts --outfile dist/render/hatch.cjs --target browser --format cjs && bun build src/render/source.ts --outfile dist/render/source.cjs --target browser --format cjs && bun build src/render/colormap.ts --outfile dist/render/colormap.cjs --target browser --format cjs && bun build src/adapters/leaflet.ts --outfile dist/adapters/leaflet.cjs --target browser --format cjs --external leaflet && bun build src/adapters/maplibre.ts --outfile dist/adapters/maplibre.cjs --target browser --format cjs --external maplibre-gl",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
@@ -116,16 +136,21 @@
     "fzstd": "^0.1.1"
   },
   "peerDependencies": {
-    "leaflet": "^1.9.0"
+    "leaflet": "^1.9.0",
+    "maplibre-gl": "^5.0.0"
   },
   "peerDependenciesMeta": {
     "leaflet": {
+      "optional": true
+    },
+    "maplibre-gl": {
       "optional": true
     }
   },
   "devDependencies": {
     "typescript": "^5.5.0",
     "bun-types": "latest",
-    "@types/leaflet": "^1.9.0"
+    "@types/leaflet": "^1.9.0",
+    "maplibre-gl": "^5.24.0"
   }
 }

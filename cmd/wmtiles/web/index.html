@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>wmtiles viewer</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
 <style>
   body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #1a1a1a; color: #ddd; }
 
@@ -67,6 +68,9 @@
   #panel .ctrls input[type=range] {
     flex: 1; min-width: 0;
   }
+  #panel .ctrls input[type=file] {
+    flex: 1; min-width: 0; font-size: 10px; color: #aaa;
+  }
   #panel .hint { font-size: 10px; color: #888; margin-left: 4px; min-width: 16px; }
 
   .legend { background: rgba(34,34,34,.92); color: #ddd; padding: 6px 10px; border-radius: 4px; font: 11px/1.3 monospace; }
@@ -77,10 +81,33 @@
   .leaflet-popup-content-wrapper { background: #2a2a2a; color: #ddd; border-radius: 4px; }
   .leaflet-popup-content-wrapper .leaflet-popup-content { font-family: monospace; font-size: 12px; }
   .leaflet-popup-tip { background: #2a2a2a; }
+
+  .maplibregl-popup-content {
+    background: #2a2a2a; color: #ddd; border-radius: 4px;
+    font-family: monospace; font-size: 12px; padding: 8px 10px;
+  }
+  .maplibregl-popup-tip { display: none; }
+  .maplibregl-popup-close-button { color: #ddd; }
+
+  #legend-floating {
+    position: absolute; right: 12px; bottom: 12px; z-index: 1000;
+    background: rgba(34,34,34,.92); color: #ddd; padding: 6px 10px;
+    border-radius: 4px; font: 11px/1.3 monospace;
+  }
+  #legend-floating .bar { width: 160px; height: 12px; margin: 4px 0; background: linear-gradient(to right,
+    rgb(68,1,84), rgb(72,35,116), rgb(64,67,135), rgb(52,94,141), rgb(41,121,142),
+    rgb(32,144,140), rgb(34,167,132), rgb(68,190,112), rgb(253,231,37)); }
+  #legend-floating .row { display: flex; justify-content: space-between; }
 </style>
 </head>
 <body>
 <div id="top">
+  <label>renderer
+    <select id="renderer">
+      <option value="leaflet">Leaflet</option>
+      <option value="maplibre">MapLibre</option>
+    </select>
+  </label>
   <label>time <input id="time" type="range" min="0" max="0" value="0" step="any" disabled> <span id="timeLabel"></span></label>
   <span id="status">opening…</span>
 </div>
@@ -107,6 +134,10 @@
     <div class="ctrls">
       <label><span>u var</span><select id="arrowU" disabled><option value="">— off —</option></select></label>
       <label><span>v var</span><select id="arrowV" disabled><option value="">— off —</option></select></label>
+      <label><span>style</span><select id="arrowStyle">
+        <option value="arrow">arrows</option>
+        <option value="barb">wind barbs</option>
+      </select></label>
     </div>
   </details>
   <details>
@@ -127,6 +158,29 @@
         <span>fill regions</span>
         <input id="isoFill" type="checkbox" disabled>
       </label>
+    </div>
+  </details>
+  <details>
+    <summary>Hatch fill</summary>
+    <div class="ctrls">
+      <label><span>variable</span><select id="hatchVar" disabled><option value="">— off —</option></select></label>
+      <label><span>mode</span><select id="hatchMode">
+        <option value="above">above</option>
+        <option value="below">below</option>
+      </select></label>
+      <label><span>threshold</span><input id="hatchThreshold" type="number" step="any" value="0" disabled></label>
+      <label><span>pattern</span><select id="hatchPattern">
+        <option value="forward">forward /</option>
+        <option value="backward">backward \</option>
+        <option value="cross">cross</option>
+        <option value="horizontal">horizontal</option>
+        <option value="vertical">vertical</option>
+        <option value="dots">dots</option>
+        <option value="icon:warning">icon: warning</option>
+        <option value="icon:dot">icon: dot</option>
+        <option value="icon:upload">icon: upload</option>
+      </select></label>
+      <label><span>icon file</span><input id="hatchIconFile" type="file" accept="image/*"></label>
     </div>
   </details>
 </div>

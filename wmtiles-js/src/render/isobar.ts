@@ -16,6 +16,35 @@ import {
   VS_FULLSCREEN,
 } from "./gl.js";
 import type { TileDrawRect } from "./heatmap.js";
+import {
+  buildSubdividedQuadVAO,
+  getProjectionUniformLocs,
+  setProjectionUniforms,
+  type GlobeProjectionData,
+  type GlobeShaderData,
+  type ProjectionUniformLocs,
+} from "./globe.js";
+import {
+  beginHostFrame,
+  RedrawScheduler,
+  VariantProgramCache,
+} from "./backend.js";
+
+const GLOBE_SEGMENTS = 16;
+
+interface IsobarProgram {
+  program: WebGLProgram;
+  proj: ProjectionUniformLocs; // all-null in screen mode, those uniforms don't exist
+}
+
+function makeIsobarProgram(
+  gl: WebGL2RenderingContext,
+  vs: string,
+  fs: string,
+): IsobarProgram {
+  const program = linkProgram(gl, vs, fs);
+  return { program, proj: getProjectionUniformLocs(gl, program) };
+}
 
 export type { TileDrawRect } from "./heatmap.js";
 
@@ -25,9 +54,6 @@ export interface IsobarRendererOptions extends TileSourceOptions {
   lineWidth?: number; // logical px, scaled by dpr
   alpha?: number;
   majorEvery?: number; // every Nth line at 1.5x opacity, 0 disables
-  // Anchor zoom for `spacing`. Below it, effective spacing doubles per zoom
-  // step out so line density stays roughly constant. null = honour spacing
-  // at every zoom.
   referenceZoom?: number | null;
   // Pyramid downsample levels (NaN-aware 2x2 box). 3-5 is broadcast-style.
   // Internally capped so the smallest mip stays >= 16 texels.
@@ -47,6 +73,12 @@ export interface IsobarRendererOptions extends TileSourceOptions {
   disableTimeLerp?: boolean;
   prefetchNext?: boolean;
   onFrame?: (frameMs: number) => void; // cpu time per draw call
+  // When true: caller drives drawing via draw(matrix, ...) into a shared gl
+  // context; setView tile rects are mercator (0..1); no internal rAF runs.
+  matrixMode?: boolean;
+  // Matrix mode only. Fires when the next draw() would produce a different
+  // result (state, view, tile arrival). Wire to map.triggerRepaint().
+  onRedraw?: () => void;
 }
 
 export interface IsobarRendererState {
@@ -123,7 +155,7 @@ void main() {
   outColor = packR(n > 0.0 ? sum / n : MISSING_SENTINEL);
 }`;
 
-const VS_CONTOUR = `#version 300 es
+const VS_CONTOUR_SCREEN = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 a_pos;
 uniform vec2 u_screen;
@@ -136,17 +168,25 @@ void main() {
   gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
 
-// Reads the smoothed pyramid level. Samples arrive pre-shifted by a baseline
-// (see TileSource): mobile fragment shaders lose precision on absolute values
-// like ~1e5 Pa, so contour math runs in shifted space.
-//
-// baseline = K*spacing + phase, K integer, phase in [0, spacing).
-//   real_v          = v + baseline
-//   nearest_n       = K + round((v + phase) / spacing)
-//   distance        = |v + phase - n_local * spacing|
-//   majorEvery test = mod(u_kMod + n_local, u_majorEvery)
-// K and phase recomputed in JS, see drawContours().
-const FS_CONTOUR = `#version 300 es
+// subdivided quad over the atlas mercator extent, projected via projectTile();
+// the subdivision is what gives globe curvature
+function buildContourMatrixVS(shaderData: GlobeShaderData): string {
+  return `#version 300 es
+precision highp float;
+${shaderData.vertexShaderPrelude}
+${shaderData.define}
+layout(location=0) in vec2 a_pos;
+uniform vec4  u_mercRect;
+out vec2 v_uv;
+void main() {
+  v_uv = a_pos;
+  vec2 mercator = mix(u_mercRect.xy, u_mercRect.zw, a_pos);
+  gl_Position = projectTile(mercator);
+}`;
+}
+
+function buildContourFS(premultiply: boolean): string {
+  return `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
@@ -169,11 +209,6 @@ void main() {
   float n_local = floor(shifted / u_spacing + 0.5);
   float fw = fwidth(v);
   if (fw <= 0.0) discard;
-  // At the data boundary, mobile drivers leak the sentinel from a
-  // discarded neighbour into fwidth() of the 2x2 quad, blowing it up by
-  // orders of magnitude and drawing a spurious ring around the data
-  // region. A real smoothed field has fwidth well under u_spacing, so
-  // anything > 5x is a boundary artefact.
   if (fw > u_spacing * 5.0) discard;
   float distPx = abs(shifted - n_local * u_spacing) / fw;
   float halfW = u_lineWidth * 0.5;
@@ -184,12 +219,16 @@ void main() {
     float m = mod(u_kMod + n_local, u_majorEvery);
     if (m < 0.5 || m > u_majorEvery - 0.5) emphasis = 1.5;
   }
-  outColor = vec4(u_lineColor, aa * u_alpha * emphasis);
+  float a = aa * u_alpha * emphasis;
+  ${premultiply
+    ? "outColor = vec4(u_lineColor * a, a);"
+    : "outColor = vec4(u_lineColor, a);"}
 }`;
+}
 
 // Fills between contours, runs before the contour pass so lines sit on top.
 // Same manual bilinear as FS_CONTOUR since R32F isn't filterable everywhere.
-function buildFillFS(colormap: Colormap): string {
+function buildFillFS(colormap: Colormap, premultiply: boolean): string {
   return `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -206,7 +245,10 @@ void main() {
   float v = bilinearR(u_field, v_uv);
   if (isMissing(v)) discard;
   float t = clamp((v - u_range.x) / max(u_range.y - u_range.x, 1e-30), 0.0, 1.0);
-  outColor = vec4(colormap(t), u_alpha);
+  vec3 rgb = colormap(t);
+  ${premultiply
+    ? "outColor = vec4(rgb * u_alpha, u_alpha);"
+    : "outColor = vec4(rgb, u_alpha);"}
 }`;
 }
 
@@ -247,9 +289,14 @@ export class IsobarRenderer {
   private readonly progAtlas: WebGLProgram;
   private readonly progAtlasLerp: WebGLProgram;
   private readonly progDown: WebGLProgram;
-  private readonly progFill: WebGLProgram;
-  private readonly progContour: WebGLProgram;
+  private readonly fillPrograms: VariantProgramCache<IsobarProgram>;
+  private readonly contourPrograms: VariantProgramCache<IsobarProgram>;
+  private readonly scheduler: RedrawScheduler;
+  private readonly fillColormap: Colormap;
   private readonly quadVAO: WebGLVertexArrayObject;
+  // Subdivided VAO for matrix-mode contour/fill so the quad curves on globe.
+  private readonly contourMatrixVAO: WebGLVertexArrayObject | null;
+  private readonly contourMatrixIndexCount: number;
 
   private atlasTex!: WebGLTexture;
   private atlasFBO!: WebGLFramebuffer;
@@ -258,32 +305,30 @@ export class IsobarRenderer {
   private mips: MipLevel[] = [];
   private builtMipCount = 0;
 
+  private readonly matrixMode: boolean;
   private canvasW = 1;
   private canvasH = 1;
   private view: TileDrawRect[] = [];
+  // Screen mode: bounding box of the visible tile set in canvas device px.
+  // Matrix mode: same set, but in mercator (0..1) units.
   private atlasRectDevPx: [number, number, number, number] = [0, 0, 1, 1];
-  private raf = 0;
+  private mercRect: [number, number, number, number] = [0, 0, 1, 1];
   private disposed = false;
 
   state: IsobarRendererState;
 
   constructor(
-    private readonly canvas: HTMLCanvasElement,
+    gl: WebGL2RenderingContext,
     wmt: WMT,
     options?: IsobarRendererOptions,
     source?: TileSource,
   ) {
-    const gl = canvas.getContext("webgl2", {
-      premultipliedAlpha: false,
-      antialias: false,
-      preserveDrawingBuffer: true,
-    }) as WebGL2RenderingContext | null;
-    if (!gl) throw new Error("WebGL2 not supported");
     if (!gl.getExtension("EXT_color_buffer_float")) {
       throw new Error("EXT_color_buffer_float not supported");
     }
     this.gl = gl;
     this.wmt = wmt;
+    this.matrixMode = options?.matrixMode ?? false;
 
     this.opts = {
       spacing: options?.spacing ?? DEFAULTS.spacing,
@@ -304,7 +349,13 @@ export class IsobarRenderer {
       prefetchNext: options?.prefetchNext ?? DEFAULTS.prefetchNext,
     };
     this.onFrame = options?.onFrame;
-    const fillColormap = resolveColormap(options?.fillColormap ?? "hilow");
+    this.fillColormap = resolveColormap(options?.fillColormap ?? "hilow");
+
+    this.scheduler = new RedrawScheduler(
+      this.matrixMode,
+      () => this.drawInternal(null, null),
+      options?.onRedraw,
+    );
 
     if (source) {
       this.source = source;
@@ -312,7 +363,7 @@ export class IsobarRenderer {
     } else {
       this.source = new TileSource(gl, wmt, {
         ...options,
-        onUpdate: () => this.scheduleDraw(),
+        onUpdate: () => this.scheduler.schedule(),
         // mobile highp demotion mangles (v - vmin)/range and (v - n*spacing) on absolute values
         shiftValuesByBaseline: true,
       });
@@ -322,8 +373,38 @@ export class IsobarRenderer {
     this.progAtlas = linkProgram(gl, VS_ATLAS_SLOT, FS_ATLAS);
     this.progAtlasLerp = linkProgram(gl, VS_ATLAS_SLOT, FS_ATLAS_LERP);
     this.progDown = linkProgram(gl, VS_FULLSCREEN, FS_DOWN);
-    this.progFill = linkProgram(gl, VS_CONTOUR, buildFillFS(fillColormap));
-    this.progContour = linkProgram(gl, VS_CONTOUR, FS_CONTOUR);
+    // matrix mode composites over MapLibre with ONE/ONE_MINUS_SRC_ALPHA, so
+    // the FS must output premultiplied alpha; screen mode uses straight
+    this.fillPrograms = new VariantProgramCache<IsobarProgram>(
+      gl,
+      this.matrixMode,
+      {
+        buildScreen: (g) =>
+          makeIsobarProgram(g, VS_CONTOUR_SCREEN, buildFillFS(this.fillColormap, false)),
+        buildMatrix: (g, sd) =>
+          makeIsobarProgram(g, buildContourMatrixVS(sd), buildFillFS(this.fillColormap, true)),
+        destroy: (g, p) => g.deleteProgram(p.program),
+      },
+    );
+    this.contourPrograms = new VariantProgramCache<IsobarProgram>(
+      gl,
+      this.matrixMode,
+      {
+        buildScreen: (g) =>
+          makeIsobarProgram(g, VS_CONTOUR_SCREEN, buildContourFS(false)),
+        buildMatrix: (g, sd) =>
+          makeIsobarProgram(g, buildContourMatrixVS(sd), buildContourFS(true)),
+        destroy: (g, p) => g.deleteProgram(p.program),
+      },
+    );
+    if (this.matrixMode) {
+      const sub = buildSubdividedQuadVAO(gl, GLOBE_SEGMENTS);
+      this.contourMatrixVAO = sub.vao;
+      this.contourMatrixIndexCount = sub.indexCount;
+    } else {
+      this.contourMatrixVAO = null;
+      this.contourMatrixIndexCount = 0;
+    }
 
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -346,32 +427,32 @@ export class IsobarRenderer {
     if (this.disposed) return;
     Object.assign(this.state, patch);
     this.source.invalidate();
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   setSpacing(spacing: number): void {
     this.opts.spacing = spacing;
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   setSmoothness(smoothness: number): void {
     this.opts.smoothness = Math.max(0, Math.round(smoothness));
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   setFillEnabled(enabled: boolean): void {
     this.opts.fillEnabled = enabled;
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   setFillRange(range: [number, number] | null): void {
     this.opts.fillRange = range;
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   setFillAlpha(alpha: number): void {
     this.opts.fillAlpha = Math.max(0, Math.min(1, alpha));
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
   effectiveSpacing(): number {
@@ -388,7 +469,8 @@ export class IsobarRenderer {
     if (uniq.length === 0) {
       this.view = tiles;
       this.atlasRectDevPx = [0, 0, 1, 1];
-      this.scheduleDraw();
+      this.mercRect = [0, 0, 1, 1];
+      this.scheduler.schedule();
       return;
     }
     this.view = uniq;
@@ -399,30 +481,46 @@ export class IsobarRenderer {
       if (t.sx1 > sx1) sx1 = t.sx1;
       if (t.sy1 > sy1) sy1 = t.sy1;
     }
-    this.atlasRectDevPx = [sx0, sy0, sx1, sy1];
+    if (this.matrixMode) {
+      // sx/sy are mercator (0..1) in matrix mode
+      this.mercRect = [sx0, sy0, sx1, sy1];
+    } else {
+      this.atlasRectDevPx = [sx0, sy0, sx1, sy1];
+    }
     this.ensureAtlas(uniq);
-    this.scheduleDraw();
+    this.scheduler.schedule();
   }
 
-  resize(widthDevPx: number, heightDevPx: number): void {
+  setViewport(widthDevPx: number, heightDevPx: number): void {
     if (this.disposed) return;
     const w = Math.max(1, widthDevPx | 0);
     const h = Math.max(1, heightDevPx | 0);
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
+    if (this.canvasW === w && this.canvasH === h) return;
     this.canvasW = w;
     this.canvasH = h;
-    this.gl.viewport(0, 0, w, h);
-    this.scheduleDraw();
+    if (!this.matrixMode) {
+      this.gl.viewport(0, 0, w, h);
+      this.scheduler.schedule();
+    }
+  }
+
+  // Matrix-mode entry point. Call from the host's render() hook each frame.
+  draw(
+    projData: GlobeProjectionData,
+    shaderData: GlobeShaderData,
+    viewportWPx: number,
+    viewportHPx: number,
+  ): void {
+    if (this.disposed || !this.matrixMode) return;
+    this.canvasW = Math.max(1, viewportWPx | 0);
+    this.canvasH = Math.max(1, viewportHPx | 0);
+    this.drawInternal(projData, shaderData);
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
+    this.scheduler.dispose();
     const gl = this.gl;
     if (this.atlasTex) gl.deleteTexture(this.atlasTex);
     if (this.atlasFBO) gl.deleteFramebuffer(this.atlasFBO);
@@ -432,20 +530,13 @@ export class IsobarRenderer {
     }
     this.mips = [];
     gl.deleteVertexArray(this.quadVAO);
+    if (this.contourMatrixVAO) gl.deleteVertexArray(this.contourMatrixVAO);
     gl.deleteProgram(this.progAtlas);
     gl.deleteProgram(this.progAtlasLerp);
     gl.deleteProgram(this.progDown);
-    gl.deleteProgram(this.progFill);
-    gl.deleteProgram(this.progContour);
+    this.fillPrograms.dispose();
+    this.contourPrograms.dispose();
     if (this.ownsSource) this.source.dispose();
-  }
-
-  private scheduleDraw(): void {
-    if (this.raf || this.disposed) return;
-    this.raf = requestAnimationFrame(() => {
-      this.raf = 0;
-      if (!this.disposed) this.draw();
-    });
   }
 
   private ensureAtlas(tiles: TileDrawRect[]): void {
@@ -618,12 +709,65 @@ export class IsobarRenderer {
     return levelsBuilt;
   }
 
-  private drawFill(sourceTex: WebGLTexture): void {
+  private setHostFramebufferState(): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvasW, this.canvasH);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    if (this.matrixMode) {
+      beginHostFrame(gl, this.canvasW, this.canvasH, "premultiplied");
+    } else {
+      gl.viewport(0, 0, this.canvasW, this.canvasH);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    }
+  }
+
+  private setQuadProjection(
+    prog: IsobarProgram,
+    projData: GlobeProjectionData | null,
+  ): void {
+    const gl = this.gl;
+    if (this.matrixMode && projData) {
+      setProjectionUniforms(gl, prog.proj, projData);
+      gl.uniform4f(
+        gl.getUniformLocation(prog.program, "u_mercRect"),
+        ...this.mercRect,
+      );
+    } else {
+      gl.uniform2f(
+        gl.getUniformLocation(prog.program, "u_screen"),
+        this.canvasW,
+        this.canvasH,
+      );
+      gl.uniform4f(
+        gl.getUniformLocation(prog.program, "u_atlasRect"),
+        ...this.atlasRectDevPx,
+      );
+    }
+  }
+
+  private drawQuad(): void {
+    const gl = this.gl;
+    if (this.matrixMode && this.contourMatrixVAO) {
+      gl.bindVertexArray(this.contourMatrixVAO);
+      gl.drawElements(
+        gl.TRIANGLES,
+        this.contourMatrixIndexCount,
+        gl.UNSIGNED_SHORT,
+        0,
+      );
+    } else {
+      gl.bindVertexArray(this.quadVAO);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+  }
+
+  private drawFill(
+    sourceTex: WebGLTexture,
+    projData: GlobeProjectionData | null,
+    shaderData: GlobeShaderData | null,
+  ): void {
+    const gl = this.gl;
+    this.setHostFramebufferState();
 
     const range = this.opts.fillRange ?? [
       Number.isFinite(this.state.variable.range.min)
@@ -636,38 +780,31 @@ export class IsobarRenderer {
     // texels are stored as (real - baseline), so the range uniform shifts too
     const baseline = this.source.getBaseline(this.state.variable);
 
-    gl.useProgram(this.progFill);
-    gl.bindVertexArray(this.quadVAO);
+    const prog = this.fillPrograms.get(shaderData);
+    gl.useProgram(prog.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, sourceTex);
-    gl.uniform1i(gl.getUniformLocation(this.progFill, "u_field"), 0);
+    gl.uniform1i(gl.getUniformLocation(prog.program, "u_field"), 0);
+    this.setQuadProjection(prog, projData);
     gl.uniform2f(
-      gl.getUniformLocation(this.progFill, "u_screen"),
-      this.canvasW,
-      this.canvasH,
-    );
-    gl.uniform4f(
-      gl.getUniformLocation(this.progFill, "u_atlasRect"),
-      ...this.atlasRectDevPx,
-    );
-    gl.uniform2f(
-      gl.getUniformLocation(this.progFill, "u_range"),
+      gl.getUniformLocation(prog.program, "u_range"),
       range[0] - baseline,
       range[1] - baseline,
     );
     gl.uniform1f(
-      gl.getUniformLocation(this.progFill, "u_alpha"),
+      gl.getUniformLocation(prog.program, "u_alpha"),
       this.opts.fillAlpha,
     );
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.drawQuad();
   }
 
-  private drawContours(sourceTex: WebGLTexture): void {
+  private drawContours(
+    sourceTex: WebGLTexture,
+    projData: GlobeProjectionData | null,
+    shaderData: GlobeShaderData | null,
+  ): void {
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvasW, this.canvasH);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    this.setHostFramebufferState();
 
     const spacing = this.effectiveSpacing();
     // baseline = K*spacing + phase decomposed in JS, shader sees small operands only
@@ -677,52 +814,45 @@ export class IsobarRenderer {
     const majorEvery = this.opts.majorEvery;
     const kMod = majorEvery > 0 ? ((K % majorEvery) + majorEvery) % majorEvery : 0;
 
-    gl.useProgram(this.progContour);
-    gl.bindVertexArray(this.quadVAO);
+    const prog = this.contourPrograms.get(shaderData);
+    gl.useProgram(prog.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, sourceTex);
-    gl.uniform1i(gl.getUniformLocation(this.progContour, "u_field"), 0);
-    gl.uniform2f(
-      gl.getUniformLocation(this.progContour, "u_screen"),
-      this.canvasW,
-      this.canvasH,
-    );
-    gl.uniform4f(
-      gl.getUniformLocation(this.progContour, "u_atlasRect"),
-      ...this.atlasRectDevPx,
-    );
+    gl.uniform1i(gl.getUniformLocation(prog.program, "u_field"), 0);
+    this.setQuadProjection(prog, projData);
     gl.uniform1f(
-      gl.getUniformLocation(this.progContour, "u_spacing"),
+      gl.getUniformLocation(prog.program, "u_spacing"),
       spacing,
     );
     gl.uniform1f(
-      gl.getUniformLocation(this.progContour, "u_phase"),
+      gl.getUniformLocation(prog.program, "u_phase"),
       phase,
     );
     gl.uniform1f(
-      gl.getUniformLocation(this.progContour, "u_kMod"),
+      gl.getUniformLocation(prog.program, "u_kMod"),
       kMod,
     );
     gl.uniform1f(
-      gl.getUniformLocation(this.progContour, "u_lineWidth"),
+      gl.getUniformLocation(prog.program, "u_lineWidth"),
       this.opts.lineWidth *
         Math.min(window.devicePixelRatio || 1, 2),
     );
     gl.uniform3f(
-      gl.getUniformLocation(this.progContour, "u_lineColor"),
+      gl.getUniformLocation(prog.program, "u_lineColor"),
       this.opts.lineColor[0],
       this.opts.lineColor[1],
       this.opts.lineColor[2],
     );
-    gl.uniform1f(gl.getUniformLocation(this.progContour, "u_alpha"), this.opts.alpha);
+    gl.uniform1f(gl.getUniformLocation(prog.program, "u_alpha"), this.opts.alpha);
     gl.uniform1f(
-      gl.getUniformLocation(this.progContour, "u_majorEvery"),
+      gl.getUniformLocation(prog.program, "u_majorEvery"),
       this.opts.majorEvery,
     );
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.drawQuad();
   }
 
   private clearCanvas(): void {
+    if (this.matrixMode) return; // host owns the framebuffer
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvasW, this.canvasH);
@@ -730,7 +860,10 @@ export class IsobarRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
-  private draw(): void {
+  private drawInternal(
+    projData: GlobeProjectionData | null,
+    shaderData: GlobeShaderData | null,
+  ): void {
     if (this.disposed) return;
     if (this.canvasW <= 1 || this.canvasH <= 1) return;
     const tStart = performance.now();
@@ -747,9 +880,6 @@ export class IsobarRenderer {
       return;
     }
 
-    // Smoothness is calibrated at max zoom. The WMT pyramid already
-    // pre-aggregates lower zooms, so we cut one mip per step below max
-    // or the shapes diverge from the colormap.
     const z = this.view[0]?.z ?? this.wmt.zoomRange.max;
     const cutLevels = Math.max(0, this.wmt.zoomRange.max - z);
     const target = Math.max(0, (this.opts.smoothness | 0) - cutLevels);
@@ -760,8 +890,8 @@ export class IsobarRenderer {
         : this.mips[this.builtMipCount - 1].tex;
 
     this.clearCanvas();
-    if (this.opts.fillEnabled) this.drawFill(sourceTex);
-    this.drawContours(sourceTex);
+    if (this.opts.fillEnabled) this.drawFill(sourceTex, projData, shaderData);
+    this.drawContours(sourceTex, projData, shaderData);
     this.onFrame?.(performance.now() - tStart);
   }
 }

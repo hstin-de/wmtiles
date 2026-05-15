@@ -1,10 +1,5 @@
 import type { TileCoord, Variable, WMT } from "../reader.js";
-import {
-  colormapToGLSL,
-  resolveColormap,
-  type BuiltinColormapName,
-  type Colormap,
-} from "./colormap.js";
+import type { RGB } from "./colormap.js";
 import { buildQuadVAO, compileShader } from "./gl.js";
 import { MISSING_GLSL_PREAMBLE } from "./missing.js";
 import { TileSource, type TexRef, type TileSourceOptions } from "./source.js";
@@ -23,39 +18,66 @@ import {
   VariantProgramCache,
 } from "./backend.js";
 
-const GLOBE_SEGMENTS = 16; // subdivision per tile rect, smooth to ~90° arc
+const GLOBE_SEGMENTS = 16;
 
-export interface HeatmapRendererOptions extends TileSourceOptions {
-  colormap?: Colormap | BuiltinColormapName;
+export type HatchPattern =
+  | "forward"
+  | "backward"
+  | "cross"
+  | "horizontal"
+  | "vertical"
+  | "dots";
+
+export interface HatchPatternBand {
+  range: [number, number];
+  pattern: HatchPattern;
+  color?: RGB; // RGB 0..255, matching the colormap stop convention
+  // line gap / stipple pitch, in CSS pixels
+  spacing?: number;
+  // line width / dot radius, in CSS pixels
+  thickness?: number;
   alpha?: number;
+}
+
+export interface HatchIconBand {
+  range: [number, number];
+  // a URL the renderer loads, or an already-decoded image
+  icon: string | TexImageSource;
+  // cell pitch (icon-to-icon gap), in CSS pixels
+  spacing?: number;
+  // drawn icon size within the cell, in CSS pixels; defaults to spacing
+  iconSize?: number;
+  alpha?: number;
+}
+
+export type HatchBand = HatchPatternBand | HatchIconBand;
+
+function isIconBand(b: HatchBand): b is HatchIconBand {
+  return "icon" in b;
+}
+
+export interface HatchRendererOptions extends TileSourceOptions {
+  bands?: HatchBand[];
   childFallback?: boolean;
   prefetchNext?: boolean;
   disableTimeLerp?: boolean;
-  onFrame?: (frameMs: number) => void; // cpu time per draw, for FPS overlays
-  // caller drives draw(), tile rects are mercator (0..1), no internal rAF;
-  // for sharing a host's GL context (e.g. MapLibre custom layer)
+  // device-pixels-per-CSS-pixel, so screen-space patterns match on retina
+  pixelRatio?: number;
+  onFrame?: (frameMs: number) => void;
   matrixMode?: boolean;
-  // matrix mode only: fires when the next draw() would differ. Wire to
-  // map.triggerRepaint()
   onRedraw?: () => void;
 }
 
-export interface HeatmapRendererState {
+export interface HatchRendererState {
   variable: Variable;
   t: number;
-  vmin: number;
-  vmax: number;
 }
 
 export interface TileDrawRect {
   z: number;
-  x: number; // wrapped, [0, 2^z), use for cache lookup / fetch
+  x: number;
   y: number;
-  // un-wrapped column. equals x on canonical world, differs by 2^z on wrap
-  // copies. atlas-style renderers filter to worldX === x.
   worldX: number;
-  // screen-mode: device pixels. matrix-mode: mercator world units (0..1, can
-  // go negative or above 1 for east/west wrap copies).
   sx0: number;
   sy0: number;
   sx1: number;
@@ -63,11 +85,69 @@ export interface TileDrawRect {
 }
 
 const DEFAULTS = {
-  alpha: 0.85,
   childFallback: true,
   prefetchNext: true,
   disableTimeLerp: false,
+  pixelRatio: 1,
 } as const;
+
+const PATTERN_DEFAULTS = {
+  color: [40, 40, 40] as RGB,
+  spacing: 8,
+  thickness: 2,
+  alpha: 1,
+};
+
+const ICON_DEFAULTS = {
+  spacing: 28,
+  alpha: 1,
+};
+
+const PATTERN_KIND: Record<HatchPattern, number> = {
+  forward: 0,
+  backward: 1,
+  cross: 2,
+  horizontal: 3,
+  vertical: 4,
+  dots: 5,
+};
+
+// GLSL has no infinity literal; clamp to a large finite value just in case.
+function glslFloat(v: number): string {
+  if (!Number.isFinite(v)) return v > 0 ? "1e30" : "-1e30";
+  // toFixed keeps it a float literal even for integers
+  return v.toFixed(6);
+}
+
+// 1x1 transparent stand-in so an icon band can be bound and drawn (as nothing)
+// while its real image is still loading.
+function createIconTexture(gl: WebGL2RenderingContext): WebGLTexture {
+  const tex = gl.createTexture();
+  if (!tex) throw new Error("createTexture failed");
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(
+    gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+    new Uint8Array([0, 0, 0, 0]),
+  );
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+function uploadIconImage(
+  gl: WebGL2RenderingContext,
+  tex: WebGLTexture,
+  image: TexImageSource,
+): void {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // a shared host context may have left these on; icon UVs assume the image's
+  // natural top-left origin and straight (un-premultiplied) alpha
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+}
 
 const VS_SCREEN = `#version 300 es
 precision highp float;
@@ -82,7 +162,6 @@ void main() {
   gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
 
-// projectTile() comes from MapLibre's prelude, handles mercator and globe
 function buildMatrixVS(shaderData: GlobeShaderData): string {
   return `#version 300 es
 precision highp float;
@@ -98,32 +177,104 @@ void main() {
 }`;
 }
 
-function buildFS(colormap: Colormap, premultiply: boolean): string {
+const PATTERN_GLSL = `
+// perpendicular distance to the nearest line center, AA'd to ~1px
+float lineCov(float coord, float spacing, float thickness) {
+  float d = abs(mod(coord, spacing) - spacing * 0.5);
+  float half_t = thickness * 0.5;
+  return 1.0 - smoothstep(half_t - 1.0, half_t + 1.0, d);
+}
+// diagonals are projected so spacing/thickness stay true perpendicular px
+float patternCov(int kind, float spacing, float thickness) {
+  vec2 fc = gl_FragCoord.xy;
+  if (kind == 0) return lineCov((fc.x + fc.y) * 0.70710678, spacing, thickness);
+  if (kind == 1) return lineCov((fc.x - fc.y) * 0.70710678, spacing, thickness);
+  if (kind == 2) return max(
+    lineCov((fc.x + fc.y) * 0.70710678, spacing, thickness),
+    lineCov((fc.x - fc.y) * 0.70710678, spacing, thickness));
+  if (kind == 3) return lineCov(fc.y, spacing, thickness);
+  if (kind == 4) return lineCov(fc.x, spacing, thickness);
+  // dots: stipple grid, thickness is the dot radius
+  vec2 cell = mod(fc, spacing) - spacing * 0.5;
+  return 1.0 - smoothstep(thickness - 1.0, thickness + 1.0, length(cell));
+}
+`;
+
+function buildFS(bands: HatchBand[], premultiply: boolean): string {
+  // icon bands each get a sampler, on texture units 2, 3, ... (0/1 are data)
+  let iconIndex = 0;
+  const samplerDecls: string[] = [];
+
+  const bandCode = bands
+    .map((b, i) => {
+      if (isIconBand(b)) {
+        const k = iconIndex++;
+        samplerDecls.push(`uniform sampler2D u_icon${k};`);
+        const spacing = b.spacing ?? ICON_DEFAULTS.spacing;
+        const iconSize = b.iconSize ?? spacing;
+        const alpha = b.alpha ?? ICON_DEFAULTS.alpha;
+        return `  // band ${i} (icon)
+  if (v >= u_bandMin[${i}] && v < u_bandMax[${i}]) {
+    float pitch = ${glslFloat(spacing)} * u_dpr;
+    float isz = ${glslFloat(iconSize)} * u_dpr;
+    vec2 cell = mod(gl_FragCoord.xy, pitch) - 0.5 * pitch;
+    vec2 q = cell / isz + 0.5;
+    if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
+      vec4 ic = texture(u_icon${k}, vec2(q.x, 1.0 - q.y));
+      float a = ic.a * ${glslFloat(alpha)};
+      acc.rgb = mix(acc.rgb, ic.rgb, a);
+      acc.a = acc.a + a * (1.0 - acc.a);
+    }
+  }`;
+      }
+      const color = b.color ?? PATTERN_DEFAULTS.color;
+      const spacing = b.spacing ?? PATTERN_DEFAULTS.spacing;
+      const thickness = b.thickness ?? PATTERN_DEFAULTS.thickness;
+      const alpha = b.alpha ?? PATTERN_DEFAULTS.alpha;
+      const kind = PATTERN_KIND[b.pattern];
+      const rgb =
+        `vec3(${(color[0] / 255).toFixed(5)}, ` +
+        `${(color[1] / 255).toFixed(5)}, ${(color[2] / 255).toFixed(5)})`;
+      return `  // band ${i}
+  if (v >= u_bandMin[${i}] && v < u_bandMax[${i}]) {
+    float c = patternCov(${kind}, ${glslFloat(spacing)} * u_dpr, ` +
+        `${glslFloat(thickness)} * u_dpr) * ${glslFloat(alpha)};
+    acc.rgb = mix(acc.rgb, ${rgb}, c);
+    acc.a = acc.a + c * (1.0 - acc.a);
+  }`;
+    })
+    .join("\n");
+
+  // band edges live in uniforms, not baked literals: samples reach the shader
+  // shifted by the source baseline, so the draw call shifts the edges to match
   return `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 uniform sampler2D u_texA;
 uniform sampler2D u_texB;
-uniform vec2 u_range;
-uniform float u_alpha;
+${samplerDecls.join("\n")}
 uniform vec2 u_uvOffA;
 uniform vec2 u_uvScaleA;
 uniform vec2 u_uvOffB;
 uniform vec2 u_uvScaleB;
 uniform float u_lerp;
+uniform float u_dpr;
+uniform float u_bandMin[${bands.length}];
+uniform float u_bandMax[${bands.length}];
 
 ${MISSING_GLSL_PREAMBLE}
-${colormapToGLSL(colormap)}
+${PATTERN_GLSL}
 
 void main() {
   float vA = texture(u_texA, u_uvOffA + v_uv * u_uvScaleA).r;
   float vB = texture(u_texB, u_uvOffB + v_uv * u_uvScaleB).r;
   if (isMissing(vA) || isMissing(vB)) discard;
   float v = mix(vA, vB, u_lerp);
-  float t = (v - u_range.x) / max(u_range.y - u_range.x, 1e-30);
-  vec3 rgb = colormap(t);
-  ${premultiply ? "outColor = vec4(rgb * u_alpha, u_alpha);" : "outColor = vec4(rgb, u_alpha);"}
+  vec4 acc = vec4(0.0);
+${bandCode}
+  if (acc.a <= 0.0) discard;
+  ${premultiply ? "outColor = vec4(acc.rgb * acc.a, acc.a);" : "outColor = acc;"}
 }`;
 }
 
@@ -131,8 +282,6 @@ interface ProgramHandles {
   program: WebGLProgram;
   uScreen: WebGLUniformLocation | null;
   uRect: WebGLUniformLocation | null;
-  uRange: WebGLUniformLocation | null;
-  uAlpha: WebGLUniformLocation | null;
   uTexA: WebGLUniformLocation | null;
   uTexB: WebGLUniformLocation | null;
   uUvOffA: WebGLUniformLocation | null;
@@ -140,33 +289,19 @@ interface ProgramHandles {
   uUvOffB: WebGLUniformLocation | null;
   uUvScaleB: WebGLUniformLocation | null;
   uLerp: WebGLUniformLocation | null;
+  uDpr: WebGLUniformLocation | null;
+  uBandMin: WebGLUniformLocation | null;
+  uBandMax: WebGLUniformLocation | null;
+  // one sampler location per icon band, in band order
+  uIcons: (WebGLUniformLocation | null)[];
   proj: ProjectionUniformLocs;
-}
-
-function buildScreenProgram(
-  gl: WebGL2RenderingContext,
-  colormap: Colormap,
-): ProgramHandles {
-  return buildProgram(gl, VS_SCREEN, buildFS(colormap, false));
-}
-
-// premultiplied output, MapLibre composites with ONE/ONE_MINUS_SRC_ALPHA
-function buildMatrixProgram(
-  gl: WebGL2RenderingContext,
-  colormap: Colormap,
-  shaderData: GlobeShaderData,
-): ProgramHandles {
-  return buildProgram(
-    gl,
-    buildMatrixVS(shaderData),
-    buildFS(colormap, true),
-  );
 }
 
 function buildProgram(
   gl: WebGL2RenderingContext,
   vsSrc: string,
   fsSrc: string,
+  iconCount: number,
 ): ProgramHandles {
   const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
   const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
@@ -183,8 +318,6 @@ function buildProgram(
     program,
     uScreen: gl.getUniformLocation(program, "u_screen"),
     uRect: gl.getUniformLocation(program, "u_rect"),
-    uRange: gl.getUniformLocation(program, "u_range"),
-    uAlpha: gl.getUniformLocation(program, "u_alpha"),
     uTexA: gl.getUniformLocation(program, "u_texA"),
     uTexB: gl.getUniformLocation(program, "u_texB"),
     uUvOffA: gl.getUniformLocation(program, "u_uvOffA"),
@@ -192,25 +325,38 @@ function buildProgram(
     uUvOffB: gl.getUniformLocation(program, "u_uvOffB"),
     uUvScaleB: gl.getUniformLocation(program, "u_uvScaleB"),
     uLerp: gl.getUniformLocation(program, "u_lerp"),
+    uDpr: gl.getUniformLocation(program, "u_dpr"),
+    uBandMin: gl.getUniformLocation(program, "u_bandMin"),
+    uBandMax: gl.getUniformLocation(program, "u_bandMax"),
+    uIcons: Array.from({ length: iconCount }, (_, k) =>
+      gl.getUniformLocation(program, `u_icon${k}`),
+    ),
     proj: getProjectionUniformLocs(gl, program),
   };
 }
 
-export class HeatmapRenderer {
+export class HatchRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly matrixMode: boolean;
   private readonly programs: VariantProgramCache<ProgramHandles>;
   private readonly scheduler: RedrawScheduler;
   private readonly vao: WebGLVertexArrayObject;
-  private readonly indexCount: number; // 0 in screen mode, plain quad has no indices
+  private readonly indexCount: number;
   private readonly source: TileSource;
   private readonly ownsSource: boolean;
-  private readonly colormap: Colormap;
+  private readonly bands: HatchBand[];
+  // band edges shifted by the source baseline, refreshed per draw
+  private readonly bandMin: Float32Array;
+  private readonly bandMax: Float32Array;
+  // band indices that are icon bands, in band order; iconTextures[k] is the
+  // sprite for iconBands[k], bound to texture unit 2 + k
+  private readonly iconBands: number[];
+  private readonly iconTextures: WebGLTexture[];
 
   private readonly opts: Required<
     Pick<
-      HeatmapRendererOptions,
-      "alpha" | "childFallback" | "prefetchNext" | "disableTimeLerp"
+      HatchRendererOptions,
+      "childFallback" | "prefetchNext" | "disableTimeLerp"
     >
   >;
   private readonly onFrame?: (frameMs: number) => void;
@@ -218,33 +364,47 @@ export class HeatmapRenderer {
   private disposed = false;
   private viewportW = 1;
   private viewportH = 1;
+  private dpr: number;
 
-  state: HeatmapRendererState;
+  state: HatchRendererState;
 
   constructor(
     gl: WebGL2RenderingContext,
     private readonly wmt: WMT,
-    options?: HeatmapRendererOptions,
+    options?: HatchRendererOptions,
     source?: TileSource,
   ) {
     this.gl = gl;
     this.matrixMode = options?.matrixMode ?? false;
 
-    this.colormap = resolveColormap(options?.colormap);
+    // one open-ended forward hatch is the do-nothing-surprising default
+    this.bands = options?.bands?.length
+      ? options.bands
+      : [{ range: [-Infinity, Infinity], pattern: "forward" }];
+    this.bandMin = new Float32Array(this.bands.length);
+    this.bandMax = new Float32Array(this.bands.length);
+    this.iconBands = [];
+    this.bands.forEach((b, i) => {
+      if (isIconBand(b)) this.iconBands.push(i);
+    });
+    this.iconTextures = this.iconBands.map(() => createIconTexture(gl));
+    const iconCount = this.iconBands.length;
     this.opts = {
-      alpha: options?.alpha ?? DEFAULTS.alpha,
       childFallback: options?.childFallback ?? DEFAULTS.childFallback,
       prefetchNext: options?.prefetchNext ?? DEFAULTS.prefetchNext,
       disableTimeLerp: options?.disableTimeLerp ?? DEFAULTS.disableTimeLerp,
     };
+    this.dpr = options?.pixelRatio ?? DEFAULTS.pixelRatio;
     this.onFrame = options?.onFrame;
 
     this.programs = new VariantProgramCache<ProgramHandles>(
       gl,
       this.matrixMode,
       {
-        buildScreen: (g) => buildScreenProgram(g, this.colormap),
-        buildMatrix: (g, sd) => buildMatrixProgram(g, this.colormap, sd),
+        buildScreen: (g) =>
+          buildProgram(g, VS_SCREEN, buildFS(this.bands, false), iconCount),
+        buildMatrix: (g, sd) =>
+          buildProgram(g, buildMatrixVS(sd), buildFS(this.bands, true), iconCount),
         destroy: (g, p) => g.deleteProgram(p.program),
       },
     );
@@ -270,14 +430,12 @@ export class HeatmapRenderer {
       this.source = new TileSource(gl, wmt, {
         ...options,
         onUpdate: () => this.scheduler.schedule(),
-        // mobile highp collapses (largeVal - largeVal), pre-shift to keep deltas small
         shiftValuesByBaseline: true,
       });
       this.ownsSource = true;
     }
 
     if (!this.matrixMode) {
-      // Screen mode owns the GL context; set persistent blend state once.
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     }
@@ -285,12 +443,37 @@ export class HeatmapRenderer {
     this.state = {
       variable: wmt.variables[0],
       t: 0,
-      vmin: 0,
-      vmax: 1,
     };
+
+    // start icon loads; until each resolves the band draws its transparent
+    // placeholder texture, then reschedules
+    this.iconBands.forEach((bandIdx, k) => {
+      this.loadIcon(
+        (this.bands[bandIdx] as HatchIconBand).icon,
+        this.iconTextures[k],
+      );
+    });
   }
 
-  setState(patch: Partial<HeatmapRendererState>): void {
+  private loadIcon(src: string | TexImageSource, tex: WebGLTexture): void {
+    if (typeof src !== "string") {
+      uploadIconImage(this.gl, tex, src);
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = (): void => {
+      if (this.disposed) return;
+      uploadIconImage(this.gl, tex, img);
+      this.scheduler.schedule();
+    };
+    img.onerror = (): void => {
+      console.error(`wmtiles: failed to load hatch icon "${src}"`);
+    };
+    img.src = src;
+  }
+
+  setState(patch: Partial<HatchRendererState>): void {
     if (this.disposed) return;
     Object.assign(this.state, patch);
     this.source.invalidate();
@@ -303,8 +486,14 @@ export class HeatmapRenderer {
     this.scheduler.schedule();
   }
 
-  // Screen mode: updates canvas-backed GL viewport. Caller resizes the canvas
-  // itself, then calls this. Matrix mode: caller passes viewport via draw().
+  setPixelRatio(ratio: number): void {
+    if (this.disposed) return;
+    const r = ratio > 0 ? ratio : 1;
+    if (this.dpr === r) return;
+    this.dpr = r;
+    this.scheduler.schedule();
+  }
+
   setViewport(widthDevPx: number, heightDevPx: number): void {
     if (this.disposed) return;
     const w = Math.max(1, widthDevPx | 0);
@@ -318,8 +507,6 @@ export class HeatmapRenderer {
     }
   }
 
-  // Matrix mode entry point. Call from the host's per-frame render hook with
-  // MapLibre's projectionData + shaderData.
   draw(
     projData: GlobeProjectionData,
     shaderData: GlobeShaderData,
@@ -338,6 +525,7 @@ export class HeatmapRenderer {
     this.scheduler.dispose();
     this.programs.dispose();
     this.gl.deleteVertexArray(this.vao);
+    for (const tex of this.iconTextures) this.gl.deleteTexture(tex);
     if (this.ownsSource) this.source.dispose();
   }
 
@@ -422,11 +610,17 @@ export class HeatmapRenderer {
       return;
     }
 
-    const { variable, t, vmin, vmax } = this.state;
+    const { variable, t } = this.state;
     const { tF, tC, frac, tP } = computeTimeWindow(this.wmt, t, this.opts);
 
-    // samples were shifted in source.ts, shift the range uniform to match
+    // samples were shifted in source.ts; shift band edges to match. open ends
+    // stay clamped far outside any real range.
     const baseline = this.source.getBaseline(variable);
+    for (let i = 0; i < this.bands.length; i++) {
+      const [lo, hi] = this.bands[i].range;
+      this.bandMin[i] = Number.isFinite(lo) ? lo - baseline : -1e30;
+      this.bandMax[i] = Number.isFinite(hi) ? hi - baseline : 1e30;
+    }
 
     gl.useProgram(prog.program);
     gl.bindVertexArray(this.vao);
@@ -435,10 +629,18 @@ export class HeatmapRenderer {
     } else {
       gl.uniform2f(prog.uScreen, this.viewportW, this.viewportH);
     }
-    gl.uniform2f(prog.uRange, vmin - baseline, vmax - baseline);
-    gl.uniform1f(prog.uAlpha, this.opts.alpha);
+    gl.uniform1f(prog.uDpr, this.dpr);
+    gl.uniform1fv(prog.uBandMin, this.bandMin);
+    gl.uniform1fv(prog.uBandMax, this.bandMax);
     gl.uniform1i(prog.uTexA, 0);
     gl.uniform1i(prog.uTexB, 1);
+    // icon sprites stay bound for the whole tile loop on units 2, 3, ...;
+    // drawPair only touches units 0/1
+    for (let k = 0; k < this.iconTextures.length; k++) {
+      gl.activeTexture(gl.TEXTURE0 + 2 + k);
+      gl.bindTexture(gl.TEXTURE_2D, this.iconTextures[k]);
+      gl.uniform1i(prog.uIcons[k], 2 + k);
+    }
 
     const maxZ = this.wmt.zoomRange.max;
     const childOK = this.opts.childFallback;

@@ -1,70 +1,78 @@
-# Leaflet Adapter
+# MapLibre Adapter
 
-The Leaflet adapter in `wmtiles/leaflet` turns a `WMT` file into Leaflet
-overlay layers. It provides WebGL-backed `L.Layer` implementations for heatmaps,
-particles, arrows, and isobars.
+The MapLibre adapter in `wmtiles/maplibre` turns a `WMT` file into MapLibre
+custom layers. It provides WebGL2-backed `CustomLayerInterface` implementations
+for heatmaps, particles, arrows, and isobars.
 
-The layers read visible tiles directly from the `WMT` instance, update on pan,
-zoom, and resize, and clean up their WebGL resources when removed from the map.
+Unlike the Leaflet adapter, these are true MapLibre custom layers. They share
+MapLibre's GL2 context, render inside MapLibre's own frame, and do not insert
+an overlay canvas. Because they hook MapLibre's projection, they render
+correctly under both the `mercator` and `globe` projections.
+
+The layers read visible tiles directly from the `WMT` instance, update on move
+and resize, and clean up their WebGL resources when removed from the map.
 
 ## Installation
 
 ```sh
-bun add wmtiles leaflet
+bun add wmtiles maplibre-gl
 # or
-npm install wmtiles leaflet
+npm install wmtiles maplibre-gl
 ```
 
-In browser bundlers, also import Leaflet's CSS:
+In browser bundlers, also import MapLibre's CSS:
 
 ```ts
-import "leaflet/dist/leaflet.css";
+import "maplibre-gl/dist/maplibre-gl.css";
 ```
 
-The adapter requires a browser environment with Leaflet. All layers require
-WebGL2. `Particles`, `Arrows`, and `Isobar` also require
-`EXT_color_buffer_float`.
+The adapter requires a browser environment with MapLibre GL JS 5 or newer. All
+layers require a WebGL2 MapLibre context. `Particles`, `Arrows`, and `Isobar`
+also require `EXT_color_buffer_float`.
 
 ## Quickstart
 
 ```ts
-import L from "leaflet";
-import "leaflet/dist/leaflet.css";
+import maplibregl from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
 import { open } from "wmtiles";
-import "wmtiles/leaflet"; // side-effect: registers the Leaflet backend
+import "wmtiles/maplibre"; // side-effect: registers the MapLibre backend
 
 const wmt = await open("/data/weather.wmt");
 
-const map = L.map("map", {
-  zoomControl: true,
-}).fitBounds([
-  [wmt.bbox.south, wmt.bbox.west],
-  [wmt.bbox.north, wmt.bbox.east],
-]);
+const map = new maplibregl.Map({
+  container: "map",
+  style: "https://demotiles.maplibre.org/style.json",
+  bounds: [
+    [wmt.bbox.west, wmt.bbox.south],
+    [wmt.bbox.east, wmt.bbox.north],
+  ],
+});
 
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  attribution: "&copy; OpenStreetMap contributors",
-}).addTo(map);
+map.on("load", () => {
+  wmt.createHeatmapLayer({
+    variable: "temperature_2m",
+    t: 0,
+    vmin: 260,
+    vmax: 305,
+    colormap: "viridis",
+  }).addTo(map);
 
-const heatmap = wmt.createHeatmapLayer({
-  variable: "temperature_2m",
-  t: 0,
-  vmin: 260,
-  vmax: 305,
-  colormap: "viridis",
-}).addTo(map);
-
-const wind = wmt.createParticlesLayer({
-  uVar: "10u",
-  vVar: "10v",
-  t: 0,
-  particleCount: 4096,
-  particleSize: 2,
-  colormap: "white",
-}).addTo(map);
+  wmt.createParticlesLayer({
+    uVar: "10u",
+    vVar: "10v",
+    t: 0,
+    particleCount: 4096,
+    particleSize: 2,
+    colormap: "white",
+  }).addTo(map);
+});
 ```
 
-The Leaflet container needs an explicit size:
+Add layers after the map's `load` event. `addTo()` calls `map.addLayer()`
+internally, which requires the style to be ready.
+
+The MapLibre container needs an explicit size:
 
 ```css
 #map {
@@ -73,15 +81,27 @@ The Leaflet container needs an explicit size:
 }
 ```
 
+### Globe projection
+
+The layers work unchanged under the globe projection. Switch projections
+whenever you like; the next frame re-projects the data:
+
+```ts
+map.on("load", () => {
+  map.setProjection({ type: "globe" });
+  wmt.createHeatmapLayer({ variable: "temperature_2m" }).addTo(map);
+});
+```
+
 ## Imports
 
-Importing `wmtiles/leaflet` for its side effect registers the Leaflet backend.
-The layer factories live on the `WMT` instance; they work once a backend is
-registered:
+Importing `wmtiles/maplibre` for its side effect registers the MapLibre
+backend. The layer factories live on the `WMT` instance; they work once a
+backend is registered:
 
 ```ts
 import { open } from "wmtiles";
-import "wmtiles/leaflet";
+import "wmtiles/maplibre";
 
 const wmt = await open("/data/weather.wmt");
 
@@ -91,14 +111,15 @@ wmt.createArrowsLayer({ uVar: "10u", vVar: "10v" }).addTo(map);
 wmt.createIsobarLayer({ variable: "pressure_msl", spacing: 400 }).addTo(map);
 ```
 
-`wmt.create*Layer(...)` returns an adapter-neutral handle; `addTo(map)` picks
-the backend that matches the map. The factory names and handle are identical
-for Leaflet and MapLibre, so the same code targets either renderer just by
-importing the other adapter. Drive the layer afterwards with `setState()`,
-`remove()`, and (for isobars) `setSpacing()` and friends.
+`wmt.create*Layer(...)` returns an adapter-neutral handle. `addTo(map, beforeId?)`
+picks the backend that matches the map and, for MapLibre, accepts an optional
+`beforeId` to control style-layer order. The same factory names and handle work
+for Leaflet, so the same code targets either renderer just by importing the
+other adapter. Drive the layer afterwards with `setState()`, `remove()`, and
+(for isobars) `setSpacing()` and friends.
 
 Detection is duck-typed from the map object. To skip it (wrapped/proxied maps,
-or future library changes), set `backend: "leaflet"` in the layer options.
+or future library changes), set `backend: "maplibre"` in the layer options.
 
 ## Layers
 
@@ -155,10 +176,10 @@ const particles = wmt.createParticlesLayer({
 }).addTo(map);
 ```
 
-The particle renderer owns its own `requestAnimationFrame` loop. The adapter
-starts it when the layer is added to the map and stops it when the layer is
-removed. During Leaflet zoom animations, particles are briefly paused and then
-realigned.
+The particle animation rides MapLibre's render loop: the renderer calls
+`map.triggerRepaint()` each frame instead of owning a separate
+`requestAnimationFrame` loop. The adapter starts the animation when the layer
+is added and stops it when the layer is removed.
 
 ```ts
 particles.setState({
@@ -244,29 +265,33 @@ layer.setState({ t: 10 });
 Do not mutate `state` directly. Use `setState()` so cache invalidation, tile
 loading, and redraw scheduling happen correctly.
 
+`setState()` works before `addTo(map)`: patches are queued on the handle and
+replayed once the layer is added. Reading `state` before `addTo(map)` throws,
+since no renderer exists yet.
+
 The layer state shapes are:
 
 ```ts
-type HeatmapState = {
+type HeatmapRendererState = {
   variable: Variable;
   t: number;
   vmin: number;
   vmax: number;
 };
 
-type ParticlesState = {
+type ParticlesRendererState = {
   uVar: Variable;
   vVar: Variable;
   t: number;
 };
 
-type ArrowsState = {
+type ArrowsRendererState = {
   uVar: Variable;
   vVar: Variable;
   t: number;
 };
 
-type IsobarState = {
+type IsobarRendererState = {
   variable: Variable;
   t: number;
 };
@@ -277,6 +302,12 @@ If a layer is created without a variable option, the renderer initially uses
 `uVar` and `vVar` explicitly.
 
 ## Options
+
+### MapLibre Layer Options
+
+| Option | Type | Default | Description |
+|---|---:|---:|---|
+| `id` | `string` | auto-generated | MapLibre style layer id. Auto-generated as `wmtiles-maplibre-<kind>-<n>` when omitted. The Leaflet backend ignores it. |
 
 ### Common Options
 
@@ -293,9 +324,10 @@ These options are accepted by all adapter layers:
 | `onFrame` | `(frameMs: number) => void` | - | Callback with CPU time per draw or tick. Useful for performance overlays. |
 | `backend` | `"leaflet" \| "maplibre"` | auto-detected | Forces a backend instead of detecting it from the map passed to `addTo()`. |
 
-`onUpdate` and `shiftValuesByBaseline` come from the internal
-`TileSourceOptions` type. For normal Leaflet usage, do not set them; the adapter
-configures them where needed.
+`onUpdate`, `onRedraw`, `matrixMode`, and `shiftValuesByBaseline` come from the
+internal renderer option types. Do not set them; the adapter configures them
+where needed. In particular, `matrixMode` is always forced on so the renderers
+use MapLibre's projection.
 
 ### Heatmap Options
 
@@ -423,12 +455,16 @@ import type {
   ParticlesLayerOptions,
   ArrowsLayerOptions,
   IsobarLayerOptions,
+  WMTLayer,
   WMTHeatmapLayer,
   WMTParticlesLayer,
   WMTArrowsLayer,
   WMTIsobarLayer,
 } from "wmtiles";
 ```
+
+`WMTHeatmapLayer` etc. are the handle returned by `wmt.create*Layer(...)`; they
+are the same types whether the layer ends up on a Leaflet or a MapLibre map.
 
 The renderer option and state types are exported from the same place:
 
@@ -449,7 +485,12 @@ A typical time-control handler:
 
 ```ts
 function setTime(
-  layers: Array<WMTHeatmapLayer | WMTParticlesLayer | WMTArrowsLayer | WMTIsobarLayer>,
+  layers: Array<
+    | WMTHeatmapLayer
+    | WMTParticlesLayer
+    | WMTArrowsLayer
+    | WMTIsobarLayer
+  >,
   t: number,
 ) {
   for (const layer of layers) {
@@ -460,7 +501,7 @@ function setTime(
 
 ## Combining Layers
 
-Multiple WMTiles layers can be active in the same Leaflet map:
+Multiple WMTiles layers can be active in the same MapLibre map:
 
 ```ts
 const heat = wmt.createHeatmapLayer({
@@ -484,9 +525,18 @@ const pressure = wmt.createIsobarLayer({
 }).addTo(map);
 ```
 
-The adapter inserts canvases into Leaflet's `overlayPane`. Use the order of
-`addTo(map)` calls to control visual stacking. The canvases use
-`pointer-events: none`, so normal Leaflet map interaction keeps working.
+Because these are real MapLibre style layers, their stacking is controlled by
+MapLibre's layer order. Pass a `beforeId` as the second `addTo` argument to
+insert a layer below an existing style layer:
+
+```ts
+wmt.createHeatmapLayer({ variable: "temperature_2m" })
+  .addTo(map, "some-label-layer");
+```
+
+To reorder later, use `map.moveLayer(...)` with the style layer id, which
+defaults to `wmtiles-maplibre-<kind>-<n>` (set it explicitly with the `id`
+option if you need a stable handle).
 
 ## Removing Layers
 
@@ -496,8 +546,11 @@ Call `remove()` on the handle:
 heatmap.remove();
 ```
 
-This removes event listeners, disposes the renderer, and removes the canvas from
-the DOM. For particles, it also stops the animation loop.
+This removes the `move` and `resize` listeners, disposes the renderer, and
+releases its GPU resources. For particles, it also stops the animation.
+
+Removing the whole style (`map.setStyle(...)`) also triggers `onRemove()` for
+each layer.
 
 ## Errors and Notes
 
@@ -505,8 +558,13 @@ the DOM. For particles, it also stops the animation loop.
 - `setState()` expects `Variable` objects, not names. Use `wmt.variable("name")`.
 - `t` is a numeric time index. If your UI works with dates, resolve the
   matching WMT time-axis index in application code.
-- Browsers without WebGL2 cannot create adapter layers.
+- Add layers after the map's `load` event; `addTo()` calls `map.addLayer()`,
+  which needs a loaded style.
+- The layers require a WebGL2 MapLibre context. `onAdd` throws if MapLibre
+  hands them a WebGL1 context.
 - Without `EXT_color_buffer_float`, `Particles`, `Arrows`, and `Isobar` cannot
   be created.
+- The layers render under both the `mercator` and `globe` projections. You can
+  switch projections at runtime.
 - For large datasets or many simultaneous layers, choose `cacheSize`
   deliberately. Each layer owns its own GPU tile cache.

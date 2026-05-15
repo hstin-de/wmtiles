@@ -9,12 +9,6 @@ export interface TileSourceOptions {
   // "auto" probes R32F and falls back to R16F on drivers that silently zero
   // R32F uploads (iOS Safari, some Mali/Adreno).
   tileTextureFormat?: "r32f" | "r16f" | "auto";
-  // Subtracts variable.range.min from every uploaded sample. Renderer must
-  // mirror the shift on any range uniform via getBaseline(). Needed for
-  // layers doing (v - vmin)/range where mobile highp gets demoted to FP16
-  // and large absolute values (e.g. surface pressure ~1e5 Pa) collapse the
-  // colormap to one colour. Off by default: breaks layers that read
-  // absolute quantities (wind, isobar contours).
   shiftValuesByBaseline?: boolean;
 }
 
@@ -30,9 +24,6 @@ const DEFAULTS = {
   parentFallbackLevels: 6,
 } as const;
 
-// Round-trip a known value through upload + sample + readback. Some older
-// Mali/Adreno accept 1x1 float uploads but zero out tile-sized ones, so we
-// probe at the real tile size.
 const PROBE_VAL = 0.5;
 function probeFloatTexture(
   gl: WebGL2RenderingContext,
@@ -50,6 +41,15 @@ function probeFloatTexture(
   if (!tex || !fbo || !colorTex || !vbo || !vao || !vs || !fs || !prog) {
     return false;
   }
+  // Snapshot state the probe is about to mutate so it can be restored. Matters
+  // when the gl context is shared with a host (e.g. MapLibre custom layer).
+  const prevViewport = gl.getParameter(gl.VIEWPORT) as Int32Array;
+  const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
+  const prevArrBuf = gl.getParameter(gl.ARRAY_BUFFER_BINDING) as WebGLBuffer | null;
+  const prevVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null;
+  const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+  const prevActiveTex = gl.getParameter(gl.ACTIVE_TEXTURE) as number;
+  const prevBlend = gl.isEnabled(gl.BLEND);
   let ok = false;
   try {
     const data = new Float32Array(size * size).fill(PROBE_VAL);
@@ -120,10 +120,6 @@ void main() { outColor = vec4(texture(u_tex, v_uv).r, 0.0, 0.0, 1.0); }`);
     ok = out[0] >= 100 && out[0] <= 156; // 0.5 * 255 ≈ 128, plus rounding slack
     return ok;
   } finally {
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    gl.bindVertexArray(null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.bindTexture(gl.TEXTURE_2D, null);
     gl.deleteProgram(prog);
     gl.deleteShader(vs);
     gl.deleteShader(fs);
@@ -132,6 +128,17 @@ void main() { outColor = vec4(texture(u_tex, v_uv).r, 0.0, 0.0, 1.0); }`);
     gl.deleteFramebuffer(fbo);
     gl.deleteTexture(colorTex);
     gl.deleteTexture(tex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, prevArrBuf);
+    gl.bindVertexArray(prevVao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+    gl.activeTexture(prevActiveTex);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.useProgram(prevProgram);
+    gl.viewport(
+      prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3],
+    );
+    if (prevBlend) gl.enable(gl.BLEND);
+    else gl.disable(gl.BLEND);
   }
 }
 
@@ -173,9 +180,6 @@ function rendererString(gl: WebGL2RenderingContext): string {
   return `${vendor} / ${renderer}`;
 }
 
-// Per-WMT tile-data manager. Shared across renderer strategies so the LRU
-// covers all variables. Fetches are deduped per (variable, time) batch and
-// results after invalidate() are dropped.
 export class TileSource {
   private readonly gl: WebGL2RenderingContext;
   private readonly wmt: WMT;
@@ -327,11 +331,6 @@ export class TileSource {
     const tex = gl.createTexture();
     if (!tex) return;
 
-    // NaN -> sentinel + optional baseline shift, fused into the diagnostics
-    // sweep so it stays one pass. Both fixes work around mobile GLSL: NaN
-    // doesn't round-trip on Apple/Mali/Adreno, and highp gets demoted so
-    // (v - vmin) collapses when both sides are ~1e5. Caller doesn't retain
-    // `pixels`, so mutation in place is fine.
     dataDiag.tilesUploaded++;
     let nans = 0;
     const head: number[] = [];
