@@ -17,6 +17,44 @@ function load(name: string): Uint8Array {
   return new Uint8Array(readFileSync(resolve(TESTDATA, name)));
 }
 
+test("opens rawgrid.wmt and samples bilinearly", async () => {
+  const r = await open(load("rawgrid.wmt"));
+  expect(r.variables.length).toBe(1);
+  expect(r.variables[0].name).toBe("temp");
+
+  const v = r.variable("temp");
+
+  // Encoded with: lat0=30, lon0=0, dy=0.5, dx=0.5, value = lat + lon/1000.
+  // (0, 0) -> 30; (5, 5) -> 32.5 + 0.0025 = 32.5025
+  const v00 = await v.sample({ time: 0, lat: 30, lon: 0 });
+  expect(Number(v00)).toBeGreaterThan(29.99);
+  expect(Number(v00)).toBeLessThan(30.01);
+
+  const v55 = await v.sample({ time: 0, lat: 30 + 5 * 0.5, lon: 0 + 5 * 0.5 });
+  expect(Number(v55)).toBeGreaterThan(32.49);
+  expect(Number(v55)).toBeLessThan(32.52);
+
+  // Out of bounds → NaN.
+  const oob = await v.sample({ time: 0, lat: 90, lon: 0 });
+  expect(Number.isNaN(Number(oob))).toBe(true);
+
+  // Batch.
+  const batch = await v.samples({
+    time: 0,
+    points: [
+      { lat: 30, lon: 0 },
+      { lat: 30 + 5 * 0.5, lon: 0 + 5 * 0.5 },
+      { lat: 90, lon: 0 },
+    ],
+  });
+  expect(batch.length).toBe(3);
+  expect(Number.isNaN(batch[2])).toBe(true);
+
+  // Tile-pyramid API rejects raw-grid blocks (returns null).
+  const tile = await v.tile({ time: 0, z: 0, x: 0, y: 0 });
+  expect(tile).toBeNull();
+});
+
 test("opens minimal.wmt", async () => {
   const r = await open(load("minimal.wmt"));
   expect(r.snapshotGeneration).toBe(0);

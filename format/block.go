@@ -14,6 +14,8 @@ const BlockFormatVersion uint16 = 2
 const (
 	BlockFlagHasLeafDirectories uint16 = 1 << 0
 	BlockFlagHasDict            uint16 = 1 << 1
+	// BlockFlagRawGrid is defined in rawgrid.go and re-exported here for
+	// readers that switch on flags in one place.
 )
 
 // When BlockFlagHasDict is set, DictLength bytes are stored at the tail of the

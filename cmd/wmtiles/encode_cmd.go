@@ -187,8 +187,13 @@ func runEncode(c *encodeCmd) error {
 
 	ui.Section("Settings")
 	ui.KV("source format", formatLabel)
-	ui.KVf("zoom range", "%d..%d", c.MinZoom, c.MaxZoom)
-	ui.KVf("tile size", "%d px", 1<<c.TileSizeLog2)
+	if c.NoTiles {
+		ui.KV("mode", "raw-grid (no tile pyramid)")
+		ui.KVf("raw chunk size", "%d px", 1<<c.RawChunkSizeLog2)
+	} else {
+		ui.KVf("zoom range", "%d..%d", c.MinZoom, c.MaxZoom)
+		ui.KVf("tile size", "%d px", 1<<c.TileSizeLog2)
+	}
 	if c.Filter == "" {
 		ui.KV("filter", "all source variables")
 	} else {
@@ -232,14 +237,16 @@ func runEncode(c *encodeCmd) error {
 	}
 
 	opts := encode.Options{
-		TileSize:          1 << c.TileSizeLog2,
-		MinZoom:           c.MinZoom,
-		MaxZoom:           c.MaxZoom,
-		Precision:         overrides,
-		Metadata:          map[string]any{"sourceFormat": formatLabel, "sourceCount": len(inputs)},
-		DisableDeltaCodec: c.DisableDeltaCodec,
-		ZstdLevel:         c.ZstdLevel,
-		EnableTileDict:    c.TileDict,
+		TileSize:             1 << c.TileSizeLog2,
+		MinZoom:              c.MinZoom,
+		MaxZoom:              c.MaxZoom,
+		NoTiles:              c.NoTiles,
+		RawGridChunkSizeLog2: c.RawChunkSizeLog2,
+		Precision:            overrides,
+		Metadata:             map[string]any{"sourceFormat": formatLabel, "sourceCount": len(inputs)},
+		DisableDeltaCodec:    c.DisableDeltaCodec,
+		ZstdLevel:            c.ZstdLevel,
+		EnableTileDict:       c.TileDict,
 		OnInputScanned: func(name string, records int) {
 			if scanPhase == nil {
 				scanStart.Store(time.Now().UnixNano())

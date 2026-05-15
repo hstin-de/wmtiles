@@ -61,11 +61,13 @@ type AppendCtx struct {
 	specByName map[string]VariableSpec
 
 	// blockMu guards blocks, declarations, variables, idByName, specByName and timeCatalog
-	blockMu        sync.RWMutex
-	blocks         map[blockKey]*blockBuilder
-	declarations   []blockKey
-	allowReplace   bool
-	existingBlocks map[blockKey]struct{}
+	blockMu         sync.RWMutex
+	blocks          map[blockKey]*blockBuilder
+	declarations    []blockKey
+	rawBlocks       map[blockKey]*rawGridBlockBuilder
+	rawDeclarations []blockKey
+	allowReplace    bool
+	existingBlocks  map[blockKey]struct{}
 
 	// flushedEntries accumulates block-table entries from incremental flushes
 	// (FlushPendingBlocks) so the final snapshot merges all new blocks even
@@ -413,6 +415,62 @@ func (a *AppendCtx) DeclareBlock(spec BlockSpec) error {
 	return nil
 }
 
+// Variable must be RegisterVariable'd first; TimeStep must lie within the
+// registered time axis. Block is finalised immediately, queued for writing.
+func (a *AppendCtx) EncodeRawGridBlock(spec RawGridSpec, values []float32) error {
+	if err := a.checkErr(); err != nil {
+		return err
+	}
+	a.blockMu.Lock()
+	id, ok := a.idByName[spec.Variable]
+	if !ok {
+		a.blockMu.Unlock()
+		return fmt.Errorf("EncodeRawGridBlock: variable %q not registered (call RegisterVariable first)", spec.Variable)
+	}
+	if int64(spec.TimeStep) >= a.timeCatalog.Count {
+		a.blockMu.Unlock()
+		return fmt.Errorf("EncodeRawGridBlock %q t=%d: time step out of range [0, %d)",
+			spec.Variable, spec.TimeStep, a.timeCatalog.Count)
+	}
+	k := blockKey{variableID: id, timeID: spec.TimeStep}
+	if _, dup := a.blocks[k]; dup {
+		a.blockMu.Unlock()
+		return fmt.Errorf("EncodeRawGridBlock %q t=%d: already declared as tiled block", spec.Variable, spec.TimeStep)
+	}
+	if a.rawBlocks != nil {
+		if _, dup := a.rawBlocks[k]; dup {
+			a.blockMu.Unlock()
+			return fmt.Errorf("EncodeRawGridBlock %q t=%d: already encoded in this session", spec.Variable, spec.TimeStep)
+		}
+	}
+	if _, exists := a.existingBlocks[k]; exists && !a.allowReplace {
+		a.blockMu.Unlock()
+		return fmt.Errorf("EncodeRawGridBlock %q t=%d: block already exists in file (use AllowReplace)", spec.Variable, spec.TimeStep)
+	}
+	a.blockMu.Unlock()
+
+	bb, err := encodeRawGridBlock(spec, id, values, a.header.InternalCompression, a.zstdLevel)
+	if err != nil {
+		return err
+	}
+
+	a.blockMu.Lock()
+	defer a.blockMu.Unlock()
+	if a.rawBlocks == nil {
+		a.rawBlocks = make(map[blockKey]*rawGridBlockBuilder)
+	}
+	a.rawBlocks[k] = bb
+	a.rawDeclarations = append(a.rawDeclarations, k)
+	v := &a.variables[id]
+	if math.IsNaN(v.ValueMinObservedGlobal) || bb.vmin < v.ValueMinObservedGlobal {
+		v.ValueMinObservedGlobal = bb.vmin
+	}
+	if math.IsNaN(v.ValueMaxObservedGlobal) || bb.vmax > v.ValueMaxObservedGlobal {
+		v.ValueMaxObservedGlobal = bb.vmax
+	}
+	return nil
+}
+
 func (a *AppendCtx) Submit(t Tile) error {
 	if err := a.checkErr(); err != nil {
 		return err
@@ -501,23 +559,31 @@ func (a *AppendCtx) FlushPendingBlocks() error {
 	a.blockMu.Lock()
 	decls := a.declarations
 	blocks := a.blocks
+	rawDecls := a.rawDeclarations
+	rawBlocks := a.rawBlocks
 	a.declarations = nil
 	a.blocks = make(map[blockKey]*blockBuilder)
+	a.rawDeclarations = nil
+	a.rawBlocks = nil
 	a.blockMu.Unlock()
-	if len(decls) == 0 {
+	if len(decls) == 0 && len(rawDecls) == 0 {
 		return nil
 	}
-	return a.compressAndWriteBatch(decls, blocks, nil, nil)
+	return a.compressAndWriteBatch(decls, blocks, rawDecls, rawBlocks, nil, nil)
 }
 
 // compressAndWriteBatch finishes the given blocks in parallel, writes them
 // sequentially at a.cursor, accumulates block-table entries into
 // a.flushedEntries and releases each block's memory after its write. Callers
 // own the slice/map (FlushPendingBlocks snapshots them under blockMu first;
-// Finish runs after workers stop and owns them directly).
+// Finish runs after workers stop and owns them directly). Raw-grid blocks
+// are already finalised at submit time; they ride the same writer pass for
+// cursor accounting.
 func (a *AppendCtx) compressAndWriteBatch(
 	decls []blockKey,
 	blocks map[blockKey]*blockBuilder,
+	rawDecls []blockKey,
+	rawBlocks map[blockKey]*rawGridBlockBuilder,
 	compressCb func(int, uint64),
 	writeCb func(idx int, total int, n uint64),
 ) error {
@@ -530,8 +596,9 @@ func (a *AppendCtx) compressAndWriteBatch(
 	if _, err := a.out.Seek(int64(a.cursor), 0); err != nil {
 		return fmt.Errorf("seek: %w", err)
 	}
-	total := len(decls)
-	for i, k := range decls {
+	total := len(decls) + len(rawDecls)
+	idx := 0
+	for _, k := range decls {
 		bb := blocks[k]
 		off := a.cursor
 		n, err := bb.writeBlockTo(a.out)
@@ -541,8 +608,24 @@ func (a *AppendCtx) compressAndWriteBatch(
 		a.cursor += uint64(n)
 		a.flushedEntries = append(a.flushedEntries, bb.blockTableEntry(off))
 		if writeCb != nil {
-			writeCb(i, total, uint64(n))
+			writeCb(idx, total, uint64(n))
 		}
+		idx++
+		bb.release()
+	}
+	for _, k := range rawDecls {
+		bb := rawBlocks[k]
+		off := a.cursor
+		n, err := bb.writeBlockTo(a.out)
+		if err != nil {
+			return fmt.Errorf("write raw block (var=%d t=%d): %w", k.variableID, k.timeID, err)
+		}
+		a.cursor += uint64(n)
+		a.flushedEntries = append(a.flushedEntries, bb.blockTableEntry(off))
+		if writeCb != nil {
+			writeCb(idx, total, uint64(n))
+		}
+		idx++
 		bb.release()
 	}
 	return nil
@@ -569,7 +652,7 @@ func (a *AppendCtx) Finish() error {
 		// Drain whatever the caller didn't FlushPendingBlocks already. With
 		// per-file flushing this is typically the final file's blocks; with
 		// no incremental flushing this is everything, exactly like before.
-		residual := len(a.declarations)
+		residual := len(a.declarations) + len(a.rawDeclarations)
 		if residual > 0 {
 			a.firePhase("compress_blocks")
 			var compressCb func(int, uint64)
@@ -587,9 +670,13 @@ func (a *AppendCtx) Finish() error {
 			}
 			decls := a.declarations
 			blocks := a.blocks
+			rawDecls := a.rawDeclarations
+			rawBlocks := a.rawBlocks
 			a.declarations = nil
 			a.blocks = make(map[blockKey]*blockBuilder)
-			if e := a.compressAndWriteBatch(decls, blocks, compressCb, writeCb); e != nil {
+			a.rawDeclarations = nil
+			a.rawBlocks = nil
+			if e := a.compressAndWriteBatch(decls, blocks, rawDecls, rawBlocks, compressCb, writeCb); e != nil {
 				err = e
 				a.cleanupOnErr()
 				return

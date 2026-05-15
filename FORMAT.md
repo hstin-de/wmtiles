@@ -366,6 +366,7 @@ Block flag bits:
 |---:|---|---|
 | `0` | `has_leaf_directories` | The block has leaf directories |
 | `1` | `has_dict` | The block carries a per-block zstd dictionary |
+| `2` | `raw_grid` | Block stores a native source-grid raster instead of a Hilbert tile pyramid; see "Raw-Grid Blocks" below |
 
 Other bits are reserved.
 
@@ -569,6 +570,103 @@ The payload is zstd-compressed vertical deltas. This codec is valid for `u8` and
 - The first row is stored unchanged.
 - Each following row stores `current - value_above`.
 - Arithmetic wraps modulo `2^(8 * dtype_bytes)`.
+
+### Raw-Grid Blocks
+
+Files encoded with `--no-tiles` skip the Web-Mercator pyramid. Each
+`(variable_id, time_id)` pair becomes one **raw-grid block** that stores the
+native source lat-lon grid chunked into fixed-size sub-tiles. Point queries by
+`(lat, lon)` are O(1) range requests; the file does not drive a slippy-map
+viewer without on-the-fly resampling.
+
+A raw-grid block reuses the 64-byte block header with `BlockFlagRawGrid`
+(`1 << 2`) set in `block_flags`. Field interpretation changes:
+
+- `root_directory_offset` and `root_directory_length` point at the compressed
+  raw-grid section (the equivalent of the tile directory).
+- `leaf_directories_offset` and `leaf_directories_length` are zero.
+- `tile_data_offset` and `tile_data_length` describe the concatenated chunk
+  payload region.
+- `num_addressed_tiles` and `num_directory_entries` hold the total chunk count
+  (`chunk_count_x * chunk_count_y`).
+- `num_tile_contents` holds the deduplicated chunk count.
+
+The block-table entry's `codec` is the dominant chunk codec ID for stats; each
+chunk payload still carries its own one-byte codec tag.
+
+#### Raw-Grid Section
+
+The raw-grid section is internally compressed (same compression as the file's
+catalogs and directories). After decompression:
+
+| Offset | Size | Type | Field |
+|---:|---:|---|---|
+| `0` | 1 | `u8` | `schema_version`, currently `1` |
+| `1` | 1 | `u8` | `chunk_size_log2`; chunk side in source pixels = `1 << value` |
+| `2` | 2 | bytes | Reserved, written as zero |
+| `4` | 4 | `u32` | `nx`, source grid width in pixels |
+| `8` | 4 | `u32` | `ny`, source grid height in pixels |
+| `16` | 8 | `f64` | `lat0`, latitude at source row `0` |
+| `24` | 8 | `f64` | `lon0`, longitude at source column `0` |
+| `32` | 8 | `f64` | `dy`, latitude step per row (may be negative) |
+| `40` | 8 | `f64` | `dx`, longitude step per column (may be negative) |
+| `48` | 8 | `f64` | `missing_value`, source NoData sentinel (may be NaN) |
+| `56` | 4 | `u32` | `chunk_count_x`, = `ceil(nx / chunk_size)` |
+| `60` | 4 | `u32` | `chunk_count_y`, = `ceil(ny / chunk_size)` |
+| `64` | varint × N | LEB128 `u64` each | `chunk_offsets`, one per chunk row-major |
+| ... | varint × N | LEB128 `u64` each | `chunk_lengths`, one per chunk row-major |
+
+`chunk_size_log2` must be in `[4, 12]`, allowing chunk sides of 16..4096
+source pixels. `N = chunk_count_x * chunk_count_y`. Chunk index is
+`cy * chunk_count_x + cx`, so chunks are stored in row-major order.
+
+`chunk_offsets[i]` is a byte offset relative to the block's `tile_data_offset`.
+`chunk_lengths[i]` is the chunk payload length. A `(0, 0)` pair signals
+**absent chunk**; decoders fill all pixels with NaN without fetching anything.
+
+#### Chunk Payloads
+
+Each chunk payload is a normal tile blob: one codec tag byte followed by the
+codec-specific stream. The current encoder uses `0x01` (constant) when all
+quantised values in the chunk are identical, otherwise `0x03`
+(bitshuffle + zstd). Lorenzo and delta codecs are not emitted for raw-grid
+chunks because edge chunks at the right/bottom border may be non-square.
+
+Chunk pixel count is `chunk_width(cx) * chunk_height(cy)` where:
+
+```text
+chunk_width(cx)  = min(chunk_size, nx - cx*chunk_size)
+chunk_height(cy) = min(chunk_size, ny - cy*chunk_size)
+```
+
+Pixels inside a chunk are row-major: `chunk[row*chunk_width + col]` is the
+quantised value at source coordinates `(cx*chunk_size + col, cy*chunk_size + row)`,
+which corresponds to lat/lon `(lat0 + (cy*chunk_size + row)*dy, lon0 + (cx*chunk_size + col)*dx)`.
+
+#### Point Sampling
+
+To compute the value at `(lat, lon)`:
+
+1. Compute source-grid coordinates `gx = (lon - lon0) / dx`,
+   `gy = (lat - lat0) / dy`. NaN or out-of-range inputs return NaN.
+2. Find the four neighbours `(x0, y0)`, `(x1, y0)`, `(x0, y1)`, `(x1, y1)` with
+   `x0 = floor(gx)`, `y0 = floor(gy)`, `x1 = x0+1`, `y1 = y0+1` clamped to
+   `[0, nx-1]` / `[0, ny-1]`.
+3. For each neighbour, locate the chunk `cx = x / chunk_size`,
+   `cy = y / chunk_size`, fetch and decode the chunk, then read the pixel.
+4. Bilinearly interpolate: `wx = gx - x0`, `wy = gy - y0`,
+   `v = ((1-wx)*v00 + wx*v10)*(1-wy) + ((1-wx)*v01 + wx*v11)*wy`.
+   If any neighbour is NaN, the result is NaN.
+
+For batched queries the reader unions the chunk indices touched by all points
+(including the 2×2 bilinear neighbourhood) and coalesces adjacent chunk byte
+ranges into shared HTTP-range requests, the same strategy as tile coalescing.
+
+A raw-grid file's header records `min_zoom = 0`, `max_zoom = 0`, and the
+authoritative signal that consumers should branch on is `BlockFlagRawGrid` on
+each block header. Mixing tiled and raw-grid blocks in the same file is
+permitted by the wire format but the current encoder does not produce mixed
+files.
 
 ### Lorenzo Zstd (`0x05`)
 

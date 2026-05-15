@@ -14,6 +14,13 @@ export const FLAG_COLD_START_IN_WINDOW = 1 << 0;
 export const FLAG_HAS_PREVIOUS_SNAPSHOT = 1 << 1;
 export const FLAG_TIME_CATALOG_REGULAR = 1 << 2;
 
+export const BLOCK_FLAG_HAS_LEAF_DIRECTORIES = 1 << 0;
+export const BLOCK_FLAG_HAS_DICT = 1 << 1;
+export const BLOCK_FLAG_RAW_GRID = 1 << 2;
+
+export const RAW_GRID_HEADER_SIZE = 64;
+export const RAW_GRID_SCHEMA_VERSION = 1;
+
 export const COMP_NONE = 0;
 export const COMP_GZIP = 1;
 export const COMP_ZSTD = 2;
@@ -483,6 +490,89 @@ export function parseBlockHeader(buf: Uint8Array): BlockHeader {
     numAddressedTiles: dv.getUint32(56, true),
     numDirectoryEntries: dv.getUint32(60, true),
   };
+}
+
+export interface RawGridSection {
+  schemaVersion: number;
+  chunkSizeLog2: number;
+  nx: number;
+  ny: number;
+  lat0: number;
+  lon0: number;
+  dy: number;
+  dx: number;
+  missingValue: number;
+  chunkCountX: number;
+  chunkCountY: number;
+  chunkOffsets: Float64Array;
+  chunkLengths: Float64Array;
+}
+
+export function parseRawGridSection(buf: Uint8Array): RawGridSection {
+  if (buf.length < RAW_GRID_HEADER_SIZE) {
+    throw new FormatError(`raw grid: need ${RAW_GRID_HEADER_SIZE} bytes, got ${buf.length}`);
+  }
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const schemaVersion = dv.getUint8(0);
+  if (schemaVersion !== RAW_GRID_SCHEMA_VERSION) {
+    throw new FormatError(`raw grid: unsupported schema version ${schemaVersion}`);
+  }
+  const chunkSizeLog2 = dv.getUint8(1);
+  const nx = dv.getUint32(4, true);
+  const ny = dv.getUint32(8, true);
+  const lat0 = dv.getFloat64(16, true);
+  const lon0 = dv.getFloat64(24, true);
+  const dy = dv.getFloat64(32, true);
+  const dx = dv.getFloat64(40, true);
+  const missingValue = dv.getFloat64(48, true);
+  const chunkCountX = dv.getUint32(56, true);
+  const chunkCountY = dv.getUint32(60, true);
+  if (chunkCountX === 0 || chunkCountY === 0) {
+    throw new FormatError("raw grid: zero-sized chunk grid");
+  }
+  const n = chunkCountX * chunkCountY;
+  const chunkOffsets = new Float64Array(n);
+  const chunkLengths = new Float64Array(n);
+  let pos = RAW_GRID_HEADER_SIZE;
+  for (let i = 0; i < n; i++) {
+    const r = readVarintNum(buf, pos);
+    pos += r.used;
+    chunkOffsets[i] = r.value;
+  }
+  for (let i = 0; i < n; i++) {
+    const r = readVarintNum(buf, pos);
+    pos += r.used;
+    chunkLengths[i] = r.value;
+  }
+  return {
+    schemaVersion,
+    chunkSizeLog2,
+    nx,
+    ny,
+    lat0,
+    lon0,
+    dy,
+    dx,
+    missingValue,
+    chunkCountX,
+    chunkCountY,
+    chunkOffsets,
+    chunkLengths,
+  };
+}
+
+export function rawGridChunkSize(s: RawGridSection): number {
+  return 1 << s.chunkSizeLog2;
+}
+
+export function rawGridChunkWidth(s: RawGridSection, cx: number): number {
+  const cs = rawGridChunkSize(s);
+  return Math.min((cx + 1) * cs, s.nx) - cx * cs;
+}
+
+export function rawGridChunkHeight(s: RawGridSection, cy: number): number {
+  const cs = rawGridChunkSize(s);
+  return Math.min((cy + 1) * cs, s.ny) - cy * cs;
 }
 
 export interface Directory {

@@ -16,6 +16,14 @@ var (
 
 	// ErrUnknownVariable is returned when a variable name is not in the file.
 	ErrUnknownVariable = reader.ErrUnknownVariable
+
+	// ErrRawGridBlock is returned by ReadTile when the block was encoded with
+	// --no-tiles; use Sample / Samples instead.
+	ErrRawGridBlock = reader.ErrRawGridBlock
+
+	// ErrNotRawGrid is returned by Sample / Samples when the block is a tile
+	// pyramid; use ReadTile / ReadTiles instead.
+	ErrNotRawGrid = reader.ErrNotRawGrid
 )
 
 // Bounds describes the geographic extent of a dataset in lon/lat degrees.
@@ -26,7 +34,6 @@ type Bounds struct {
 	North float64
 }
 
-// Variable describes one named weather variable.
 type Variable struct {
 	Name     string
 	Unit     string
@@ -46,7 +53,6 @@ type TileCoord struct {
 	X, Y uint32
 }
 
-// Coord returns a Web Mercator XYZ tile coordinate.
 func Coord(z uint8, x, y uint32) TileCoord {
 	return TileCoord{Z: z, X: x, Y: y}
 }
@@ -62,7 +68,6 @@ type Decoder struct {
 	r *reader.Reader
 }
 
-// Open opens a WMTiles file from a path.
 func Open(path string) (*Decoder, error) {
 	r, err := reader.Open(path)
 	if err != nil {
@@ -71,7 +76,6 @@ func Open(path string) (*Decoder, error) {
 	return &Decoder{r: r}, nil
 }
 
-// NewReader opens a WMTiles file from an io.ReaderAt.
 func NewReader(src io.ReaderAt) (*Decoder, error) {
 	r, err := reader.NewReader(src)
 	if err != nil {
@@ -94,7 +98,6 @@ func (d *Decoder) PixelCount() int { return d.r.PixelCount() }
 // TileSize returns the tile width and height in pixels.
 func (d *Decoder) TileSize() int { return 1 << d.r.Header.TilePixelSizeLog2 }
 
-// ZoomRange returns the minimum and maximum zoom level in the file.
 func (d *Decoder) ZoomRange() (minZoom, maxZoom uint8) {
 	return d.r.Header.MinZoom, d.r.Header.MaxZoom
 }
@@ -119,7 +122,6 @@ func (d *Decoder) Variables() []Variable {
 	return out
 }
 
-// Variable returns one variable by name.
 func (d *Decoder) Variable(name string) (Variable, bool) {
 	v, ok := d.r.Variable(name)
 	if !ok {
@@ -144,7 +146,6 @@ func (d *Decoder) Times() []time.Time {
 	return out
 }
 
-// Time returns the timestamp at index.
 func (d *Decoder) Time(index int) (time.Time, bool) {
 	if index < 0 {
 		return time.Time{}, false
@@ -211,7 +212,6 @@ func (d *Decoder) ReadTileAt(variable string, t time.Time, coord TileCoord) ([]f
 	return out, nil
 }
 
-// ReadTileAtInto reads one tile by timestamp into out.
 func (d *Decoder) ReadTileAtInto(variable string, t time.Time, coord TileCoord, out []float32) error {
 	idx, ok := d.TimeIndex(t)
 	if !ok {
@@ -253,6 +253,55 @@ func (d *Decoder) ReadTilesInto(variable string, timeIndex int, coords []TileCoo
 		MaxGapBytes:     opt.MaxGapBytes,
 		MaxRequestBytes: opt.MaxRequestBytes,
 	})
+}
+
+type SamplePoint struct {
+	Lat, Lon float64
+}
+
+// Returns NaN for points outside the source grid; ErrNotRawGrid when the block is a tile pyramid.
+func (d *Decoder) Sample(variable string, timeIndex int, lat, lon float64) (float32, error) {
+	ti, err := checkedTimeIndex(timeIndex)
+	if err != nil {
+		return 0, err
+	}
+	return d.r.ReadSample(variable, ti, lat, lon)
+}
+
+func (d *Decoder) SampleAt(variable string, t time.Time, lat, lon float64) (float32, error) {
+	idx, ok := d.TimeIndex(t)
+	if !ok {
+		return 0, fmt.Errorf("wmtiles/decode: time %s not found", t.UTC().Format(time.RFC3339Nano))
+	}
+	return d.Sample(variable, idx, lat, lon)
+}
+
+// Chunk fetches are coalesced so a viewport-sized batch stays network-cheap.
+func (d *Decoder) Samples(variable string, timeIndex int, points []SamplePoint, opts ...ReadOptions) ([]float32, error) {
+	ti, err := checkedTimeIndex(timeIndex)
+	if err != nil {
+		return nil, err
+	}
+	opt, err := readOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	rpoints := make([]reader.SamplePoint, len(points))
+	for i, p := range points {
+		rpoints[i] = reader.SamplePoint{Lat: p.Lat, Lon: p.Lon}
+	}
+	return d.r.ReadSamples(variable, ti, rpoints, reader.SampleCoalesceOptions{
+		MaxGapBytes:     opt.MaxGapBytes,
+		MaxRequestBytes: opt.MaxRequestBytes,
+	})
+}
+
+func (d *Decoder) IsRawGridBlock(variable string, timeIndex int) (bool, error) {
+	ti, err := checkedTimeIndex(timeIndex)
+	if err != nil {
+		return false, err
+	}
+	return d.r.IsRawGridBlock(variable, ti)
 }
 
 // SanityCheck validates the loaded header and snapshot.

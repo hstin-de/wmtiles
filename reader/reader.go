@@ -20,7 +20,21 @@ var ErrNotFound = errors.New("wmtiles: tile not found")
 
 var ErrUnknownVariable = errors.New("wmtiles: unknown variable")
 
+// ErrRawGridBlock is returned by ReadTile / ReadTilesInBlock when the addressed
+// (variable, time) block was encoded with --no-tiles. Use ReadSample /
+// ReadSamples for those blocks.
+var ErrRawGridBlock = errors.New("wmtiles: block was encoded as a raw-grid; use Sample/Samples")
+
+// ErrNotRawGrid is the inverse: returned by Sample / Samples when the block is
+// a Hilbert tile pyramid and not a raw-grid block.
+var ErrNotRawGrid = errors.New("wmtiles: block is a tile pyramid; use ReadTile/ReadTiles")
+
 const blockHeaderCacheCap = 64 // LRU cap on parsed block headers + roots, ~1MB worst-case
+
+// chunkCacheCap bounds the per-block raw-grid chunk decode cache. 64 chunks at
+// 256x256 float32 is ~16 MB worst-case per hot block; the global LRU on blocks
+// (blockHeaderCacheCap) then caps total resident chunks.
+const chunkCacheCap = 64
 
 type Reader struct {
 	src    io.ReaderAt
@@ -58,6 +72,19 @@ type Snapshot struct {
 type blockCacheEntry struct {
 	header *format.BlockHeader
 	root   []directory.Entry
+
+	// rawGrid is set instead of root when BlockFlagRawGrid is set on the
+	// block header. The root region holds the raw-grid section bytes; the
+	// directory format is intentionally absent.
+	rawGrid *format.RawGridSection
+
+	// chunkCache caches the dequantized float32 buffer for chunks accessed
+	// via Sample/Samples. Bounded by chunkCacheCap and only populated for
+	// raw-grid blocks.
+	chunkMu     sync.Mutex
+	chunkCache  map[uint32][]float32
+	chunkOrder  *list.List
+	chunkTotal  int
 
 	// dict is loaded lazily on the first dict-flagged tile read.
 	dictMu     sync.Mutex
@@ -334,6 +361,9 @@ func (r *Reader) readTileFromBlock(blk format.BlockTableEntry, tid uint64, out [
 	if err != nil {
 		return err
 	}
+	if hdr.BlockFlags&format.BlockFlagRawGrid != 0 {
+		return ErrRawGridBlock
+	}
 
 	dirEntry, ok := directory.FindTile(root, tid)
 	if !ok {
@@ -457,9 +487,20 @@ func (r *Reader) loadBlockHeaderEntry(blockOff, blockLen uint64) (*format.BlockH
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decompress block root: %w", err)
 	}
-	root, err := directory.Decode(rootDecomp)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse block root: %w", err)
+	var (
+		root    []directory.Entry
+		rawGrid *format.RawGridSection
+	)
+	if hdr.BlockFlags&format.BlockFlagRawGrid != 0 {
+		rawGrid, err = format.UnmarshalRawGridSection(rootDecomp)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("parse raw-grid section: %w", err)
+		}
+	} else {
+		root, err = directory.Decode(rootDecomp)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("parse block root: %w", err)
+		}
 	}
 
 	r.cacheMu.Lock()
@@ -468,7 +509,7 @@ func (r *Reader) loadBlockHeaderEntry(blockOff, blockLen uint64) (*format.BlockH
 		r.blockOrder.MoveToBack(existing.elem)
 		return existing.header, existing.root, existing, nil
 	}
-	entry := &blockCacheEntry{header: hdr, root: root}
+	entry := &blockCacheEntry{header: hdr, root: root, rawGrid: rawGrid}
 	entry.elem = r.blockOrder.PushBack(blockOff)
 	r.blockCache[blockOff] = entry
 	r.blockTotal++

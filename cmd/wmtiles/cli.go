@@ -8,8 +8,6 @@ import (
 	"github.com/hstin-de/wmtiles/parser"
 )
 
-// Each field is one subcommand for kong; the Run() method on the subcommand
-// struct receives the parsed flags and drives the real work.
 type CLI struct {
 	Encode          encodeCmd          `cmd:"" help:"encode GRIB2 or HDF5 sources into a fresh .wmt"`
 	Extend          extendCmd          `cmd:"" help:"append blocks for new (variable, time) pairs to an existing .wmt"`
@@ -24,9 +22,11 @@ type CLI struct {
 type encodeCmd struct {
 	Output            string `short:"o" required:"" placeholder:"PATH" help:"output .wmt path"`
 	Format            string `enum:"auto,grib2,hdf5" default:"auto" help:"override input-format auto-detection"`
-	MinZoom           uint8  `default:"0" help:"minimum zoom level"`
-	MaxZoom           uint8  `default:"5" help:"maximum zoom level"`
+	MinZoom           uint8  `default:"0" help:"minimum zoom level (ignored when --no-tiles is set)"`
+	MaxZoom           uint8  `default:"5" help:"maximum zoom level (ignored when --no-tiles is set)"`
 	TileSizeLog2      uint8  `name:"tile-size-log2" default:"8" help:"tile size as log2 of pixel count (7..10 -> 128..1024)"`
+	NoTiles           bool   `name:"no-tiles" help:"skip the Web-Mercator pyramid; store source-grid chunks for point-query (lat/lon) API use. Output is not viewable on a slippy map without on-the-fly tiling"`
+	RawChunkSizeLog2  uint8  `name:"raw-chunk-size-log2" default:"8" help:"source-pixel side of one raw-grid chunk as log2 (4..12 -> 16..4096). Only consulted with --no-tiles"`
 	Filter            string `help:"comma-separated source variable shortNames to keep (default: all)"`
 	Precision         string `placeholder:"NAME=K,..." help:"per-variable quantisation precision overrides (default: lookup table + auto-cap)"`
 	DisableDeltaCodec bool   `help:"force bitshuffle-only encoding (faster, larger files)"`
@@ -44,8 +44,11 @@ func (c *encodeCmd) Validate() error {
 	if c.TileSizeLog2 < 7 || c.TileSizeLog2 > 10 {
 		return fmt.Errorf("tile-size-log2 must be 7..10, got %d", c.TileSizeLog2)
 	}
-	if c.MaxZoom < c.MinZoom {
+	if !c.NoTiles && c.MaxZoom < c.MinZoom {
 		return fmt.Errorf("max-zoom %d < min-zoom %d", c.MaxZoom, c.MinZoom)
+	}
+	if c.NoTiles && (c.RawChunkSizeLog2 < 4 || c.RawChunkSizeLog2 > 12) {
+		return fmt.Errorf("raw-chunk-size-log2 must be 4..12, got %d", c.RawChunkSizeLog2)
 	}
 	return nil
 }

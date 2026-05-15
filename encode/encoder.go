@@ -54,6 +54,19 @@ type Options struct {
 	// DisableDeltaCodec skips the slower delta/Lorenzo codec candidates.
 	DisableDeltaCodec bool
 
+	// NoTiles disables the Web-Mercator tile pyramid entirely. Each (variable,
+	// time) pair is stored as a single raw-grid block holding the source
+	// lat-lon grid chunked into RawGridChunkSizeLog2-sided sub-tiles. This is
+	// the right mode for point-query APIs ("value at lat/lon"); the resulting
+	// file cannot drive the map-viewer / Hilbert tile reader. MinZoom and
+	// MaxZoom are ignored when NoTiles is set.
+	NoTiles bool
+
+	// RawGridChunkSizeLog2 sets the source-pixel side of one raw-grid chunk
+	// (1<<n). Valid range is [4, 12]. 0 picks the default
+	// encoder.RawGridDefaultChunkSizeLog2. Only consulted when NoTiles is set.
+	RawGridChunkSizeLog2 uint8
+
 	// ZstdLevel sets the per-tile libzstd level (1..22). 0 = encoder default (3).
 	ZstdLevel int
 
@@ -96,8 +109,7 @@ type ScanStats struct {
 type VariablePlan = scan.VariablePlan
 
 // Encoder collects one or more source inputs and writes them as one fresh WMT
-// file when Finish is called. Inputs can use different formats once this
-// package supports them; currently FormatGRIB2 is implemented.
+// file when Finish is called.
 type Encoder struct {
 	outPath  string
 	opts     Options
@@ -242,6 +254,12 @@ func (e *Encoder) Finish() error {
 	bboxArr := [4]float64{bounds.West, bounds.South, bounds.East, bounds.North}
 
 	if e.opts.OnScanComplete != nil {
+		expected := e.expectedTiles
+		if e.opts.NoTiles {
+			// One raw-grid block per kept message; clearer signal than
+			// the per-zoom-level pyramid count when reporting progress.
+			expected = int64(kept)
+		}
 		e.opts.OnScanComplete(ScanStats{
 			InputCount:    len(e.inputs),
 			TotalMessages: kept,
@@ -249,13 +267,19 @@ func (e *Encoder) Finish() error {
 			VariableCount: len(bySig),
 			TimeAxis:      timeCat,
 			BBox:          bboxArr,
-			ExpectedTiles: e.expectedTiles,
+			ExpectedTiles: expected,
 		})
+	}
+	// MinZoom/MaxZoom in the file header are informational for raw-grid
+	// files; the block-level RawGrid flag is the authoritative signal.
+	minZoom, maxZoom := e.opts.MinZoom, e.opts.MaxZoom
+	if e.opts.NoTiles {
+		minZoom, maxZoom = 0, 0
 	}
 	enc, err := encoder.NewStreamingEncoder(encoder.Options{
 		TilePixelSizeLog2:     tileSizeLog2,
-		MinZoom:               e.opts.MinZoom,
-		MaxZoom:               e.opts.MaxZoom,
+		MinZoom:               minZoom,
+		MaxZoom:               maxZoom,
 		ReferenceForecastTime: refTime,
 		TimeCatalog:           timeCat,
 		BBox:                  bboxArr,
@@ -278,9 +302,16 @@ func (e *Encoder) Finish() error {
 		return fmt.Errorf("wmtiles/encode: encoder init: %w", err)
 	}
 
-	if err := e.streamTiles(bySig, timeIdxByTime, enc, pixSize); err != nil {
-		enc.Close()
-		return err
+	if e.opts.NoTiles {
+		if err := e.streamRawGridInputs(bySig, timeIdxByTime, enc, e.opts.RawGridChunkSizeLog2); err != nil {
+			enc.Close()
+			return err
+		}
+	} else {
+		if err := e.streamTiles(bySig, timeIdxByTime, enc, pixSize); err != nil {
+			enc.Close()
+			return err
+		}
 	}
 
 	if e.opts.OnFinishStats != nil {
@@ -493,6 +524,11 @@ type streamSink interface {
 	// it to disk. Called between input files so peak RAM stays at one
 	// file's worth of blocks instead of all-files'.
 	FlushPendingBlocks() error
+	// EncodeRawGridBlock writes one (variable, time) directly from a source
+	// grid, bypassing the Web-Mercator tile pyramid. Used when Options.NoTiles
+	// is set. Duplicates are swallowed as a nil error, same convention as
+	// DeclareBlock.
+	EncodeRawGridBlock(encoder.RawGridSpec, []float32) error
 }
 
 // Cached GRIB inputs go through the parallel fast path; HDF5 and byte

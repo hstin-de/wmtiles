@@ -39,6 +39,57 @@ func main() {
 	multistepPath := filepath.Join(outDir, "multistep.wmt")
 	makeMultistep(multistepPath, pixSize, refTime, fixedNow)
 	fmt.Printf("wrote %s\n", multistepPath)
+
+	rawGridPath := filepath.Join(outDir, "rawgrid.wmt")
+	makeRawGrid(rawGridPath, refTime, fixedNow)
+	fmt.Printf("wrote %s\n", rawGridPath)
+}
+
+// makeRawGrid writes a small --no-tiles file with a deterministic synthetic
+// grid. Used by the JS round-trip tests to lock in raw-grid sample values.
+func makeRawGrid(path string, refTime time.Time, now time.Time) {
+	const nx, ny = 64, 33
+	const lat0, lon0 = 30.0, 0.0
+	const dy, dx = 0.5, 0.5
+	values := make([]float32, nx*ny)
+	for y := 0; y < ny; y++ {
+		for x := 0; x < nx; x++ {
+			// pixel = lat + lon/1000, deterministic and easy to verify.
+			values[y*nx+x] = float32(lat0+float64(y)*dy) + float32(lon0+float64(x)*dx)/1000
+		}
+	}
+
+	opts := encoder.Options{
+		TilePixelSizeLog2:     7,
+		MinZoom:               0,
+		MaxZoom:               0,
+		ReferenceForecastTime: refTime,
+		TimeCatalog: format.TimeCatalog{
+			Regular: true, StartMs: refTime.UnixMilli(), IntervalMs: 0, Count: 1,
+		},
+		BBox: [4]float64{lon0, lat0, lon0 + float64(nx-1)*dx, lat0 + float64(ny-1)*dy},
+		Variables: []encoder.VariableSpec{
+			{Name: "temp", Unit: "K", Precision: 0.001},
+		},
+		CreationTime:        now,
+		SkipInternalWorkers: true,
+	}
+	enc, err := encoder.NewStreamingEncoder(opts, path)
+	if err != nil {
+		die(err)
+	}
+	if err := enc.EncodeRawGridBlock(encoder.RawGridSpec{
+		Variable: "temp", TimeStep: 0,
+		Nx: nx, Ny: ny,
+		Lat0: lat0, Lon0: lon0,
+		DY: dy, DX: dx,
+		Precision: 0.001,
+	}, values); err != nil {
+		die(err)
+	}
+	if err := enc.Finish(); err != nil {
+		die(err)
+	}
 }
 
 // 4 hourly steps × 2 variables. Pixel values encode (timeStep, variable) so a

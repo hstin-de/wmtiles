@@ -31,9 +31,11 @@ type StreamingEncoder struct {
 	defaultDType map[string]uint8
 
 	// blockMu guards blocks and declarations
-	blockMu      sync.RWMutex
-	blocks       map[blockKey]*blockBuilder
-	declarations []blockKey
+	blockMu         sync.RWMutex
+	blocks          map[blockKey]*blockBuilder
+	declarations    []blockKey
+	rawBlocks       map[blockKey]*rawGridBlockBuilder
+	rawDeclarations []blockKey
 
 	jobCh chan submitMsg
 	resCh chan encodedTile
@@ -317,18 +319,28 @@ func (s *StreamingEncoder) FlushPendingBlocks() error {
 	s.blockMu.Lock()
 	decls := s.declarations
 	blocks := s.blocks
+	rawDecls := s.rawDeclarations
+	rawBlocks := s.rawBlocks
 	s.declarations = nil
 	s.blocks = make(map[blockKey]*blockBuilder)
+	s.rawDeclarations = nil
+	s.rawBlocks = nil
 	s.blockMu.Unlock()
-	if len(decls) == 0 {
+	if len(decls) == 0 && len(rawDecls) == 0 {
 		return nil
 	}
-	return s.compressAndWriteBatch(decls, blocks, nil, nil)
+	return s.compressAndWriteBatch(decls, blocks, rawDecls, rawBlocks, nil, nil)
 }
 
+// compressAndWriteBatch drains both pending block kinds (tiled and raw-grid)
+// to disk. Tiled blocks finish their root directories inside
+// finishBlocksParallel; raw-grid blocks are already finalised at
+// EncodeRawGridBlock time.
 func (s *StreamingEncoder) compressAndWriteBatch(
 	decls []blockKey,
 	blocks map[blockKey]*blockBuilder,
+	rawDecls []blockKey,
+	rawBlocks map[blockKey]*rawGridBlockBuilder,
 	compressCb func(int, uint64),
 	writeCb func(idx, total int, n uint64),
 ) error {
@@ -341,8 +353,9 @@ func (s *StreamingEncoder) compressAndWriteBatch(
 	if _, err := s.out.Seek(int64(s.cursor), 0); err != nil {
 		return fmt.Errorf("seek to block region: %w", err)
 	}
-	total := len(decls)
-	for i, k := range decls {
+	total := len(decls) + len(rawDecls)
+	idx := 0
+	for _, k := range decls {
 		bb := blocks[k]
 		off := s.cursor
 		n, err := bb.writeBlockTo(s.out)
@@ -352,8 +365,24 @@ func (s *StreamingEncoder) compressAndWriteBatch(
 		s.cursor += uint64(n)
 		s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
 		if writeCb != nil {
-			writeCb(i, total, uint64(n))
+			writeCb(idx, total, uint64(n))
 		}
+		idx++
+		bb.release()
+	}
+	for _, k := range rawDecls {
+		bb := rawBlocks[k]
+		off := s.cursor
+		n, err := bb.writeBlockTo(s.out)
+		if err != nil {
+			return fmt.Errorf("write raw block (var=%d t=%d): %w", k.variableID, k.timeID, err)
+		}
+		s.cursor += uint64(n)
+		s.blockTable = append(s.blockTable, bb.blockTableEntry(off))
+		if writeCb != nil {
+			writeCb(idx, total, uint64(n))
+		}
+		idx++
 		bb.release()
 	}
 	return nil
@@ -380,7 +409,7 @@ func (s *StreamingEncoder) Finish() error {
 		// With per-file flushing this is typically empty or just the last
 		// file's blocks; the no-flush path lands every block here, exactly
 		// like the pre-flush behaviour.
-		residual := len(s.declarations)
+		residual := len(s.declarations) + len(s.rawDeclarations)
 		if residual > 0 {
 			s.firePhase("compress_blocks")
 			var compressCb func(int, uint64)
@@ -398,9 +427,13 @@ func (s *StreamingEncoder) Finish() error {
 			}
 			decls := s.declarations
 			blocks := s.blocks
+			rawDecls := s.rawDeclarations
+			rawBlocks := s.rawBlocks
 			s.declarations = nil
 			s.blocks = make(map[blockKey]*blockBuilder)
-			if e := s.compressAndWriteBatch(decls, blocks, compressCb, writeCb); e != nil {
+			s.rawDeclarations = nil
+			s.rawBlocks = nil
+			if e := s.compressAndWriteBatch(decls, blocks, rawDecls, rawBlocks, compressCb, writeCb); e != nil {
 				err = e
 				s.cleanupOnErr()
 				return

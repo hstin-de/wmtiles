@@ -74,7 +74,7 @@ func (a *Appender) Stats() AppendStats {
 	return AppendStats{Submitted: sub, Skipped: sk, AlreadyPresent: a.alreadyPresent.Load()}
 }
 
-// OpenForAppend deferred to Finish so AddFile errors don't tie up the lock.
+// encoder.OpenForAppend is deferred to Finish so AddFile errors don't tie up the lock.
 func NewAppender(wmtPath string, opts AppenderOptions) (*Appender, error) {
 	if wmtPath == "" {
 		return nil, errors.New("wmtiles/encode: append path is empty")
@@ -264,6 +264,20 @@ func (a *appendSinkWrap) NewDirectWorker() (*encoder.DirectWorker, error) {
 
 func (a *appendSinkWrap) FlushPendingBlocks() error {
 	return a.ctx.FlushPendingBlocks()
+}
+
+func (a *appendSinkWrap) EncodeRawGridBlock(spec encoder.RawGridSpec, values []float32) error {
+	if err := a.ctx.EncodeRawGridBlock(spec, values); err != nil {
+		if isAlreadyExists(err) {
+			a.already.Add(1)
+			if a.onDup != nil {
+				a.onDup(spec.Variable)
+			}
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func isAlreadyExists(err error) bool {

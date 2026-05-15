@@ -82,6 +82,11 @@ wmtiles encode 'composite_wn_*-hd5' -o radar.wmt --max-zoom 7
 
 # CF-1.x / NetCDF4 file (regular lat-lon coords)
 wmtiles encode model.nc4 -o model.wmt
+
+# Weather-API mode: skip the Web-Mercator pyramid, store the source grid
+# chunked in source coords. Bilinear point queries via Sample / sample();
+# encodes ~50-100x faster, files shrink to ~GRIB×0.5..1.0.
+wmtiles encode forecast.grib2 -o api.wmt --no-tiles
 ```
 
 The input format is auto-detected by magic bytes (`GRIB` vs `\x89HDF`) with a
@@ -128,6 +133,23 @@ const px = await t2m.tile({ time: 12, z: 5, x: 16, y: 11 });
 // Float32Array(256*256), NaN where the encoder marked NoData
 ```
 
+For `--no-tiles` archives use the lat/lon sample API; the same range
+coalescing keeps a batch of points down to a single byte-range request when
+they fall in the same source-grid chunk neighbourhood:
+
+```ts
+const v = wmt.variable("2t_2m");
+const tempBerlin = await v.sample({ time: 0, lat: 52.52, lon: 13.40 });
+
+const cities = [
+  { lat: 52.52, lon: 13.40 },  // Berlin
+  { lat: 48.14, lon: 11.58 },  // Munich
+  { lat: 53.55, lon:  9.99 },  // Hamburg
+];
+const values = await v.samples({ time: 0, points: cities });
+// Float32Array(3) — NaN outside the source bbox.
+```
+
 For multi-tile fetches at the same `(variable, time)`, `tiles()`
 coalesces 9 viewport tiles into 1 to 2 range requests:
 
@@ -169,6 +191,18 @@ Read one tile:
 
 ```go
 pixels, err := wmt.ReadTile("2t", 12, decode.Coord(5, 16, 11))
+```
+
+For `--no-tiles` files use point sampling:
+
+```go
+v, err := wmt.Sample("2t", 12, 52.52, 13.40) // lat, lon
+// Float32; NaN outside the source bbox.
+
+values, err := wmt.Samples("2t", 12, []decode.SamplePoint{
+    {Lat: 52.52, Lon: 13.40},
+    {Lat: 48.14, Lon: 11.58},
+})
 ```
 
 Read a viewport worth of tiles with range coalescing:
@@ -400,6 +434,8 @@ wmtiles serve            <file.wmt> [--addr :8080]     bundled web viewer
 | `--tile-size-log2 N` | `8` (256 px) | tile pixel size, allowed `7..10` (128..1024) |
 | `--filter SHORTNAMES` | (none = all) | comma-separated shortNames to keep (GRIB shortName, ODIM quantity, or CF mapping) |
 | `--precision NAME=K,…` | shortName/unit lookup, then 10-bit auto-cap | quantisation precision overrides; `=0` forces full-range u16 |
+| `--no-tiles` | off | skip the Web-Mercator pyramid; store source-grid chunks for point-query (lat/lon) API use. Output is not viewable on a slippy map without on-the-fly tiling |
+| `--raw-chunk-size-log2 N` | `8` (256 px) | source-pixel side of one raw-grid chunk as log2 (4..12 → 16..4096). Only consulted with `--no-tiles` |
 
 ---
 

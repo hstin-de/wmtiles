@@ -1,4 +1,5 @@
 import {
+  BLOCK_FLAG_RAW_GRID,
   BLOCK_HEADER_SIZE,
   COLD_START_BYTES,
   FLAG_HAS_PREVIOUS_SNAPSHOT,
@@ -14,14 +15,18 @@ import {
   parseBlockTable,
   parseDirectory,
   parseHeader,
+  parseRawGridSection,
   parseSnapshotHeader,
   parseSnapshotTrailer,
   parseTimeCatalog,
   parseVariableCatalog,
+  rawGridChunkHeight,
+  rawGridChunkWidth,
   type BlockHeader,
   type BlockTableEntry,
   type Directory,
   type Header,
+  type RawGridSection,
   type SnapshotHeader,
   type TimeCatalog,
   type VariableEntry,
@@ -122,8 +127,16 @@ export interface SampleRequest {
   time: TimeRef;
   lat: number;
   lon: number;
-  /** Defaults to maxZoom of the file. */
+  /** Defaults to maxZoom of the file. Ignored for raw-grid blocks. */
   z?: number;
+}
+
+export interface SamplesRequest {
+  time: TimeRef;
+  points: ReadonlyArray<{ lat: number; lon: number }>;
+  /** Defaults to maxZoom of the file. Ignored for raw-grid blocks. */
+  z?: number;
+  coalesce?: CoalesceOptions;
 }
 
 export interface ForecastRequest {
@@ -263,6 +276,14 @@ type Sampler = (
   z: number,
 ) => Promise<number | null>;
 
+type SamplesBatch = (
+  varId: number,
+  t: number,
+  points: ReadonlyArray<{ lat: number; lon: number }>,
+  z: number,
+  opts?: CoalesceOptions,
+) => Promise<Float32Array>;
+
 export interface Variable {
   /** Numeric ID assigned by the encoder. */
   readonly id: number;
@@ -274,7 +295,10 @@ export interface Variable {
   /** Fetch one tile of pixels. Returns null if the tile is missing/out of range. */
   tile(req: TileRequest): Promise<Float32Array | null>;
   tiles(req: TilesRequest): Promise<Float32Array[]>;
+  /** One value at (lat, lon). For raw-grid blocks this is a bilinear sample. */
   sample(req: SampleRequest): Promise<number | null>;
+  /** Many values at (lat, lon). Chunk fetches are coalesced. */
+  samples(req: SamplesRequest): Promise<Float32Array>;
 }
 
 class WMTVariable implements Variable {
@@ -284,6 +308,7 @@ class WMTVariable implements Variable {
     private readonly _fetchTile: TileFetcher,
     private readonly _fetchTiles: TilesFetcher,
     private readonly _sample: Sampler,
+    private readonly _samplesBatch: SamplesBatch,
     private readonly _maxZoom: number,
     readonly id: number,
     readonly name: string,
@@ -308,13 +333,24 @@ class WMTVariable implements Variable {
     const z = req.z ?? this._maxZoom;
     return this._sample(this.id, t, req.lat, req.lon, z);
   }
+
+  async samples(req: SamplesRequest): Promise<Float32Array> {
+    const t = this._timeIndexOf(req.time);
+    const z = req.z ?? this._maxZoom;
+    return this._samplesBatch(this.id, t, req.points, z, req.coalesce);
+  }
 }
 
 // ---------- WMT reader ----------
 
 interface CachedBlock {
   header: BlockHeader;
-  root: Directory;
+  /** Hilbert directory; null when the block is a raw-grid block. */
+  root: Directory | null;
+  /** Raw-grid section; null when the block is a tile pyramid. */
+  rawGrid: RawGridSection | null;
+  /** Cached decoded chunk pixels (raw-grid only), keyed by chunk index. */
+  chunkCache?: Map<number, Float32Array>;
 }
 
 export class WMT {
@@ -362,8 +398,6 @@ export class WMT {
     return w;
   }
 
-  // ---- Inspection ----
-
   get tileSize(): number {
     return this._tileSize;
   }
@@ -409,8 +443,6 @@ export class WMT {
         };
     return this._timeAxis;
   }
-
-  // ---- Lookups ----
 
   /** Variable handle by name. Throws UnknownVariableError if absent. */
   variable(name: string): Variable {
@@ -546,8 +578,6 @@ export class WMT {
     return { time: this.timeAt(t), values };
   }
 
-  // ---- Layers ----
-
   createHeatmapLayer(options?: HeatmapLayerOptions): WMTHeatmapLayer {
     return new WMTLayerImpl<HeatmapRendererState>(this, "heatmap", options);
   }
@@ -572,8 +602,6 @@ export class WMT {
     return new WMTLayerImpl<HatchRendererState>(this, "hatch", options);
   }
 
-  // ---- Internal: fetch helpers (called by Variable) ----
-
   private async _fetchTile(
     varId: number,
     t: number,
@@ -589,10 +617,13 @@ export class WMT {
     if (!blk) return null;
 
     const tid = encode3D(z, x, y);
-    const { header: blkHdr, root } = await this._loadBlockHeader(
-      blk.blockOffset,
-      blk.blockLength,
-    );
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    if (cb.rawGrid) {
+      // Raw-grid blocks have no Hilbert directory; callers should use sample().
+      return null;
+    }
+    const { header: blkHdr, root } = cb;
+    if (!root) return null;
 
     let entry = findTile(root, tid);
     if (!entry) return null;
@@ -671,10 +702,20 @@ export class WMT {
       }
       return out;
     }
-    const { header: blkHdr, root } = await this._loadBlockHeader(
-      blk.blockOffset,
-      blk.blockLength,
-    );
+    const cbAll = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    if (cbAll.rawGrid) {
+      for (let i = 0; i < coords.length; i++) {
+        out[i] = nanArray(this._nPixels);
+      }
+      return out;
+    }
+    const { header: blkHdr, root } = cbAll;
+    if (!root) {
+      for (let i = 0; i < coords.length; i++) {
+        out[i] = nanArray(this._nPixels);
+      }
+      return out;
+    }
 
     type Need = { i: number; fileOff: number; length: number };
     const needs: Need[] = [];
@@ -819,6 +860,13 @@ export class WMT {
     lon: number,
     z: number,
   ): Promise<number | null> {
+    // Raw-grid blocks ignore z and bilinearly sample from the source grid.
+    const blk = await this._lookupBlock(varId, t);
+    if (!blk) return null;
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    if (cb.rawGrid) {
+      return await this._sampleRaw(blk, cb, lat, lon);
+    }
     if (z < this._header.minZoom || z > this._header.maxZoom) return null;
     const px = latLonToTilePixel(z, lat, lon, this._tileSize);
     if (!px) return null;
@@ -827,7 +875,195 @@ export class WMT {
     return tile[px.row * this._tileSize + px.col];
   }
 
-  // ---- Internal: open / loaders ----
+  private async _sampleRaw(
+    blk: BlockTableEntry,
+    cb: CachedBlock,
+    lat: number,
+    lon: number,
+  ): Promise<number> {
+    const g = cb.rawGrid!;
+    if (g.dx === 0 || g.dy === 0) return NaN;
+    const gx = (lon - g.lon0) / g.dx;
+    const gy = (lat - g.lat0) / g.dy;
+    if (!Number.isFinite(gx) || !Number.isFinite(gy)) return NaN;
+    if (gx < 0 || gy < 0) return NaN;
+    if (gx > g.nx - 1 || gy > g.ny - 1) return NaN;
+
+    let x0 = Math.floor(gx);
+    let y0 = Math.floor(gy);
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    if (x1 > g.nx - 1) x1 = x0;
+    if (y1 > g.ny - 1) y1 = y0;
+    const wx = gx - x0;
+    const wy = gy - y0;
+
+    // Decode the (at most 4) chunks needed and cache them.
+    const need = new Set<number>();
+    const cs = 1 << g.chunkSizeLog2;
+    for (const x of [x0, x1]) {
+      for (const y of [y0, y1]) {
+        const cx = Math.floor(x / cs);
+        const cy = Math.floor(y / cs);
+        need.add(cy * g.chunkCountX + cx);
+      }
+    }
+    await this._ensureRawChunks(blk, cb, need);
+
+    const pixel = (x: number, y: number): number => {
+      const cx = Math.floor(x / cs);
+      const cy = Math.floor(y / cs);
+      const idx = cy * g.chunkCountX + cx;
+      const pixels = cb.chunkCache!.get(idx)!;
+      const w = rawGridChunkWidth(g, cx);
+      const row = y - cy * cs;
+      const col = x - cx * cs;
+      return pixels[row * w + col];
+    };
+    const v00 = pixel(x0, y0);
+    const v10 = pixel(x1, y0);
+    const v01 = pixel(x0, y1);
+    const v11 = pixel(x1, y1);
+    if (Number.isNaN(v00) || Number.isNaN(v10) || Number.isNaN(v01) || Number.isNaN(v11)) {
+      return NaN;
+    }
+    const a = v00 * (1 - wx) + v10 * wx;
+    const b = v01 * (1 - wx) + v11 * wx;
+    return a * (1 - wy) + b * wy;
+  }
+
+  private async _samplesBatch(
+    varId: number,
+    t: number,
+    points: ReadonlyArray<{ lat: number; lon: number }>,
+    z: number,
+    opts: CoalesceOptions = {},
+  ): Promise<Float32Array> {
+    const blk = await this._lookupBlock(varId, t);
+    if (!blk) return new Float32Array(points.length).fill(NaN);
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    if (cb.rawGrid) {
+      return this._sampleManyRaw(blk, cb, points, opts);
+    }
+    // Tile-pyramid path: per-point sample, no coalescing yet.
+    const out = new Float32Array(points.length);
+    for (let i = 0; i < points.length; i++) {
+      const v = await this._sample(varId, t, points[i].lat, points[i].lon, z);
+      out[i] = v ?? NaN;
+    }
+    return out;
+  }
+
+  private async _sampleManyRaw(
+    blk: BlockTableEntry,
+    cb: CachedBlock,
+    points: ReadonlyArray<{ lat: number; lon: number }>,
+    opts: CoalesceOptions,
+  ): Promise<Float32Array> {
+    const g = cb.rawGrid!;
+    const cs = 1 << g.chunkSizeLog2;
+    const need = new Set<number>();
+    for (const p of points) {
+      const gx = (p.lon - g.lon0) / g.dx;
+      const gy = (p.lat - g.lat0) / g.dy;
+      if (!Number.isFinite(gx) || !Number.isFinite(gy)) continue;
+      if (gx < 0 || gy < 0 || gx > g.nx - 1 || gy > g.ny - 1) continue;
+      let x0 = Math.floor(gx);
+      let y0 = Math.floor(gy);
+      let x1 = x0 + 1;
+      let y1 = y0 + 1;
+      if (x1 > g.nx - 1) x1 = x0;
+      if (y1 > g.ny - 1) y1 = y0;
+      for (const x of [x0, x1]) {
+        for (const y of [y0, y1]) {
+          const cx = Math.floor(x / cs);
+          const cy = Math.floor(y / cs);
+          need.add(cy * g.chunkCountX + cx);
+        }
+      }
+    }
+    await this._ensureRawChunks(blk, cb, need, opts);
+
+    const out = new Float32Array(points.length);
+    for (let i = 0; i < points.length; i++) {
+      out[i] = await this._sampleRaw(blk, cb, points[i].lat, points[i].lon);
+    }
+    return out;
+  }
+
+  private async _ensureRawChunks(
+    blk: BlockTableEntry,
+    cb: CachedBlock,
+    needIdx: Set<number>,
+    opts: CoalesceOptions = {},
+  ): Promise<void> {
+    const g = cb.rawGrid!;
+    if (!cb.chunkCache) cb.chunkCache = new Map();
+    const cache = cb.chunkCache;
+    const missing: number[] = [];
+    for (const i of needIdx) {
+      if (!cache.has(i)) missing.push(i);
+    }
+    if (missing.length === 0) return;
+
+    const maxGap = opts.maxGapBytes ?? 32 * 1024;
+    const maxReq = opts.maxRequestBytes ?? 1024 * 1024;
+
+    type R = { idx: number; off: number; ln: number; cx: number; cy: number };
+    const ranges: R[] = [];
+    for (const idx of missing) {
+      const cy = Math.floor(idx / g.chunkCountX);
+      const cx = idx - cy * g.chunkCountX;
+      ranges.push({
+        idx,
+        off: g.chunkOffsets[idx],
+        ln: g.chunkLengths[idx],
+        cx,
+        cy,
+      });
+    }
+    ranges.sort((a, b) => a.off - b.off);
+
+    let i = 0;
+    while (i < ranges.length) {
+      let j = i;
+      const runStart = ranges[i].off;
+      let runEnd = ranges[i].off + ranges[i].ln;
+      while (j + 1 < ranges.length) {
+        const next = ranges[j + 1];
+        if (next.ln === 0) {
+          j++;
+          continue;
+        }
+        const gap = next.off - runEnd;
+        if (gap > maxGap) break;
+        if (next.off + next.ln - runStart > maxReq) break;
+        runEnd = next.off + next.ln;
+        j++;
+      }
+      if (runEnd > runStart) {
+        const buf = await this._src.read(
+          blk.blockOffset + (cb.header.tileDataOffset as number) + runStart,
+          runEnd - runStart,
+        );
+        for (let k = i; k <= j; k++) {
+          const rg = ranges[k];
+          const w = rawGridChunkWidth(g, rg.cx);
+          const h = rawGridChunkHeight(g, rg.cy);
+          if (rg.ln === 0) {
+            cache.set(rg.idx, new Float32Array(w * h).fill(NaN));
+            continue;
+          }
+          const start = rg.off - runStart;
+          const blob = buf.subarray(start, start + rg.ln);
+          const decoded = decodeCodec(blob, blk.dtype, w * h);
+          const pixels = dequantize(decoded, blk, w * h);
+          cache.set(rg.idx, pixels);
+        }
+      }
+      i = j + 1;
+    }
+  }
 
   private async _open(): Promise<void> {
     const log = debugSink();
@@ -909,6 +1145,8 @@ export class WMT {
           (varId, t, coords, opts) =>
             this._fetchTiles(varId, t, coords, opts),
           (varId, t, lat, lon, z) => this._sample(varId, t, lat, lon, z),
+          (varId, t, points, z, opts) =>
+            this._samplesBatch(varId, t, points, z, opts),
           this._header.maxZoom,
           v.id,
           v.name,
@@ -1013,8 +1251,14 @@ export class WMT {
           rootRaw,
           this._header.internalCompression,
         );
-        const root = parseDirectory(rootBuf);
-        const out = { header, root };
+        let out: CachedBlock;
+        if ((header.blockFlags & BLOCK_FLAG_RAW_GRID) !== 0) {
+          const rawGrid = parseRawGridSection(rootBuf);
+          out = { header, root: null, rawGrid };
+        } else {
+          const root = parseDirectory(rootBuf);
+          out = { header, root, rawGrid: null };
+        }
         this._blockCache.set(blockOff, out);
         this._blockFetches.delete(blockOff);
         return out;
