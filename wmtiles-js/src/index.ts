@@ -17,11 +17,17 @@ export {
   type TileRequest,
   type TilesRequest,
   type SampleRequest,
+  type SamplesRequest,
+  type SampleDetail,
+  type SampleDetailNeighbour,
+  type SampleDetailChunk,
   type ForecastRequest,
   type ForecastResult,
   type ValueRequest,
   type ValueResult,
 } from "./reader.js";
+
+export { type RawGridSection } from "./format.js";
 
 export {
   WMTError,

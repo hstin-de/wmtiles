@@ -435,7 +435,7 @@ wmtiles serve            <file.wmt> [--addr :8080]     bundled web viewer
 | `--filter SHORTNAMES` | (none = all) | comma-separated shortNames to keep (GRIB shortName, ODIM quantity, or CF mapping) |
 | `--precision NAME=K,…` | shortName/unit lookup, then 10-bit auto-cap | quantisation precision overrides; `=0` forces full-range u16 |
 | `--no-tiles` | off | skip the Web-Mercator pyramid; store source-grid chunks for point-query (lat/lon) API use. Output is not viewable on a slippy map without on-the-fly tiling |
-| `--raw-chunk-size-log2 N` | `8` (256 px) | source-pixel side of one raw-grid chunk as log2 (4..12 → 16..4096). Only consulted with `--no-tiles` |
+| `--raw-chunk-size-log2 N` | `5` (32 px) | source-pixel side of one raw-grid chunk as log2 (4..12 → 16..4096). Smaller = smaller per-query fetches at the cost of a larger chunk directory. Only consulted with `--no-tiles` |
 
 ---
 

@@ -37,7 +37,8 @@ are limited to 255 bytes.
 | Block format version | `2` | Block-level wire format |
 | Block header size | `64` bytes | Fixed size |
 | Block magic | `0xB10CC0DE` | Block header sentinel |
-| Max block root bytes | `16384 - 64` | Compressed root directory limit |
+| Max block root bytes | `16384 - 64` | Compressed root directory limit (tile blocks); first-RTT prefetch budget |
+| Max raw-grid section bytes | `4 << 20` | Compressed raw-grid section limit; exceeds the prefetch budget but the reader fallback handles it with one extra range request |
 | Max block-table root bytes | `16384` | Compressed block-table root limit |
 | File trailer size | `16` bytes | Fixed size |
 | File trailer magic | `0xEEEFFFFF` | Logical-end sentinel |

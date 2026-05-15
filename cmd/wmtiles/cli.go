@@ -26,7 +26,7 @@ type encodeCmd struct {
 	MaxZoom           uint8  `default:"5" help:"maximum zoom level (ignored when --no-tiles is set)"`
 	TileSizeLog2      uint8  `name:"tile-size-log2" default:"8" help:"tile size as log2 of pixel count (7..10 -> 128..1024)"`
 	NoTiles           bool   `name:"no-tiles" help:"skip the Web-Mercator pyramid; store source-grid chunks for point-query (lat/lon) API use. Output is not viewable on a slippy map without on-the-fly tiling"`
-	RawChunkSizeLog2  uint8  `name:"raw-chunk-size-log2" default:"8" help:"source-pixel side of one raw-grid chunk as log2 (4..12 -> 16..4096). Only consulted with --no-tiles"`
+	RawChunkSizeLog2  uint8  `name:"raw-chunk-size-log2" default:"5" help:"source-pixel side of one raw-grid chunk as log2 (4..12 -> 16..4096). Smaller = smaller per-click fetches, larger chunk directory. Only consulted with --no-tiles"`
 	Filter            string `help:"comma-separated source variable shortNames to keep (default: all)"`
 	Precision         string `placeholder:"NAME=K,..." help:"per-variable quantisation precision overrides (default: lookup table + auto-cap)"`
 	DisableDeltaCodec bool   `help:"force bitshuffle-only encoding (faster, larger files)"`

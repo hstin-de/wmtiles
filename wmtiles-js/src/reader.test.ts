@@ -53,6 +53,35 @@ test("opens rawgrid.wmt and samples bilinearly", async () => {
   // Tile-pyramid API rejects raw-grid blocks (returns null).
   const tile = await v.tile({ time: 0, z: 0, x: 0, y: 0 });
   expect(tile).toBeNull();
+
+  // Inspection API: isRawGrid + rawGridSection + sampleDetail.
+  expect(await v.isRawGrid(0)).toBe(true);
+  const section = await v.rawGridSection(0);
+  expect(section).not.toBeNull();
+  expect(section!.nx).toBe(64);
+  expect(section!.ny).toBe(33);
+  expect(section!.lat0).toBe(30);
+  expect(section!.lon0).toBe(0);
+
+  const detail = await v.sampleDetail({ time: 0, lat: 30 + 2.5 * 0.5, lon: 0 + 2.5 * 0.5 });
+  expect(detail).not.toBeNull();
+  expect(detail!.gx).toBeCloseTo(2.5, 5);
+  expect(detail!.gy).toBeCloseTo(2.5, 5);
+  expect(detail!.neighbours[0].x).toBe(2);
+  expect(detail!.neighbours[0].y).toBe(2);
+  expect(detail!.neighbours[3].x).toBe(3);
+  expect(detail!.neighbours[3].y).toBe(3);
+  // All four neighbours present, no NaNs in the synthetic grid.
+  for (const n of detail!.neighbours) expect(Number.isNaN(n.value)).toBe(false);
+  expect(detail!.chunks.length).toBeGreaterThan(0);
+  expect(detail!.chunks[0].cx).toBe(0);
+  expect(detail!.chunks[0].cy).toBe(0);
+
+  // Out-of-bounds detail returns NaN bilinear, no neighbour info.
+  const oobDetail = await v.sampleDetail({ time: 0, lat: 90, lon: 0 });
+  expect(oobDetail).not.toBeNull();
+  expect(Number.isNaN(oobDetail!.bilinear)).toBe(true);
+  expect(oobDetail!.chunks.length).toBe(0);
 });
 
 test("opens minimal.wmt", async () => {

@@ -1,4 +1,10 @@
-import { open, latLonToTilePixel, type Variable, type WMT } from "wmtiles";
+import {
+  open,
+  latLonToTilePixel,
+  type SampleDetail,
+  type Variable,
+  type WMT,
+} from "wmtiles";
 import type {
   HeatmapRendererOptions,
   HeatmapRendererState,
@@ -268,15 +274,9 @@ function makeMapLibreBackend(wmt: WMT): Backend {
   };
 }
 
-interface ClickResult {
-  value?: number;
-  missing?: boolean;
-  z: number;
-  x: number;
-  y: number;
-  col: number;
-  row: number;
-}
+type ClickResult =
+  | { kind: "tile"; value?: number; missing?: boolean; z: number; x: number; y: number; col: number; row: number }
+  | { kind: "raw"; detail: SampleDetail; lat: number; lon: number };
 
 async function valueAtClick(
   wmt: WMT,
@@ -285,24 +285,55 @@ async function valueAtClick(
   lng: number,
   mapZoom: number,
 ): Promise<ClickResult | null> {
+  const v = layer.state.variable;
+  const t = layer.state.t | 0;
+  if (await v.isRawGrid(t)) {
+    const detail = await v.sampleDetail({ time: t, lat, lon: lng });
+    if (!detail) return null;
+    return { kind: "raw", detail, lat, lon: lng };
+  }
   const z = Math.min(
     Math.max(mapZoom | 0, wmt.zoomRange.min),
     wmt.zoomRange.max,
   );
   const px = latLonToTilePixel(z, lat, lng, wmt.tileSize);
   if (!px) return null;
-  const pixels = await layer.state.variable.tile({
-    time: layer.state.t,
-    z,
-    x: px.x,
-    y: px.y,
-  });
-  if (!pixels) return { missing: true, z, ...px };
+  const pixels = await v.tile({ time: t, z, x: px.x, y: px.y });
+  if (!pixels) return { kind: "tile", missing: true, z, ...px };
   return {
+    kind: "tile",
     value: pixels[px.row * wmt.tileSize + px.col],
     z,
     ...px,
   };
+}
+
+function formatValue(v: number, unit: string): string {
+  if (Number.isNaN(v)) return "<i>NaN</i>";
+  return `${v.toFixed(4)} ${unit}`.trimEnd();
+}
+
+function renderRawPopup(r: { kind: "raw"; detail: SampleDetail; lat: number; lon: number }, unit: string): string {
+  const d = r.detail;
+  const [n00, n10, n01, n11] = d.neighbours;
+  const chunkRows = d.chunks
+    .map((c) => {
+      const tag = c.absent ? " <i>absent</i>" : "";
+      return `chunk (${c.cx},${c.cy})  idx=${c.index}  off=${c.offset}  len=${c.length}${tag}`;
+    })
+    .join("<br>");
+  const fmt = (v: number) => (Number.isNaN(v) ? "NaN" : v.toFixed(4));
+  return (
+    `<b>${formatValue(d.bilinear, unit)}</b>` +
+    `<br><small>` +
+    `lat=${r.lat.toFixed(5)} lon=${r.lon.toFixed(5)}` +
+    `<br>nearest: ${fmt(d.nearest)} ${unit}`.trimEnd() +
+    `<br>grid coord: gx=${d.gx.toFixed(3)} gy=${d.gy.toFixed(3)}` +
+    `<br>(${n00.x},${n00.y})=${fmt(n00.value)}  (${n10.x},${n10.y})=${fmt(n10.value)}` +
+    `<br>(${n01.x},${n01.y})=${fmt(n01.value)}  (${n11.x},${n11.y})=${fmt(n11.value)}` +
+    `<br>${chunkRows}` +
+    `</small>`
+  );
 }
 
 function splitVarName(name: string): { param: string; level: string } {
@@ -763,16 +794,17 @@ async function boot(): Promise<void> {
   backend.onClick(async (lat, lng) => {
     const result = await valueAtClick(wmt, layer, lat, lng, backend.getZoom());
     const v = currentVar();
+    const unit = v?.unit ?? "";
     let body: string;
     if (!result) body = "<i>out of range</i>";
+    else if (result.kind === "raw") body = renderRawPopup(result, unit);
     else if (result.missing) body = "<i>no tile</i>";
     else if (result.value === undefined || Number.isNaN(result.value)) {
       body = "<i>NaN</i>";
     } else {
-      body = `<b>${result.value.toFixed(4)}</b> ${v?.unit ?? ""}`;
-    }
-    if (result && !(result.missing && result.value === undefined)) {
-      body += `<br><small>z=${result.z} tile=(${result.x},${result.y}) px=(${result.col},${result.row})</small>`;
+      body =
+        `<b>${result.value.toFixed(4)}</b> ${unit}` +
+        `<br><small>z=${result.z} tile=(${result.x},${result.y}) px=(${result.col},${result.row})</small>`;
     }
     backend.openPopup(lat, lng, body);
   });

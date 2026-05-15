@@ -26,6 +26,12 @@ const ColdStartBudget = 65536
 
 const MaxBlockRootBytes = 16384 - BlockHeaderSize
 
+// Raw-grid sections have no leaf indirection: the whole chunk directory must
+// load before any chunk read, so it scales linearly with chunk count rather
+// than fitting in a single-RTT prefetch budget. Reader fallback handles
+// oversize sections with one extra Range request; this cap is a sanity ceiling.
+const MaxRawGridSectionBytes = 4 << 20
+
 const MaxBlockTableRootBytes = 16384
 
 // Castagnoli: hardware-accelerated on SSE4.2/ARMv8, matches iSCSI/Btrfs

@@ -284,6 +284,60 @@ type SamplesBatch = (
   opts?: CoalesceOptions,
 ) => Promise<Float32Array>;
 
+type RawGridCheck = (varId: number, t: number) => Promise<boolean>;
+
+type RawGridSectionGetter = (
+  varId: number,
+  t: number,
+) => Promise<RawGridSection | null>;
+
+type SampleDetailFn = (
+  varId: number,
+  t: number,
+  lat: number,
+  lon: number,
+) => Promise<SampleDetail | null>;
+
+export interface SampleDetailNeighbour {
+  /** Source-grid column (0..nx-1). */
+  x: number;
+  /** Source-grid row (0..ny-1). */
+  y: number;
+  /** Decoded value at (x, y). NaN means NoData. */
+  value: number;
+}
+
+export interface SampleDetailChunk {
+  cx: number;
+  cy: number;
+  index: number;
+  /** Byte offset within the block's tile-data region. */
+  offset: number;
+  /** Byte length of the chunk payload. 0 means absent (all-NaN). */
+  length: number;
+  /** True when the chunk is recorded absent (length == 0). */
+  absent: boolean;
+}
+
+export interface SampleDetail {
+  /** Bilinear-interpolated value; NaN if any 2x2 neighbour is NaN or point is out of grid. */
+  bilinear: number;
+  /** Nearest-cell value; NaN if the nearest cell is NoData or the point is out of grid. */
+  nearest: number;
+  /** Fractional source-pixel coordinates (lon → gx, lat → gy). */
+  gx: number;
+  gy: number;
+  /** The four bilinear neighbours in (x0,y0), (x1,y0), (x0,y1), (x1,y1) order. */
+  neighbours: [
+    SampleDetailNeighbour,
+    SampleDetailNeighbour,
+    SampleDetailNeighbour,
+    SampleDetailNeighbour,
+  ];
+  /** Unique chunks the four neighbours map to. */
+  chunks: SampleDetailChunk[];
+}
+
 export interface Variable {
   /** Numeric ID assigned by the encoder. */
   readonly id: number;
@@ -299,6 +353,12 @@ export interface Variable {
   sample(req: SampleRequest): Promise<number | null>;
   /** Many values at (lat, lon). Chunk fetches are coalesced. */
   samples(req: SamplesRequest): Promise<Float32Array>;
+  /** True when the (variable, time) block was encoded with --no-tiles. */
+  isRawGrid(time: TimeRef): Promise<boolean>;
+  /** Raw-grid descriptor; null for tile-pyramid blocks. */
+  rawGridSection(time: TimeRef): Promise<RawGridSection | null>;
+  /** Inspection helper: bilinear + nearest + 4 neighbours + chunk info. Null when the block is a tile pyramid. */
+  sampleDetail(req: SampleRequest): Promise<SampleDetail | null>;
 }
 
 class WMTVariable implements Variable {
@@ -309,6 +369,9 @@ class WMTVariable implements Variable {
     private readonly _fetchTiles: TilesFetcher,
     private readonly _sample: Sampler,
     private readonly _samplesBatch: SamplesBatch,
+    private readonly _isRawGrid: RawGridCheck,
+    private readonly _rawGridSection: RawGridSectionGetter,
+    private readonly _sampleDetail: SampleDetailFn,
     private readonly _maxZoom: number,
     readonly id: number,
     readonly name: string,
@@ -338,6 +401,19 @@ class WMTVariable implements Variable {
     const t = this._timeIndexOf(req.time);
     const z = req.z ?? this._maxZoom;
     return this._samplesBatch(this.id, t, req.points, z, req.coalesce);
+  }
+
+  async isRawGrid(time: TimeRef): Promise<boolean> {
+    return this._isRawGrid(this.id, this._timeIndexOf(time));
+  }
+
+  async rawGridSection(time: TimeRef): Promise<RawGridSection | null> {
+    return this._rawGridSection(this.id, this._timeIndexOf(time));
+  }
+
+  async sampleDetail(req: SampleRequest): Promise<SampleDetail | null> {
+    const t = this._timeIndexOf(req.time);
+    return this._sampleDetail(this.id, t, req.lat, req.lon);
   }
 }
 
@@ -875,6 +951,150 @@ export class WMT {
     return tile[px.row * this._tileSize + px.col];
   }
 
+  private async _isRawGrid(varId: number, t: number): Promise<boolean> {
+    const blk = await this._lookupBlock(varId, t);
+    if (!blk) return false;
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    return cb.rawGrid !== null;
+  }
+
+  private async _rawGridSectionOf(
+    varId: number,
+    t: number,
+  ): Promise<RawGridSection | null> {
+    const blk = await this._lookupBlock(varId, t);
+    if (!blk) return null;
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    return cb.rawGrid;
+  }
+
+  private async _sampleDetail(
+    varId: number,
+    t: number,
+    lat: number,
+    lon: number,
+  ): Promise<SampleDetail | null> {
+    const blk = await this._lookupBlock(varId, t);
+    if (!blk) return null;
+    const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+    if (!cb.rawGrid) return null;
+    const g = cb.rawGrid;
+
+    const cs = 1 << g.chunkSizeLog2;
+    const gx = g.dx === 0 ? NaN : (lon - g.lon0) / g.dx;
+    const gy = g.dy === 0 ? NaN : (lat - g.lat0) / g.dy;
+    const inGrid =
+      Number.isFinite(gx) &&
+      Number.isFinite(gy) &&
+      gx >= 0 &&
+      gy >= 0 &&
+      gx <= g.nx - 1 &&
+      gy <= g.ny - 1;
+
+    const empty: SampleDetail = {
+      bilinear: NaN,
+      nearest: NaN,
+      gx,
+      gy,
+      neighbours: [
+        { x: 0, y: 0, value: NaN },
+        { x: 0, y: 0, value: NaN },
+        { x: 0, y: 0, value: NaN },
+        { x: 0, y: 0, value: NaN },
+      ],
+      chunks: [],
+    };
+    if (!inGrid) return empty;
+
+    const x0 = Math.floor(gx);
+    const y0 = Math.floor(gy);
+    const x1 = x0 + 1 > g.nx - 1 ? x0 : x0 + 1;
+    const y1 = y0 + 1 > g.ny - 1 ? y0 : y0 + 1;
+
+    const need = new Set<number>();
+    for (const x of [x0, x1]) {
+      for (const y of [y0, y1]) {
+        const cx = Math.floor(x / cs);
+        const cy = Math.floor(y / cs);
+        need.add(cy * g.chunkCountX + cx);
+      }
+    }
+    await this._ensureRawChunks(blk, cb, need);
+
+    const cache = cb.chunkCache!;
+    const pixelAt = (x: number, y: number): number => {
+      const cx = Math.floor(x / cs);
+      const cy = Math.floor(y / cs);
+      const pixels = cache.get(cy * g.chunkCountX + cx);
+      if (!pixels) return NaN;
+      const w = rawGridChunkWidth(g, cx);
+      return pixels[(y - cy * cs) * w + (x - cx * cs)];
+    };
+
+    const v00 = pixelAt(x0, y0);
+    const v10 = pixelAt(x1, y0);
+    const v01 = pixelAt(x0, y1);
+    const v11 = pixelAt(x1, y1);
+    const wx = gx - x0;
+    const wy = gy - y0;
+
+    let bilinear: number;
+    if (
+      Number.isNaN(v00) ||
+      Number.isNaN(v10) ||
+      Number.isNaN(v01) ||
+      Number.isNaN(v11)
+    ) {
+      bilinear = NaN;
+    } else {
+      const a = v00 * (1 - wx) + v10 * wx;
+      const b = v01 * (1 - wx) + v11 * wx;
+      bilinear = a * (1 - wy) + b * wy;
+    }
+
+    const nx = Math.min(g.nx - 1, Math.max(0, Math.round(gx)));
+    const ny = Math.min(g.ny - 1, Math.max(0, Math.round(gy)));
+    const nearest = pixelAt(nx, ny);
+
+    const seenChunks = new Set<number>();
+    const chunks: SampleDetailChunk[] = [];
+    for (const [x, y] of [
+      [x0, y0],
+      [x1, y0],
+      [x0, y1],
+      [x1, y1],
+    ]) {
+      const cx = Math.floor(x / cs);
+      const cy = Math.floor(y / cs);
+      const idx = cy * g.chunkCountX + cx;
+      if (seenChunks.has(idx)) continue;
+      seenChunks.add(idx);
+      const length = g.chunkLengths[idx];
+      chunks.push({
+        cx,
+        cy,
+        index: idx,
+        offset: g.chunkOffsets[idx],
+        length,
+        absent: length === 0,
+      });
+    }
+
+    return {
+      bilinear,
+      nearest,
+      gx,
+      gy,
+      neighbours: [
+        { x: x0, y: y0, value: v00 },
+        { x: x1, y: y0, value: v10 },
+        { x: x0, y: y1, value: v01 },
+        { x: x1, y: y1, value: v11 },
+      ],
+      chunks,
+    };
+  }
+
   private async _sampleRaw(
     blk: BlockTableEntry,
     cb: CachedBlock,
@@ -1147,6 +1367,9 @@ export class WMT {
           (varId, t, lat, lon, z) => this._sample(varId, t, lat, lon, z),
           (varId, t, points, z, opts) =>
             this._samplesBatch(varId, t, points, z, opts),
+          (varId, t) => this._isRawGrid(varId, t),
+          (varId, t) => this._rawGridSectionOf(varId, t),
+          (varId, t, lat, lon) => this._sampleDetail(varId, t, lat, lon),
           this._header.maxZoom,
           v.id,
           v.name,

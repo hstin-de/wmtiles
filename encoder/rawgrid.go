@@ -16,10 +16,9 @@ import (
 )
 
 const (
-	// RawGridDefaultChunkSizeLog2 = 8 -> 256x256 chunks. Matches the typical
-	// tile size, so memory pressure during decode is comparable, and a point
-	// query touches one chunk of <= 256x256 source pixels.
-	RawGridDefaultChunkSizeLog2 = 8
+	// 32x32 source pixels per chunk. Sized for point-query workloads where a
+	// query fetches one chunk to read one value
+	RawGridDefaultChunkSizeLog2 = 5
 )
 
 type RawGridSpec struct {
@@ -340,9 +339,9 @@ func encodeRawGridBlock(
 	if err != nil {
 		return nil, fmt.Errorf("raw grid block %q: compress section: %w", spec.Variable, err)
 	}
-	if len(sectionComp) > format.MaxBlockRootBytes {
-		return nil, fmt.Errorf("raw grid block %q: section %d > limit %d (chunks=%d); use a smaller chunk size",
-			spec.Variable, len(sectionComp), format.MaxBlockRootBytes, totalChunks)
+	if len(sectionComp) > format.MaxRawGridSectionBytes {
+		return nil, fmt.Errorf("raw grid block %q: section %d > limit %d (chunks=%d); use a larger chunk size",
+			spec.Variable, len(sectionComp), format.MaxRawGridSectionBytes, totalChunks)
 	}
 
 	var nodata uint32
