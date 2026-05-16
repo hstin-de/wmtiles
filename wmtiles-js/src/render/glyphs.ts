@@ -578,11 +578,20 @@ export class GlyphRenderer {
     if (this.disposed) return false;
     // canonical world only, no wrap copies
     const filtered = tiles.filter((t) => t.worldX === t.x);
-    // fingerprint the tile set: matrix mode calls setView on every move, and a
-    // pan that doesn't change the set shouldn't trigger a rebuild
+    // fingerprint the tile set: matrix mode reprojects per frame so a pan with
+    // an unchanged set is a true no-op. Screen mode bakes device-pixel
+    // sx0/sy0 into the instance buffer, so those must be re-uploaded every
+    // pan even when z/x/y stays the same.
     let key = "";
     for (const t of filtered) key += `${t.z},${t.x},${t.y};`;
-    if (key === this.viewKey) return false;
+    const tileSetChanged = key !== this.viewKey;
+    if (!tileSetChanged) {
+      if (this.matrixMode) return false;
+      this.view = filtered;
+      this.instancesDirty = true;
+      this.scheduler.schedule();
+      return false;
+    }
     this.viewKey = key;
     this.view = filtered;
     this.computeLayout();
