@@ -396,6 +396,7 @@ class MapLibreHatchLayer implements CustomLayerInterface {
       shaderData(options),
       canvas.width,
       canvas.height,
+      mapWorldSize(this.map),
     );
   }
 }

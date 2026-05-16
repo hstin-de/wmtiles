@@ -1,6 +1,6 @@
 {
   "name": "wmtiles",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Pure-TypeScript reader plus WebGL2 renderers (heatmap, animated particles, vector arrows, isobars) and optional Leaflet/MapLibre adapters for the WMTiles single-file weather data format. Reader runs in browsers, Node, Bun, and Cloudflare Workers; renderers need a WebGL2 canvas.",
   "keywords": [
     "wmtiles",

@@ -63,6 +63,10 @@ export interface HatchRendererOptions extends TileSourceOptions {
   disableTimeLerp?: boolean;
   // device-pixels-per-CSS-pixel, so screen-space patterns match on retina
   pixelRatio?: number;
+  // when true, the pattern is anchored to map content (zoom-aware) so the same
+  // lat/lon shows the same pattern phase regardless of pan. Default false
+  // (screen-locked).
+  lockToMap?: boolean;
   onFrame?: (frameMs: number) => void;
   matrixMode?: boolean;
   onRedraw?: () => void;
@@ -149,35 +153,48 @@ function uploadIconImage(
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
 }
 
-const VS_SCREEN = `#version 300 es
+function buildScreenVS(lockToMap: boolean): string {
+  return `#version 300 es
 precision highp float;
 layout(location=0) in vec2 a_pos;
 uniform vec2 u_screen;
 uniform vec4 u_rect;
+${lockToMap ? "uniform vec4 u_mapAnchor;  // (anchorX, anchorY, sizeX, sizeY) in device px" : ""}
 out vec2 v_uv;
+${lockToMap ? "out vec2 v_mapPx;" : ""}
 void main() {
   vec2 px = mix(u_rect.xy, u_rect.zw, a_pos);
   vec2 ndc = vec2(px.x / u_screen.x * 2.0 - 1.0, 1.0 - px.y / u_screen.y * 2.0);
   v_uv = a_pos;
+  ${lockToMap ? "v_mapPx = u_mapAnchor.xy + a_pos * u_mapAnchor.zw;" : ""}
   gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
+}
 
-function buildMatrixVS(shaderData: GlobeShaderData): string {
+function buildMatrixVS(
+  shaderData: GlobeShaderData,
+  lockToMap: boolean,
+): string {
   return `#version 300 es
 precision highp float;
 ${shaderData.vertexShaderPrelude}
 ${shaderData.define}
 layout(location=0) in vec2 a_pos;
 uniform vec4 u_rect;
+${lockToMap ? "uniform float u_mapWorldPx;  // mercator-world span in device px at current zoom" : ""}
 out vec2 v_uv;
+${lockToMap ? "out vec2 v_mapPx;" : ""}
 void main() {
   vec2 mercator = mix(u_rect.xy, u_rect.zw, a_pos);
   v_uv = a_pos;
+  ${lockToMap ? "v_mapPx = mercator * u_mapWorldPx;" : ""}
   gl_Position = projectTile(mercator);
 }`;
 }
 
-const PATTERN_GLSL = `
+function buildPatternGlsl(lockToMap: boolean): string {
+  const coord = lockToMap ? "v_mapPx" : "gl_FragCoord.xy";
+  return `
 // perpendicular distance to the nearest line center, AA'd to ~1px
 float lineCov(float coord, float spacing, float thickness) {
   float d = abs(mod(coord, spacing) - spacing * 0.5);
@@ -186,7 +203,7 @@ float lineCov(float coord, float spacing, float thickness) {
 }
 // diagonals are projected so spacing/thickness stay true perpendicular px
 float patternCov(int kind, float spacing, float thickness) {
-  vec2 fc = gl_FragCoord.xy;
+  vec2 fc = ${coord};
   if (kind == 0) return lineCov((fc.x + fc.y) * 0.70710678, spacing, thickness);
   if (kind == 1) return lineCov((fc.x - fc.y) * 0.70710678, spacing, thickness);
   if (kind == 2) return max(
@@ -199,11 +216,17 @@ float patternCov(int kind, float spacing, float thickness) {
   return 1.0 - smoothstep(thickness - 1.0, thickness + 1.0, length(cell));
 }
 `;
+}
 
-function buildFS(bands: HatchBand[], premultiply: boolean): string {
+function buildFS(
+  bands: HatchBand[],
+  premultiply: boolean,
+  lockToMap: boolean,
+): string {
   // icon bands each get a sampler, on texture units 2, 3, ... (0/1 are data)
   let iconIndex = 0;
   const samplerDecls: string[] = [];
+  const coord = lockToMap ? "v_mapPx" : "gl_FragCoord.xy";
 
   const bandCode = bands
     .map((b, i) => {
@@ -217,7 +240,7 @@ function buildFS(bands: HatchBand[], premultiply: boolean): string {
   if (v >= u_bandMin[${i}] && v < u_bandMax[${i}]) {
     float pitch = ${glslFloat(spacing)} * u_dpr;
     float isz = ${glslFloat(iconSize)} * u_dpr;
-    vec2 cell = mod(gl_FragCoord.xy, pitch) - 0.5 * pitch;
+    vec2 cell = mod(${coord}, pitch) - 0.5 * pitch;
     vec2 q = cell / isz + 0.5;
     if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
       vec4 ic = texture(u_icon${k}, vec2(q.x, 1.0 - q.y));
@@ -250,6 +273,7 @@ function buildFS(bands: HatchBand[], premultiply: boolean): string {
   return `#version 300 es
 precision highp float;
 in vec2 v_uv;
+${lockToMap ? "in vec2 v_mapPx;" : ""}
 out vec4 outColor;
 uniform sampler2D u_texA;
 uniform sampler2D u_texB;
@@ -264,7 +288,7 @@ uniform float u_bandMin[${bands.length}];
 uniform float u_bandMax[${bands.length}];
 
 ${MISSING_GLSL_PREAMBLE}
-${PATTERN_GLSL}
+${buildPatternGlsl(lockToMap)}
 
 void main() {
   float vA = texture(u_texA, u_uvOffA + v_uv * u_uvScaleA).r;
@@ -294,6 +318,9 @@ interface ProgramHandles {
   uBandMax: WebGLUniformLocation | null;
   // one sampler location per icon band, in band order
   uIcons: (WebGLUniformLocation | null)[];
+  // lockToMap only: screen-mode per-tile anchor, matrix-mode world span
+  uMapAnchor: WebGLUniformLocation | null;
+  uMapWorldPx: WebGLUniformLocation | null;
   proj: ProjectionUniformLocs;
 }
 
@@ -331,6 +358,8 @@ function buildProgram(
     uIcons: Array.from({ length: iconCount }, (_, k) =>
       gl.getUniformLocation(program, `u_icon${k}`),
     ),
+    uMapAnchor: gl.getUniformLocation(program, "u_mapAnchor"),
+    uMapWorldPx: gl.getUniformLocation(program, "u_mapWorldPx"),
     proj: getProjectionUniformLocs(gl, program),
   };
 }
@@ -338,6 +367,7 @@ function buildProgram(
 export class HatchRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly matrixMode: boolean;
+  private readonly lockToMap: boolean;
   private readonly programs: VariantProgramCache<ProgramHandles>;
   private readonly scheduler: RedrawScheduler;
   private readonly vao: WebGLVertexArrayObject;
@@ -365,6 +395,8 @@ export class HatchRenderer {
   private viewportW = 1;
   private viewportH = 1;
   private dpr: number;
+  // matrix-mode world size in CSS px; the adapter refreshes it per draw()
+  private worldSize = 0;
 
   state: HatchRendererState;
 
@@ -376,6 +408,7 @@ export class HatchRenderer {
   ) {
     this.gl = gl;
     this.matrixMode = options?.matrixMode ?? false;
+    this.lockToMap = options?.lockToMap ?? false;
 
     // one open-ended forward hatch is the do-nothing-surprising default
     this.bands = options?.bands?.length
@@ -397,14 +430,25 @@ export class HatchRenderer {
     this.dpr = options?.pixelRatio ?? DEFAULTS.pixelRatio;
     this.onFrame = options?.onFrame;
 
+    const lockToMap = this.lockToMap;
     this.programs = new VariantProgramCache<ProgramHandles>(
       gl,
       this.matrixMode,
       {
         buildScreen: (g) =>
-          buildProgram(g, VS_SCREEN, buildFS(this.bands, false), iconCount),
+          buildProgram(
+            g,
+            buildScreenVS(lockToMap),
+            buildFS(this.bands, false, lockToMap),
+            iconCount,
+          ),
         buildMatrix: (g, sd) =>
-          buildProgram(g, buildMatrixVS(sd), buildFS(this.bands, true), iconCount),
+          buildProgram(
+            g,
+            buildMatrixVS(sd, lockToMap),
+            buildFS(this.bands, true, lockToMap),
+            iconCount,
+          ),
         destroy: (g, p) => g.deleteProgram(p.program),
       },
     );
@@ -512,10 +556,12 @@ export class HatchRenderer {
     shaderData: GlobeShaderData,
     viewportWPx: number,
     viewportHPx: number,
+    worldSize = 0,
   ): void {
     if (this.disposed || !this.matrixMode) return;
     this.viewportW = Math.max(1, viewportWPx | 0);
     this.viewportH = Math.max(1, viewportHPx | 0);
+    this.worldSize = worldSize;
     this.drawInternal(projData, shaderData);
   }
 
@@ -538,6 +584,8 @@ export class HatchRenderer {
     sy0: number,
     sx1: number,
     sy1: number,
+    worldX: number,
+    y: number,
   ): void {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0);
@@ -550,6 +598,11 @@ export class HatchRenderer {
     gl.uniform2f(prog.uUvOffB, B.ox, B.oy);
     gl.uniform2f(prog.uUvScaleB, B.s, B.s);
     gl.uniform1f(prog.uLerp, lerp);
+    if (this.lockToMap && !this.matrixMode && prog.uMapAnchor) {
+      const sw = sx1 - sx0;
+      const sh = sy1 - sy0;
+      gl.uniform4f(prog.uMapAnchor, worldX * sw, y * sh, sw, sh);
+    }
     if (this.matrixMode) {
       gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_SHORT, 0);
     } else {
@@ -570,19 +623,20 @@ export class HatchRenderer {
     sy0: number,
     sx1: number,
     sy1: number,
+    worldX: number,
   ): boolean {
     const A = this.source.findTex(variable, tF, z, x, y);
     const B = frac > 0 ? this.source.findTex(variable, tC, z, x, y) : A;
     if (A && B) {
-      this.drawPair(prog, A, B, frac, sx0, sy0, sx1, sy1);
+      this.drawPair(prog, A, B, frac, sx0, sy0, sx1, sy1, worldX, y);
       return true;
     }
     if (A) {
-      this.drawPair(prog, A, A, 0, sx0, sy0, sx1, sy1);
+      this.drawPair(prog, A, A, 0, sx0, sy0, sx1, sy1, worldX, y);
       return true;
     }
     if (B) {
-      this.drawPair(prog, B, B, 0, sx0, sy0, sx1, sy1);
+      this.drawPair(prog, B, B, 0, sx0, sy0, sx1, sy1, worldX, y);
       return true;
     }
     return false;
@@ -634,6 +688,9 @@ export class HatchRenderer {
     gl.uniform1fv(prog.uBandMax, this.bandMax);
     gl.uniform1i(prog.uTexA, 0);
     gl.uniform1i(prog.uTexB, 1);
+    if (this.lockToMap && this.matrixMode && prog.uMapWorldPx) {
+      gl.uniform1f(prog.uMapWorldPx, this.worldSize * this.dpr);
+    }
     // icon sprites stay bound for the whole tile loop on units 2, 3, ...;
     // drawPair only touches units 0/1
     for (let k = 0; k < this.iconTextures.length; k++) {
@@ -657,6 +714,7 @@ export class HatchRenderer {
         variable, tF, tC, frac,
         r.z, r.x, r.y,
         r.sx0, r.sy0, r.sx1, r.sy1,
+        r.worldX,
       );
 
       if (!drew && childOK && r.z + 1 <= maxZ) {
@@ -673,6 +731,7 @@ export class HatchRenderer {
               r.sy0 + (cy * h) / 2,
               r.sx0 + ((cx + 1) * w) / 2,
               r.sy0 + ((cy + 1) * h) / 2,
+              r.worldX * 2 + cx,
             );
           }
         }

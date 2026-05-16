@@ -636,6 +636,7 @@ async function boot(): Promise<void> {
   const hatchThresholdEl = $("hatchThreshold") as HTMLInputElement;
   const hatchPatternSel = $("hatchPattern") as HTMLSelectElement;
   const hatchIconFileEl = $("hatchIconFile") as HTMLInputElement;
+  const hatchLockToMapEl = $("hatchLockToMap") as HTMLInputElement;
   // backs the "icon:upload" pattern option
   let uploadedIconUrl: string | null = null;
   for (const v of sortedVars) {
@@ -670,10 +671,11 @@ async function boot(): Promise<void> {
       band = { range, pattern: pat as HatchPattern, color: [255, 90, 90] };
     }
     try {
-      // bands are baked into the shader, so any band change rebuilds the layer
+      // bands and lockToMap are baked into the shader, so any change rebuilds
       hatchLayer = backend.addHatch({
         variable: name,
         bands: [band],
+        lockToMap: hatchLockToMapEl.checked,
         tileTextureFormat,
       });
       hatchLayer.setState({ t: +time.value });
@@ -685,6 +687,7 @@ async function boot(): Promise<void> {
   hatchModeSel.onchange = rebuildHatchLayer;
   hatchThresholdEl.onchange = rebuildHatchLayer;
   hatchPatternSel.onchange = rebuildHatchLayer;
+  hatchLockToMapEl.onchange = rebuildHatchLayer;
   hatchIconFileEl.onchange = () => {
     const file = hatchIconFileEl.files?.[0];
     if (!file) return;
