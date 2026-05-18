@@ -73,18 +73,18 @@ type blockCacheEntry struct {
 	header *format.BlockHeader
 	root   []directory.Entry
 
-	// rawGrid is set instead of root when BlockFlagRawGrid is set on the
-	// block header. The root region holds the raw-grid section bytes; the
-	// directory format is intentionally absent.
+	// set instead of root when BlockFlagRawGrid is on.
 	rawGrid *format.RawGridSection
 
-	// chunkCache caches the dequantized float32 buffer for chunks accessed
-	// via Sample/Samples. Bounded by chunkCacheCap and only populated for
-	// raw-grid blocks.
-	chunkMu     sync.Mutex
-	chunkCache  map[uint32][]float32
-	chunkOrder  *list.List
-	chunkTotal  int
+	// dequantized chunk pixels, bounded by chunkCacheCap (raw-grid only).
+	chunkMu    sync.Mutex
+	chunkCache map[uint32][]float32
+	chunkOrder *list.List
+	chunkTotal int
+
+	// unbounded; one entry per visited coarse cell (~KB each).
+	fineMu    sync.Mutex
+	fineCache map[int]*fineIndex
 
 	// dict is loaded lazily on the first dict-flagged tile read.
 	dictMu     sync.Mutex
@@ -492,7 +492,7 @@ func (r *Reader) loadBlockHeaderEntry(blockOff, blockLen uint64) (*format.BlockH
 		rawGrid *format.RawGridSection
 	)
 	if hdr.BlockFlags&format.BlockFlagRawGrid != 0 {
-		rawGrid, err = format.UnmarshalRawGridSection(rootDecomp)
+		rawGrid, err = format.UnmarshalRawGridSectionRoot(rootDecomp)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("parse raw-grid section: %w", err)
 		}

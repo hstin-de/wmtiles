@@ -12,9 +12,9 @@
     "test": "true"
   },
   "dependencies": {
-    "wmtiles": "workspace:*",
     "leaflet": "^1.9.4",
-    "maplibre-gl": "^5.0.0"
+    "maplibre-gl": "^5.0.0",
+    "wmtiles": "workspace:*"
   },
   "devDependencies": {
     "@types/leaflet": "^1.9.12",

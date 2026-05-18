@@ -12,13 +12,11 @@ import (
 	"github.com/hstin-de/wmtiles/quantize"
 )
 
-// SamplePoint is one lat/lon query against a (variable, time) raw-grid block.
 type SamplePoint struct {
 	Lat, Lon float64
 }
 
-// SampleCoalesceOptions controls how Samples groups chunk reads into byte-range
-// requests. Zero values pick sensible defaults.
+// Zero values pick sensible defaults.
 type SampleCoalesceOptions struct {
 	MaxGapBytes     uint64
 	MaxRequestBytes uint64
@@ -29,10 +27,7 @@ const (
 	defaultSampleMaxRequestBytes uint64 = 1 << 20
 )
 
-// ReadSample returns one bilinearly-interpolated value for (lat, lon) from a
-// raw-grid block. Returns NaN when the point lies outside the source grid;
-// returns ErrNotRawGrid if the block is a tile pyramid; returns ErrNotFound
-// if the (variable, time) block does not exist.
+// NaN out-of-grid; ErrNotRawGrid on a tile pyramid; ErrNotFound on a missing block.
 func (r *Reader) ReadSample(variable string, t uint32, lat, lon float64) (float32, error) {
 	id, ok := r.VariableID(variable)
 	if !ok {
@@ -56,9 +51,7 @@ func (r *Reader) ReadSample(variable string, t uint32, lat, lon float64) (float3
 	return value, nil
 }
 
-// ReadSamples returns one bilinearly-interpolated value per point. Chunk fetches
-// are coalesced into byte-range requests so a viewport-sized query stays
-// network-cheap. Returns ErrNotRawGrid if the block is a tile pyramid.
+// Chunk fetches are coalesced into shared range requests.
 func (r *Reader) ReadSamples(variable string, t uint32, points []SamplePoint, opts ...SampleCoalesceOptions) ([]float32, error) {
 	id, ok := r.VariableID(variable)
 	if !ok {
@@ -100,8 +93,7 @@ func (r *Reader) ReadSamples(variable string, t uint32, points []SamplePoint, op
 	return out, nil
 }
 
-// sampleFromRawBlock performs the bilinear interpolation. Out-of-bounds points
-// return NaN. If any of the four neighbours is NaN, the result is NaN.
+// any-NaN neighbour → NaN; out-of-grid → NaN.
 func (r *Reader) sampleFromRawBlock(
 	entry format.BlockTableEntry,
 	hdr *format.BlockHeader,
@@ -162,8 +154,6 @@ func (r *Reader) sampleFromRawBlock(
 	return a*(1-wy) + b*wy, nil
 }
 
-// pixelAt returns the dequantized value at source-grid coords (x, y), going
-// through the per-chunk decode cache.
 func (r *Reader) pixelAt(
 	entry format.BlockTableEntry,
 	hdr *format.BlockHeader,
@@ -185,8 +175,88 @@ func (r *Reader) pixelAt(
 	return pixels[row*w+col], nil
 }
 
-// loadChunk decodes and caches the float32 buffer for one chunk. The on-disk
-// payload is at (blockOffset + tile_data_offset + chunk_offset).
+// chunk (offset, length) in cell-row-major order.
+type fineIndex struct {
+	offsets []uint64
+	lengths []uint64
+	cellW   uint32
+}
+
+// cached unbounded per block; fine-indices are ~KB.
+func (r *Reader) loadFineIndex(
+	entry format.BlockTableEntry,
+	hdr *format.BlockHeader,
+	ce *blockCacheEntry,
+	coarseIdx int,
+) (*fineIndex, error) {
+	ce.fineMu.Lock()
+	if fi, ok := ce.fineCache[coarseIdx]; ok {
+		ce.fineMu.Unlock()
+		return fi, nil
+	}
+	ce.fineMu.Unlock()
+
+	g := ce.rawGrid
+	if coarseIdx < 0 || coarseIdx >= len(g.CoarseTable) {
+		return nil, fmt.Errorf("fine index: coarse idx %d out of range [0,%d)", coarseIdx, len(g.CoarseTable))
+	}
+	cce := g.CoarseTable[coarseIdx]
+	coarseCountX := int(g.CoarseCountX())
+	coarseCx := uint32(coarseIdx % coarseCountX)
+	coarseCy := uint32(coarseIdx / coarseCountX)
+	cellW, cellH := g.CoarseCellChunkExtent(coarseCx, coarseCy)
+	expected := int(cellW) * int(cellH)
+
+	var offsets, lengths []uint64
+	if cce.Length == 0 {
+		// Degenerate cell with no chunks (only possible for malformed inputs).
+		offsets = make([]uint64, expected)
+		lengths = make([]uint64, expected)
+	} else {
+		buf := make([]byte, cce.Length)
+		abs := entry.BlockOffset + hdr.LeafDirectoriesOffset + uint64(cce.Offset)
+		if _, err := r.src.ReadAt(buf, int64(abs)); err != nil {
+			return nil, fmt.Errorf("read fine index for coarse %d: %w", coarseIdx, err)
+		}
+		var err error
+		offsets, lengths, err = format.UnmarshalFineIndex(buf, expected)
+		if err != nil {
+			return nil, fmt.Errorf("parse fine index for coarse %d: %w", coarseIdx, err)
+		}
+	}
+	fi := &fineIndex{offsets: offsets, lengths: lengths, cellW: cellW}
+
+	ce.fineMu.Lock()
+	defer ce.fineMu.Unlock()
+	if existing, ok := ce.fineCache[coarseIdx]; ok {
+		return existing, nil
+	}
+	if ce.fineCache == nil {
+		ce.fineCache = map[int]*fineIndex{}
+	}
+	ce.fineCache[coarseIdx] = fi
+	return fi, nil
+}
+
+func (r *Reader) chunkLocation(
+	entry format.BlockTableEntry,
+	hdr *format.BlockHeader,
+	ce *blockCacheEntry,
+	cx, cy uint32,
+) (offset, length uint64, err error) {
+	g := ce.rawGrid
+	coarseIdx, localIdx := g.CoarseIndexOf(cx, cy)
+	fi, err := r.loadFineIndex(entry, hdr, ce, coarseIdx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if localIdx < 0 || localIdx >= len(fi.offsets) {
+		return 0, 0, fmt.Errorf("fine index: local idx %d out of range [0,%d)", localIdx, len(fi.offsets))
+	}
+	return fi.offsets[localIdx], fi.lengths[localIdx], nil
+}
+
+// payload at (blockOffset + tile_data_offset + chunk_offset).
 func (r *Reader) loadChunk(
 	entry format.BlockTableEntry,
 	hdr *format.BlockHeader,
@@ -210,8 +280,10 @@ func (r *Reader) loadChunk(
 	ce.chunkMu.Unlock()
 
 	g := ce.rawGrid
-	length := g.ChunkLengths[idx]
-	offset := g.ChunkOffsets[idx]
+	offset, length, err := r.chunkLocation(entry, hdr, ce, cx, cy)
+	if err != nil {
+		return nil, err
+	}
 	w := g.ChunkWidth(cx)
 	h := g.ChunkHeight(cy)
 	n := w * h
@@ -280,9 +352,7 @@ func (r *Reader) returnDecoder(d *codec.Decoder) {
 	r.decoderPool.Put(d)
 }
 
-// prefetchChunksFor figures out the unique chunks any of the points touches
-// (with 1-cell bilinear neighbourhood) and decodes them, coalescing adjacent
-// chunk reads into shared byte-range requests.
+// decodes every chunk under the bilinear 2x2 neighbourhood of any point.
 func (r *Reader) prefetchChunksFor(
 	entry format.BlockTableEntry,
 	hdr *format.BlockHeader,
@@ -328,7 +398,6 @@ func (r *Reader) prefetchChunksFor(
 		return nil
 	}
 
-	// already-cached chunks don't need fetching.
 	ce.chunkMu.Lock()
 	for idx := range need {
 		if _, ok := ce.chunkCache[idx]; ok {
@@ -340,22 +409,39 @@ func (r *Reader) prefetchChunksFor(
 		return nil
 	}
 
+	// dedup by coarse cell so each fine-index is fetched at most once.
+	coarseSet := map[int]struct{}{}
+	for idx := range need {
+		cy := idx / g.ChunkCountX
+		cx := idx % g.ChunkCountX
+		coarseIdx, _ := g.CoarseIndexOf(cx, cy)
+		coarseSet[coarseIdx] = struct{}{}
+	}
+	for coarseIdx := range coarseSet {
+		if _, err := r.loadFineIndex(entry, hdr, ce, coarseIdx); err != nil {
+			return err
+		}
+	}
+
 	type chunkRange struct {
-		idx        uint32
-		off, ln    uint64
-		cx, cy     uint32
+		idx     uint32
+		off, ln uint64
+		cx, cy  uint32
 	}
 	ranges := make([]chunkRange, 0, len(need))
 	for idx := range need {
 		cy := idx / g.ChunkCountX
 		cx := idx % g.ChunkCountX
+		off, ln, err := r.chunkLocation(entry, hdr, ce, cx, cy)
+		if err != nil {
+			return err
+		}
 		ranges = append(ranges, chunkRange{
-			idx: idx, off: g.ChunkOffsets[idx], ln: g.ChunkLengths[idx], cx: cx, cy: cy,
+			idx: idx, off: off, ln: ln, cx: cx, cy: cy,
 		})
 	}
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].off < ranges[j].off })
 
-	// coalesce contiguous-or-near ranges into combined byte-range fetches.
 	i := 0
 	for i < len(ranges) {
 		j := i
@@ -445,9 +531,7 @@ func (r *Reader) cacheChunkPixels(ce *blockCacheEntry, idx uint32, pixels []floa
 	return nil
 }
 
-// IsRawGridBlock returns true when the (variable, time) block was encoded with
-// the no-tiles path. Useful for callers that need to dispatch between the
-// tile-pyramid and sample APIs without catching ErrRawGridBlock.
+// lets callers dispatch tile-pyramid vs sample APIs without catching ErrRawGridBlock.
 func (r *Reader) IsRawGridBlock(variable string, t uint32) (bool, error) {
 	id, ok := r.VariableID(variable)
 	if !ok {
@@ -464,8 +548,7 @@ func (r *Reader) IsRawGridBlock(variable string, t uint32) (bool, error) {
 	return hdr.BlockFlags&format.BlockFlagRawGrid != 0, nil
 }
 
-// RawGridSection returns the parsed raw-grid descriptor for (variable, time).
-// Returns ErrNotRawGrid if the block is a Hilbert tile pyramid.
+// ErrNotRawGrid on a tile pyramid.
 func (r *Reader) RawGridSection(variable string, t uint32) (*format.RawGridSection, error) {
 	id, ok := r.VariableID(variable)
 	if !ok {

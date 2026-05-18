@@ -16,8 +16,7 @@ import (
 )
 
 const (
-	// 32x32 source pixels per chunk. Sized for point-query workloads where a
-	// query fetches one chunk to read one value
+	// 32x32 pixels: one chunk per point query.
 	RawGridDefaultChunkSizeLog2 = 5
 )
 
@@ -29,18 +28,14 @@ type RawGridSpec struct {
 	Lat0, Lon0 float64
 	DY, DX     float64
 
-	// MissingValue marks the source NoData sentinel; NaN means "use NaN
-	// directly". Values matching MissingValue are recoded to NaN before
-	// quantisation so dedup of all-NoData chunks works regardless of source
-	// convention.
+	// source NoData sentinel (NaN = unset); recoded to NaN pre-quantise so
+	// all-NoData chunks dedup regardless of source convention.
 	MissingValue float64
 
-	// Precision drives FitParams; 0 means "full-range u16".
+	// 0 = full-range u16.
 	Precision float64
 
-	// ChunkSizeLog2 picks the chunk side in source pixels. 0 means default
-	// (RawGridDefaultChunkSizeLog2). Allowed range matches the format spec
-	// (4..12, so 16..4096 pixels per side).
+	// 0 = RawGridDefaultChunkSizeLog2. Range 4..12 (16..4096 px per side).
 	ChunkSizeLog2 uint8
 }
 
@@ -58,6 +53,7 @@ type rawGridBlockBuilder struct {
 
 	section      *format.RawGridSection
 	sectionBytes []byte // compressed wire bytes of the section (the "root" region)
+	fineIndices  []byte // concatenated per-coarse-cell fine-indices, uncompressed
 	tileData     []byte // concatenated chunk payloads
 	addressed    uint32
 	contents     uint64
@@ -77,6 +73,11 @@ func (b *rawGridBlockBuilder) writeBlockTo(w io.Writer) (int64, error) {
 	} else {
 		total += int64(n)
 	}
+	if n, err := w.Write(b.fineIndices); err != nil {
+		return total + int64(n), err
+	} else {
+		total += int64(n)
+	}
 	if n, err := w.Write(b.tileData); err != nil {
 		return total + int64(n), err
 	} else {
@@ -88,15 +89,17 @@ func (b *rawGridBlockBuilder) writeBlockTo(w io.Writer) (int64, error) {
 func (b *rawGridBlockBuilder) header() *format.BlockHeader {
 	rootOff := uint64(format.BlockHeaderSize)
 	rootLen := uint32(len(b.sectionBytes))
-	tileDataOff := rootOff + uint64(rootLen)
+	fineOff := rootOff + uint64(rootLen)
+	fineLen := uint64(len(b.fineIndices))
+	tileDataOff := fineOff + fineLen
 	return &format.BlockHeader{
 		BlockFormatVersion:    format.BlockFormatVersion,
 		BlockFlags:            format.BlockFlagRawGrid,
 		RootDirectoryOffset:   rootOff,
 		RootDirectoryLength:   rootLen,
 		DictLength:            0,
-		LeafDirectoriesOffset: 0,
-		LeafDirectoriesLength: 0,
+		LeafDirectoriesOffset: fineOff,
+		LeafDirectoriesLength: fineLen,
 		TileDataOffset:        tileDataOff,
 		TileDataLength:        uint64(len(b.tileData)),
 		NumAddressedTiles:     b.addressed,
@@ -105,7 +108,8 @@ func (b *rawGridBlockBuilder) header() *format.BlockHeader {
 }
 
 func (b *rawGridBlockBuilder) blockTableEntry(fileOffset uint64) format.BlockTableEntry {
-	blockLen := uint64(format.BlockHeaderSize) + uint64(len(b.sectionBytes)) + uint64(len(b.tileData))
+	blockLen := uint64(format.BlockHeaderSize) + uint64(len(b.sectionBytes)) +
+		uint64(len(b.fineIndices)) + uint64(len(b.tileData))
 	return format.BlockTableEntry{
 		VariableID:          b.variableID,
 		TimeID:              b.timeID,
@@ -126,8 +130,30 @@ func (b *rawGridBlockBuilder) blockTableEntry(fileOffset uint64) format.BlockTab
 
 func (b *rawGridBlockBuilder) release() {
 	b.sectionBytes = nil
+	b.fineIndices = nil
 	b.tileData = nil
 	b.section = nil
+}
+
+// target ~64 coarse cells total, capped so cells hold ≤~256 chunks.
+func pickCoarseSizeLog2(chunkCountX, chunkCountY uint32) uint8 {
+	total := float64(chunkCountX) * float64(chunkCountY)
+	if total <= 64 {
+		return 0
+	}
+	// Per-side cell count target: sqrt(total/64). Round up to next power of two.
+	target := math.Ceil(math.Sqrt(total / 64))
+	if target < 1 {
+		return 0
+	}
+	log2 := math.Ceil(math.Log2(target))
+	if log2 < 0 {
+		return 0
+	}
+	if log2 > 8 {
+		return 8
+	}
+	return uint8(log2)
 }
 
 // finishBlock is part of the writableBlock interface; raw-grid blocks are
@@ -136,14 +162,12 @@ func (b *rawGridBlockBuilder) finishBlock(comp format.InternalCompression, opts 
 	return nil
 }
 
-// chunkSpec is reused across goroutines while encoding chunks in parallel.
 type chunkSpec struct {
 	cx, cy uint32
 	w, h   int
 }
 
-// encodeRawGridBlock turns a source-grid array into a finalised raw-grid block
-// builder, ready to be written to disk. values is row-major: values[y*Nx + x].
+// values is row-major: values[y*Nx + x].
 func encodeRawGridBlock(
 	spec RawGridSpec,
 	variableID uint16,
@@ -285,7 +309,6 @@ func encodeRawGridBlock(
 	codecCounts := map[byte]int{}
 	for i, r := range results {
 		if r.blob == nil {
-			// shouldn't happen; treat as empty
 			continue
 		}
 		codecCounts[r.tag]++
@@ -305,8 +328,7 @@ func encodeRawGridBlock(
 		contents++
 	}
 
-	// dominant chunk codec is a stats hint on the block-table entry; the
-	// per-chunk tag inside each payload is still authoritative.
+	// stats hint only; the per-chunk tag inside each payload is authoritative.
 	dominantCodec := uint8(codec.IDBitshuffleZstd)
 	bestCount := 0
 	for tag, count := range codecCounts {
@@ -316,22 +338,62 @@ func encodeRawGridBlock(
 		}
 	}
 
+	coarseSizeLog2 := pickCoarseSizeLog2(chunkCountX, chunkCountY)
+
 	section := &format.RawGridSection{
-		SchemaVersion: format.RawGridSchemaVersion,
-		ChunkSizeLog2: chunkLog2,
-		Nx:            uint32(spec.Nx),
-		Ny:            uint32(spec.Ny),
-		Lat0:          spec.Lat0,
-		Lon0:          spec.Lon0,
-		DY:            spec.DY,
-		DX:            spec.DX,
-		MissingValue:  spec.MissingValue,
-		ChunkCountX:   chunkCountX,
-		ChunkCountY:   chunkCountY,
-		ChunkOffsets:  chunkOffsets,
-		ChunkLengths:  chunkLengths,
+		SchemaVersion:  format.RawGridSchemaVersion,
+		ChunkSizeLog2:  chunkLog2,
+		CoarseSizeLog2: coarseSizeLog2,
+		Nx:             uint32(spec.Nx),
+		Ny:             uint32(spec.Ny),
+		Lat0:           spec.Lat0,
+		Lon0:           spec.Lon0,
+		DY:             spec.DY,
+		DX:             spec.DX,
+		MissingValue:   spec.MissingValue,
+		ChunkCountX:    chunkCountX,
+		ChunkCountY:    chunkCountY,
 	}
-	sectionRaw, err := format.MarshalRawGridSection(section)
+
+	coarseCountX := section.CoarseCountX()
+	coarseCountY := section.CoarseCountY()
+	coarseCount := int(coarseCountX) * int(coarseCountY)
+	coarseTable := make([]format.CoarseEntry, coarseCount)
+	fineBuf := make([]byte, 0)
+	for ccy := uint32(0); ccy < coarseCountY; ccy++ {
+		for ccx := uint32(0); ccx < coarseCountX; ccx++ {
+			cellW, cellH := section.CoarseCellChunkExtent(ccx, ccy)
+			n := int(cellW) * int(cellH)
+			if n == 0 {
+				continue
+			}
+			cellOffsets := make([]uint64, n)
+			cellLengths := make([]uint64, n)
+			cs := section.CoarseSize()
+			for ly := uint32(0); ly < cellH; ly++ {
+				for lx := uint32(0); lx < cellW; lx++ {
+					cx := ccx*cs + lx
+					cy := ccy*cs + ly
+					gIdx := section.ChunkIndex(cx, cy)
+					lIdx := int(ly)*int(cellW) + int(lx)
+					cellOffsets[lIdx] = chunkOffsets[gIdx]
+					cellLengths[lIdx] = chunkLengths[gIdx]
+				}
+			}
+			fineBytes, err := format.MarshalFineIndex(cellOffsets, cellLengths)
+			if err != nil {
+				return nil, fmt.Errorf("raw grid block %q: marshal fine index (%d,%d): %w", spec.Variable, ccx, ccy, err)
+			}
+			coarseTable[int(ccy)*int(coarseCountX)+int(ccx)] = format.CoarseEntry{
+				Offset: uint32(len(fineBuf)),
+				Length: uint32(len(fineBytes)),
+			}
+			fineBuf = append(fineBuf, fineBytes...)
+		}
+	}
+	section.CoarseTable = coarseTable
+
+	sectionRaw, err := format.MarshalRawGridSectionRoot(section)
 	if err != nil {
 		return nil, fmt.Errorf("raw grid block %q: marshal section: %w", spec.Variable, err)
 	}
@@ -366,6 +428,7 @@ func encodeRawGridBlock(
 		missing:      spec.MissingValue,
 		section:      section,
 		sectionBytes: sectionComp,
+		fineIndices:  fineBuf,
 		tileData:     tileData,
 		addressed:    uint32(totalChunks),
 		contents:     contents,
@@ -373,8 +436,7 @@ func encodeRawGridBlock(
 	return b, nil
 }
 
-// encodeChunkBlob picks a codec for a single raw-grid chunk. constant chunks
-// collapse to a 5-byte payload; everything else uses bitshuffle+zstd.
+// constant chunks collapse to a 5-byte payload; rest is bitshuffle+zstd.
 func encodeChunkBlob(enc *codec.Encoder, quant []byte, params quantize.Params, nPixels int) ([]byte, byte, error) {
 	stride := params.DType.Bytes()
 	if isAllSame(quant, stride) {
@@ -399,9 +461,7 @@ func isAllSame(b []byte, stride int) bool {
 	return true
 }
 
-// canonicaliseValues copies values, replacing MissingValue with NaN so the
-// quantiser sees a single missing pattern and the dedup hash for all-NoData
-// chunks is stable across inputs that use different sentinels.
+// recodes MissingValue → NaN so dedup of all-NoData chunks is sentinel-stable.
 func canonicaliseValues(in []float32, missing float64) []float32 {
 	out := make([]float32, len(in))
 	if math.IsNaN(missing) {

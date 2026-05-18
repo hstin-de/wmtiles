@@ -98,6 +98,76 @@
     rgb(68,1,84), rgb(72,35,116), rgb(64,67,135), rgb(52,94,141), rgb(41,121,142),
     rgb(32,144,140), rgb(34,167,132), rgb(68,190,112), rgb(253,231,37)); }
   #legend-floating .row { display: flex; justify-content: space-between; }
+
+  #forecast {
+    position: absolute; left: 12px; top: 70px; width: 380px;
+    max-height: calc(100vh - 90px);
+    background: rgba(28,28,28,.96); border: 1px solid #333; border-radius: 6px;
+    color: #ddd; font-size: 12px; z-index: 1000;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+    display: flex; flex-direction: column;
+  }
+  #forecast.hidden { display: none; }
+  #forecast .fc-head {
+    padding: 8px 10px; border-bottom: 1px solid #2a2a2a;
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  }
+  #forecast .fc-title { font-weight: 600; color: #fff; }
+  #forecast .fc-coord {
+    font-family: monospace; font-size: 11px; color: #888;
+    margin-left: 4px;
+  }
+  #forecast .fc-when {
+    margin-left: auto; font-family: monospace; font-size: 11px; color: #6cf;
+  }
+  #forecast .fc-close {
+    background: none; border: none; color: #888; cursor: pointer;
+    font-size: 18px; padding: 0 4px; line-height: 1;
+  }
+  #forecast .fc-close:hover { color: #fff; }
+  #forecast .fc-body { overflow: auto; padding: 4px 0; }
+  #forecast .fc-empty { padding: 16px; color: #888; text-align: center; }
+  #forecast .fc-group {
+    border-bottom: 1px solid #2a2a2a;
+  }
+  #forecast .fc-group:last-child { border-bottom: none; }
+  #forecast .fc-group-name {
+    padding: 6px 10px 2px; font-weight: 600; color: #bbb;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  }
+  #forecast .fc-row {
+    padding: 4px 10px 6px;
+    display: grid;
+    grid-template-columns: 70px 1fr 84px;
+    grid-template-rows: auto auto;
+    column-gap: 8px;
+    align-items: center;
+  }
+  #forecast .fc-row:hover { background: rgba(255,255,255,.03); }
+  #forecast .fc-level {
+    font-family: monospace; color: #999; font-size: 11px;
+    grid-row: 1; grid-column: 1;
+  }
+  #forecast .fc-value {
+    font-family: monospace; color: #fff; font-weight: 600; text-align: right;
+    grid-row: 1; grid-column: 3;
+  }
+  #forecast .fc-value .fc-unit { color: #888; font-weight: 400; margin-left: 4px; }
+  #forecast .fc-value.nan { color: #666; font-weight: 400; }
+  #forecast .fc-spark {
+    grid-row: 2; grid-column: 1 / -1; height: 28px; width: 100%;
+    display: block; margin-top: 2px;
+  }
+  #forecast .fc-spark .area { fill: rgba(108,204,255,.18); }
+  #forecast .fc-spark .line { fill: none; stroke: #6cf; stroke-width: 1.25; }
+  #forecast .fc-spark .baseline { stroke: #444; stroke-width: 1; }
+  #forecast .fc-spark .cursor { stroke: #ff5a5a; stroke-width: 1; }
+  #forecast .fc-spark .dot { fill: #ff5a5a; }
+  #forecast .fc-spark text { fill: #666; font-size: 9px; font-family: monospace; }
+  #forecast .fc-status {
+    padding: 6px 10px; color: #888; font-size: 11px;
+    border-top: 1px solid #2a2a2a;
+  }
 </style>
 </head>
 <body>
@@ -190,6 +260,20 @@
 </div>
 
 <div id="map"></div>
+
+<div id="forecast" class="hidden">
+  <div class="fc-head">
+    <span class="fc-title">Forecast</span>
+    <span class="fc-coord" id="fcCoord"></span>
+    <span class="fc-when" id="fcWhen"></span>
+    <button class="fc-close" id="fcClose" title="close">×</button>
+  </div>
+  <div class="fc-body" id="fcBody">
+    <div class="fc-empty">click the map to sample all variables at a point</div>
+  </div>
+  <div class="fc-status" id="fcStatus"></div>
+</div>
+
 <script src="/viewer.js"></script>
 </body>
 </html>

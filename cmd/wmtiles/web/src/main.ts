@@ -1,7 +1,5 @@
 import {
   open,
-  latLonToTilePixel,
-  type SampleDetail,
   type Variable,
   type WMT,
 } from "wmtiles";
@@ -19,8 +17,7 @@ import type {
   HatchPattern,
   HatchBand,
 } from "wmtiles";
-// Side-effect imports: each registers its layer backend. wmt.createHeatmapLayer
-// etc. then work for both, and addTo(map) picks the right one per map.
+// side-effect: registers Leaflet + MapLibre backends for wmt.create*Layer.
 import "wmtiles/leaflet";
 import "wmtiles/maplibre";
 import { installDebugHud } from "./debug";
@@ -32,6 +29,7 @@ const $ = (id: string): HTMLElement => {
   if (!el) throw new Error(`missing #${id}`);
   return el;
 };
+
 
 // SVG sprites for hatch icon-fill, keyed by the "icon:<name>" dropdown values
 const svgIcon = (body: string): string =>
@@ -81,12 +79,18 @@ type IsobarOpts = IsobarRendererOptions & {
 };
 type HatchOpts = HatchRendererOptions & { variable: string };
 
+interface MarkerHandle {
+  setLatLng(lat: number, lng: number): void;
+  remove(): void;
+}
+
 interface Backend {
   readonly name: RendererName;
   getZoom(): number;
   onZoomEnd(cb: () => void): void;
   onClick(cb: (lat: number, lng: number) => void): void;
   openPopup(lat: number, lng: number, html: string): void;
+  addMarker(lat: number, lng: number): MarkerHandle;
   addHeatmap(opts?: HeatmapOpts): LayerWrap<HeatmapRendererState>;
   addParticles(opts: ParticlesOpts): LayerWrap<ParticlesRendererState>;
   addArrows(opts: ArrowsOpts): LayerWrap<ArrowsRendererState>;
@@ -118,6 +122,22 @@ function makeLeafletBackend(wmt: WMT): Backend {
       ),
     openPopup: (lat, lng, html) =>
       L.popup().setLatLng([lat, lng]).setContent(html).openOn(map),
+    addMarker: (lat, lng) => {
+      const icon = L.divIcon({
+        className: "wmt-pin",
+        html:
+          '<div style="width:14px;height:14px;border-radius:50%;' +
+          "background:#ff5a5a;border:2px solid #fff;" +
+          'box-shadow:0 0 0 1px rgba(0,0,0,.5),0 2px 6px rgba(0,0,0,.6);"></div>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      });
+      const m = L.marker([lat, lng], { icon, interactive: false }).addTo(map);
+      return {
+        setLatLng: (la, lo) => m.setLatLng([la, lo]),
+        remove: () => m.remove(),
+      };
+    },
     addHeatmap: (opts) => {
       const layer = wmt.createHeatmapLayer(opts).addTo(map);
       return {
@@ -222,6 +242,20 @@ function makeMapLibreBackend(wmt: WMT): Backend {
         .setHTML(html)
         .addTo(map);
     },
+    addMarker: (lat, lng) => {
+      const dot = document.createElement("div");
+      dot.style.cssText =
+        "width:14px;height:14px;border-radius:50%;" +
+        "background:#ff5a5a;border:2px solid #fff;" +
+        "box-shadow:0 0 0 1px rgba(0,0,0,.5),0 2px 6px rgba(0,0,0,.6);";
+      const m = new maplibregl.Marker({ element: dot, anchor: "center" })
+        .setLngLat([lng, lat])
+        .addTo(map);
+      return {
+        setLatLng: (la, lo) => m.setLngLat([lo, la]),
+        remove: () => m.remove(),
+      };
+    },
     addHeatmap: (opts) => {
       const layer = wmt.createHeatmapLayer(opts);
       addWhenReady(layer);
@@ -274,68 +308,6 @@ function makeMapLibreBackend(wmt: WMT): Backend {
   };
 }
 
-type ClickResult =
-  | { kind: "tile"; value?: number; missing?: boolean; z: number; x: number; y: number; col: number; row: number }
-  | { kind: "raw"; detail: SampleDetail; lat: number; lon: number };
-
-async function valueAtClick(
-  wmt: WMT,
-  layer: LayerWrap<HeatmapRendererState>,
-  lat: number,
-  lng: number,
-  mapZoom: number,
-): Promise<ClickResult | null> {
-  const v = layer.state.variable;
-  const t = layer.state.t | 0;
-  if (await v.isRawGrid(t)) {
-    const detail = await v.sampleDetail({ time: t, lat, lon: lng });
-    if (!detail) return null;
-    return { kind: "raw", detail, lat, lon: lng };
-  }
-  const z = Math.min(
-    Math.max(mapZoom | 0, wmt.zoomRange.min),
-    wmt.zoomRange.max,
-  );
-  const px = latLonToTilePixel(z, lat, lng, wmt.tileSize);
-  if (!px) return null;
-  const pixels = await v.tile({ time: t, z, x: px.x, y: px.y });
-  if (!pixels) return { kind: "tile", missing: true, z, ...px };
-  return {
-    kind: "tile",
-    value: pixels[px.row * wmt.tileSize + px.col],
-    z,
-    ...px,
-  };
-}
-
-function formatValue(v: number, unit: string): string {
-  if (Number.isNaN(v)) return "<i>NaN</i>";
-  return `${v.toFixed(4)} ${unit}`.trimEnd();
-}
-
-function renderRawPopup(r: { kind: "raw"; detail: SampleDetail; lat: number; lon: number }, unit: string): string {
-  const d = r.detail;
-  const [n00, n10, n01, n11] = d.neighbours;
-  const chunkRows = d.chunks
-    .map((c) => {
-      const tag = c.absent ? " <i>absent</i>" : "";
-      return `chunk (${c.cx},${c.cy})  idx=${c.index}  off=${c.offset}  len=${c.length}${tag}`;
-    })
-    .join("<br>");
-  const fmt = (v: number) => (Number.isNaN(v) ? "NaN" : v.toFixed(4));
-  return (
-    `<b>${formatValue(d.bilinear, unit)}</b>` +
-    `<br><small>` +
-    `lat=${r.lat.toFixed(5)} lon=${r.lon.toFixed(5)}` +
-    `<br>nearest: ${fmt(d.nearest)} ${unit}`.trimEnd() +
-    `<br>grid coord: gx=${d.gx.toFixed(3)} gy=${d.gy.toFixed(3)}` +
-    `<br>(${n00.x},${n00.y})=${fmt(n00.value)}  (${n10.x},${n10.y})=${fmt(n10.value)}` +
-    `<br>(${n01.x},${n01.y})=${fmt(n01.value)}  (${n11.x},${n11.y})=${fmt(n11.value)}` +
-    `<br>${chunkRows}` +
-    `</small>`
-  );
-}
-
 function splitVarName(name: string): { param: string; level: string } {
   const i = name.indexOf("_");
   if (i < 0) return { param: name, level: "" };
@@ -364,6 +336,296 @@ function ensureLegendEl(): HTMLElement {
     '<div class="row"><span id="legMin"></span><span id="legMax"></span></div>';
   document.body.appendChild(el);
   return el;
+}
+
+function formatTimestamp(d: Date): string {
+  return d.toISOString().replace("T", " ").slice(0, 16) + "Z";
+}
+
+function buildSparkline(
+  series: Float32Array,
+  cursorIdx: number,
+  width: number,
+  height: number,
+): string {
+  const W = width;
+  const H = height;
+  const pad = 2;
+  const N = series.length;
+  if (N === 0) return "";
+  let lo = +Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < N; i++) {
+    const v = series[i];
+    if (!Number.isFinite(v)) continue;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+    return `<svg class="fc-spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+      `<text x="${W / 2}" y="${H / 2 + 3}" text-anchor="middle">no data</text></svg>`;
+  }
+  // Flat series: draw a single horizontal line through the middle.
+  if (hi - lo < 1e-12) {
+    hi = lo + 1;
+    lo = lo - 0;
+  }
+  const span = hi - lo;
+  const xOf = (i: number): number =>
+    N === 1 ? W / 2 : pad + (i / (N - 1)) * (W - 2 * pad);
+  const yOf = (v: number): number =>
+    H - pad - ((v - lo) / span) * (H - 2 * pad);
+
+  let line = "";
+  let area = "";
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < N; i++) {
+    const v = series[i];
+    if (!Number.isFinite(v)) continue;
+    const x = xOf(i);
+    const y = yOf(v);
+    line += line === "" ? `M${x.toFixed(1)} ${y.toFixed(1)}` : ` L${x.toFixed(1)} ${y.toFixed(1)}`;
+    if (first < 0) first = i;
+    last = i;
+  }
+  if (first >= 0 && last >= 0) {
+    area = `M${xOf(first).toFixed(1)} ${(H - pad).toFixed(1)} ` +
+      line.replace(/^M/, "L") +
+      ` L${xOf(last).toFixed(1)} ${(H - pad).toFixed(1)} Z`;
+  }
+
+  const ci = Math.max(0, Math.min(N - 1, Math.round(cursorIdx)));
+  const cx = xOf(ci);
+  const cv = series[ci];
+  const cursorLine = `<line class="cursor" x1="${cx.toFixed(1)}" y1="0" x2="${cx.toFixed(1)}" y2="${H}"/>`;
+  const cursorDot = Number.isFinite(cv)
+    ? `<circle class="dot" cx="${cx.toFixed(1)}" cy="${yOf(cv).toFixed(1)}" r="2.2"/>`
+    : "";
+
+  return (
+    `<svg class="fc-spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<path class="area" d="${area}"/>` +
+    `<path class="line" d="${line}"/>` +
+    cursorLine + cursorDot +
+    `<text x="2" y="${H - 1}">${lo.toPrecision(3)}</text>` +
+    `<text x="${W - 2}" y="${H - 1}" text-anchor="end">${hi.toPrecision(3)}</text>` +
+    `</svg>`
+  );
+}
+
+interface ForecastViewer {
+  show(lat: number, lng: number): void;
+  onTimeChange(): void;
+}
+
+function installForecastViewer(
+  wmt: WMT,
+  backend: Backend,
+  currentStep: () => number,
+): ForecastViewer {
+  const panel = $("forecast");
+  const body = $("fcBody");
+  const coordEl = $("fcCoord");
+  const whenEl = $("fcWhen");
+  const statusEl = $("fcStatus");
+  const closeBtn = $("fcClose") as HTMLButtonElement;
+
+  let marker: MarkerHandle | null = null;
+  // Times + per-variable series for the active location. Cleared on new click.
+  let times: readonly Date[] | null = null;
+  let valuesByVar: Record<string, Float32Array> | null = null;
+  // Generation token so a stale fetch never paints over a newer one.
+  let gen = 0;
+
+  function close(): void {
+    panel.classList.add("hidden");
+    if (marker) {
+      marker.remove();
+      marker = null;
+    }
+    times = null;
+    valuesByVar = null;
+  }
+
+  closeBtn.onclick = close;
+
+  function renderRows(): void {
+    if (!times || !valuesByVar) return;
+    const step = currentStep();
+    const N = times.length;
+    const stepF = Math.max(0, Math.min(N - 1, Math.floor(step)));
+    const stepC = Math.min(N - 1, stepF + 1);
+    const frac = step - stepF;
+
+    // Group by parameter (e.g. "t_2m" → param "t", level "2m") for compact display.
+    const groups = new Map<string, VarGroup[]>();
+    for (const v of wmt.variables) {
+      const { param, level } = splitVarName(v.name);
+      if (!groups.has(param)) groups.set(param, []);
+      groups.get(param)!.push({ level, variable: v });
+    }
+    for (const list of groups.values()) {
+      list.sort((a, b) => {
+        const ka = levelSortKey(a.level);
+        const kb = levelSortKey(b.level);
+        return ka[0] - kb[0] || ka[1] - kb[1] || ka[2].localeCompare(kb[2]);
+      });
+    }
+    const paramNames = [...groups.keys()].sort((a, b) => a.localeCompare(b));
+
+    let html = "";
+    for (const p of paramNames) {
+      const list = groups.get(p)!;
+      const unit = list[0].variable.unit;
+      html += `<div class="fc-group">`;
+      html += `<div class="fc-group-name">${escapeHtml(p)}${
+        unit ? ` <span style="color:#666;font-weight:400">(${escapeHtml(unit)})</span>` : ""
+      }</div>`;
+      for (const { level, variable } of list) {
+        const series = valuesByVar[variable.name];
+        let valueText: string;
+        let cls = "fc-value";
+        if (!series) {
+          valueText = "—";
+          cls += " nan";
+        } else {
+          // Interpolate so scrubbing between integer steps still shows movement.
+          const a = series[stepF];
+          const b = series[stepC];
+          let v: number;
+          if (!Number.isFinite(a) && !Number.isFinite(b)) v = NaN;
+          else if (!Number.isFinite(a)) v = b;
+          else if (!Number.isFinite(b)) v = a;
+          else v = a + (b - a) * frac;
+          if (!Number.isFinite(v)) {
+            valueText = "NaN";
+            cls += " nan";
+          } else {
+            valueText = `${formatNumberCompact(v)}${
+              variable.unit ? `<span class="fc-unit">${escapeHtml(variable.unit)}</span>` : ""
+            }`;
+          }
+        }
+        const spark = series
+          ? buildSparkline(series, step, 320, 28)
+          : "";
+        html += `<div class="fc-row">`;
+        html += `<div class="fc-level">${escapeHtml(level || "—")}</div>`;
+        html += `<div class="${cls}">${valueText}</div>`;
+        html += spark;
+        html += `</div>`;
+      }
+      html += `</div>`;
+    }
+    body.innerHTML = html;
+  }
+
+  async function show(lat: number, lng: number): Promise<void> {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    const myGen = ++gen;
+
+    panel.classList.remove("hidden");
+    coordEl.textContent = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+    whenEl.textContent = "";
+    body.innerHTML = `<div class="fc-empty">loading ${wmt.variables.length} variables × ${wmt.timeStepCount} steps…</div>`;
+    statusEl.textContent = "fetching…";
+
+    if (marker) marker.setLatLng(lat, lng);
+    else marker = backend.addMarker(lat, lng);
+
+    const names = wmt.variables.map((v) => v.name);
+    const t0 = performance.now();
+    // filter to /wmt so basemap tiles and stylesheets don't inflate the count.
+    let fetchCount = 0;
+    let observer: PerformanceObserver | null = null;
+    const isWmtUrl = (n: string): boolean =>
+      n.includes("/wmt") && !n.endsWith(".js");
+    if (typeof PerformanceObserver !== "undefined") {
+      observer = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          if (isWmtUrl(e.name)) fetchCount++;
+        }
+      });
+      try {
+        observer.observe({ type: "resource", buffered: false });
+      } catch {
+        observer = null;
+      }
+    }
+    let res: { times: readonly Date[]; values: Readonly<Record<string, Float32Array>> };
+    try {
+      res = await wmt.forecast({ lat, lon: lng, variables: names });
+    } catch (err) {
+      if (observer) observer.disconnect();
+      if (myGen !== gen) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      body.innerHTML = `<div class="fc-empty">error: ${escapeHtml(msg)}</div>`;
+      statusEl.textContent = "";
+      return;
+    }
+    if (observer) {
+      for (const e of observer.takeRecords()) {
+        if (isWmtUrl(e.name)) fetchCount++;
+      }
+      observer.disconnect();
+    }
+    if (myGen !== gen) return;
+    const dt = (performance.now() - t0) | 0;
+
+    times = res.times;
+    valuesByVar = res.values as Record<string, Float32Array>;
+    const reqText = fetchCount > 0 ? ` · ${fetchCount} req` : "";
+    statusEl.textContent =
+      `${names.length} vars · ${res.times.length} steps · ${dt}ms${reqText}`;
+    renderRows();
+    updateWhenLabel();
+  }
+
+  function updateWhenLabel(): void {
+    if (!times || times.length === 0) {
+      whenEl.textContent = "";
+      return;
+    }
+    const step = currentStep();
+    const N = times.length;
+    const stepF = Math.max(0, Math.min(N - 1, Math.floor(step)));
+    const stepC = Math.min(N - 1, stepF + 1);
+    const frac = step - stepF;
+    const ms = times[stepF].getTime() +
+      (times[stepC].getTime() - times[stepF].getTime()) * frac;
+    whenEl.textContent = formatTimestamp(new Date(ms));
+  }
+
+  function onTimeChange(): void {
+    if (!times || !valuesByVar) return;
+    updateWhenLabel();
+    renderRows();
+  }
+
+  return {
+    show: (lat, lng) => {
+      void show(lat, lng);
+    },
+    onTimeChange,
+  };
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatNumberCompact(v: number): string {
+  const abs = Math.abs(v);
+  if (abs === 0) return "0";
+  if (abs >= 1000 || abs < 0.01) return v.toExponential(2);
+  if (abs >= 100) return v.toFixed(1);
+  if (abs >= 10) return v.toFixed(2);
+  return v.toFixed(3);
 }
 
 async function boot(): Promise<void> {
@@ -794,23 +1056,9 @@ async function boot(): Promise<void> {
   applyRangeForVar();
   refresh();
 
-  backend.onClick(async (lat, lng) => {
-    const result = await valueAtClick(wmt, layer, lat, lng, backend.getZoom());
-    const v = currentVar();
-    const unit = v?.unit ?? "";
-    let body: string;
-    if (!result) body = "<i>out of range</i>";
-    else if (result.kind === "raw") body = renderRawPopup(result, unit);
-    else if (result.missing) body = "<i>no tile</i>";
-    else if (result.value === undefined || Number.isNaN(result.value)) {
-      body = "<i>NaN</i>";
-    } else {
-      body =
-        `<b>${result.value.toFixed(4)}</b> ${unit}` +
-        `<br><small>z=${result.z} tile=(${result.x},${result.y}) px=(${result.col},${result.row})</small>`;
-    }
-    backend.openPopup(lat, lng, body);
-  });
+  const forecastViewer = installForecastViewer(wmt, backend, () => +time.value);
+  time.addEventListener("input", () => forecastViewer.onTimeChange());
+  backend.onClick((lat, lng) => forecastViewer.show(lat, lng));
 
   console.log("wmtiles loaded", {
     renderer: backend.name,

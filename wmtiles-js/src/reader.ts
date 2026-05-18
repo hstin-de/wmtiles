@@ -5,7 +5,6 @@ import {
   FLAG_HAS_PREVIOUS_SNAPSHOT,
   FLAG_TIME_CATALOG_REGULAR,
   HEADER_SIZE,
-  MAX_BLOCK_ROOT,
   SNAPSHOT_TRAILER_SIZE,
   crc32c,
   decompressInternal,
@@ -22,9 +21,15 @@ import {
   parseVariableCatalog,
   rawGridChunkHeight,
   rawGridChunkWidth,
+  rawGridCoarseCountX,
+  rawGridCoarseCellExtent,
+  rawGridCoarseIndexOf,
+  parseFineIndex,
   type BlockHeader,
   type BlockTableEntry,
+  type DirEntry,
   type Directory,
+  type FineIndex,
   type Header,
   type RawGridSection,
   type SnapshotHeader,
@@ -62,17 +67,28 @@ import {
   type WMTHatchLayer,
 } from "./layers.js";
 
-// ---------- Public types ----------
+export interface ByteRange {
+  offset: number;
+  length: number;
+}
 
 export interface ByteSource {
   read(offset: number, length: number): Promise<Uint8Array>;
+  // bulk fetch for disjoint ranges (HTTP multi-range). Result order = input order.
+  readMulti?(ranges: readonly ByteRange[]): Promise<Uint8Array[]>;
+  // null = not yet probed; true/false = known multipart support.
+  isMultipartCapable?(): boolean | null;
 }
 
 export type WMTSource = ByteSource | Uint8Array | ArrayBuffer | string | URL;
 
 export interface OpenOptions {
-  /** Used when opening from a URL string or URL object. */
   requestInit?: RequestInit;
+  // default 2 KB: fits layered raw-grid roots and most Hilbert roots; large
+  // tile-pyramid roots tail-stitch (one extra RTT per such block, once).
+  blockHeaderPrefetchBytes?: number;
+  // sync; default is pure-JS fzstd (~150-250 MB/s). Override for native zstd.
+  zstdDecompress?: (compressed: Uint8Array) => Uint8Array;
 }
 
 export interface BBox {
@@ -171,57 +187,289 @@ export interface ValueResult {
   readonly values: Readonly<Record<string, number>>;
 }
 
-// ---------- Sources ----------
 
 export function httpSource(url: string | URL, init?: RequestInit): ByteSource {
   const href = String(url);
-  return {
-    async read(offset, length) {
-      if (length === 0) return new Uint8Array();
-      const headers = new Headers(init?.headers);
-      headers.set("Range", `bytes=${offset}-${offset + length - 1}`);
-      let resp: Response;
+  // Memoize once: once we know the origin won't honor multipart/byteranges,
+  // stop wasting requests on it.
+  let multipartSupported: boolean | null = null;
+
+  async function readOne(offset: number, length: number): Promise<Uint8Array> {
+    if (length === 0) return new Uint8Array();
+    const headers = new Headers(init?.headers);
+    headers.set("Range", `bytes=${offset}-${offset + length - 1}`);
+    let resp: Response;
+    try {
+      resp = await fetch(href, { ...init, headers });
+    } catch (err) {
+      throw new SourceError(
+        `HTTP fetch failed for bytes=${offset}-${offset + length - 1}`,
+        { cause: err },
+      );
+    }
+
+    const body = async (): Promise<Uint8Array> => {
       try {
-        resp = await fetch(href, { ...init, headers });
+        return new Uint8Array(await resp.arrayBuffer());
       } catch (err) {
         throw new SourceError(
-          `HTTP fetch failed for bytes=${offset}-${offset + length - 1}`,
+          `HTTP body read failed for bytes=${offset}-${offset + length - 1}`,
           { cause: err },
         );
       }
+    };
+    const trim = (buf: Uint8Array): Uint8Array =>
+      buf.length > length ? buf.subarray(0, length) : buf;
 
-      const body = async (): Promise<Uint8Array> => {
-        try {
-          return new Uint8Array(await resp.arrayBuffer());
-        } catch (err) {
-          throw new SourceError(
-            `HTTP body read failed for bytes=${offset}-${offset + length - 1}`,
-            { cause: err },
-          );
-        }
-      };
-      const trim = (buf: Uint8Array): Uint8Array =>
-        buf.length > length ? buf.subarray(0, length) : buf;
+    if (resp.status === 206) return trim(await body());
+    if (resp.status === 200 && offset === 0) return trim(await body());
+    if (resp.status === 200) {
+      throw new SourceError(
+        `HTTP server did not honor Range for bytes=${offset}-${offset + length - 1}`,
+      );
+    }
+    throw new SourceError(
+      `HTTP ${resp.status} fetching bytes=${offset}-${offset + length - 1}`,
+    );
+  }
 
-      if (resp.status === 206) {
-        return trim(await body());
+  async function readMulti(
+    ranges: readonly ByteRange[],
+  ): Promise<Uint8Array[]> {
+    if (ranges.length === 0) return [];
+    if (ranges.length === 1) {
+      return [await readOne(ranges[0].offset, ranges[0].length)];
+    }
+
+    const rangeStr = ranges
+      .map((r) => `${r.offset}-${r.offset + r.length - 1}`)
+      .join(",");
+    const headers = new Headers(init?.headers);
+    headers.set("Range", `bytes=${rangeStr}`);
+    let resp: Response;
+    try {
+      resp = await fetch(href, { ...init, headers });
+    } catch (err) {
+      throw new SourceError(`HTTP multi-range fetch failed`, { cause: err });
+    }
+
+    if (resp.status !== 206) {
+      throw new SourceError(`HTTP ${resp.status} on multi-range fetch`);
+    }
+
+    const ct = resp.headers.get("Content-Type") ?? "";
+    if (ct.toLowerCase().startsWith("multipart/byteranges")) {
+      const boundary = multipartBoundary(ct);
+      if (!boundary) {
+        throw new SourceError("multipart/byteranges without boundary");
       }
-
-      if (resp.status === 200 && offset === 0) {
-        return trim(await body());
-      }
-
-      if (resp.status === 200) {
+      const body = new Uint8Array(await resp.arrayBuffer());
+      const parts = parseMultipartByteRanges(body, boundary, ranges.length);
+      // RFC 7233: parts arrive in request order. Validate first part's
+      // Content-Range as a sanity check against shuffled responses.
+      if (parts.length !== ranges.length) {
         throw new SourceError(
-          `HTTP server did not honor Range for bytes=${offset}-${offset + length - 1}`,
+          `multipart response had ${parts.length} parts, expected ${ranges.length}`,
         );
       }
+      if (parts.length > 0 && parts[0].start !== ranges[0].offset) {
+        throw new SourceError(
+          `multipart first part starts at ${parts[0].start}, expected ${ranges[0].offset} (server reordered ranges?)`,
+        );
+      }
+      const out: Uint8Array[] = new Array(ranges.length);
+      for (let i = 0; i < ranges.length; i++) {
+        const part = parts[i].data;
+        out[i] = part.length > ranges[i].length
+          ? part.subarray(0, ranges[i].length)
+          : part;
+      }
+      return out;
+    }
 
-      throw new SourceError(
-        `HTTP ${resp.status} fetching bytes=${offset}-${offset + length - 1}`,
-      );
+    // Server collapsed multi-range into a single 206 response. Bail out so the
+    // caller can fall back to per-range fetches.
+    throw new SourceError(
+      `server returned single-range 206 (Content-Type=${ct}) instead of multipart/byteranges`,
+    );
+  }
+
+  return {
+    read: readOne,
+    isMultipartCapable: () => multipartSupported,
+    async readMulti(ranges) {
+      if (ranges.length <= 1) {
+        if (ranges.length === 0) return [];
+        return [await readOne(ranges[0].offset, ranges[0].length)];
+      }
+      if (multipartSupported === false) {
+        // Server already said no; fan out concurrently and let fetch/HTTP/2 sort it.
+        return Promise.all(ranges.map((r) => readOne(r.offset, r.length)));
+      }
+      try {
+        const out = await readMulti(ranges);
+        multipartSupported = true;
+        return out;
+      } catch (err) {
+        if (multipartSupported === null) {
+          // First attempt failed: probably no multipart support. Note and fall back.
+          multipartSupported = false;
+          return Promise.all(ranges.map((r) => readOne(r.offset, r.length)));
+        }
+        throw err;
+      }
     },
   };
+}
+
+function multipartBoundary(contentType: string): string | null {
+  const m = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  if (!m) return null;
+  return (m[1] ?? m[2]).trim();
+}
+
+interface MultipartPart {
+  /** Parsed from Content-Range on the first part only; -1 for later parts. */
+  start: number;
+  data: Uint8Array;
+}
+
+function parseMultipartByteRanges(
+  body: Uint8Array,
+  boundary: string,
+  expectedParts: number,
+): MultipartPart[] {
+  const dashBoundary = new TextEncoder().encode("--" + boundary);
+  const parts: MultipartPart[] = expectedParts > 0 ? new Array(expectedParts) : [];
+  let partIdx = 0;
+
+  let i = indexOfBytes(body, dashBoundary, 0);
+  while (i >= 0) {
+    let after = i + dashBoundary.length;
+    // Closing boundary (--boundary--): done.
+    if (
+      after + 1 < body.length &&
+      body[after] === 0x2d &&
+      body[after + 1] === 0x2d
+    ) {
+      break;
+    }
+    // Skip trailing CRLF after boundary line.
+    if (
+      after + 1 < body.length &&
+      body[after] === 0x0d &&
+      body[after + 1] === 0x0a
+    ) {
+      after += 2;
+    }
+    // Skip past headers: find \r\n\r\n. Only parse Content-Range for the first
+    // part as a sanity check; trust request-order for the rest.
+    const headersEnd = findCRLFCRLF(body, after);
+    if (headersEnd < 0) break;
+    let start = -1;
+    if (partIdx === 0) {
+      start = parseContentRangeStart(body, after, headersEnd);
+      if (start < 0) {
+        throw new SourceError("multipart part missing/invalid Content-Range");
+      }
+    }
+    const bodyStart = headersEnd + 4;
+    const nextBoundary = indexOfBytes(body, dashBoundary, bodyStart);
+    if (nextBoundary < 0) break;
+    // Trim the CRLF that precedes the next boundary.
+    let bodyEnd = nextBoundary;
+    if (
+      bodyEnd >= 2 &&
+      body[bodyEnd - 2] === 0x0d &&
+      body[bodyEnd - 1] === 0x0a
+    ) {
+      bodyEnd -= 2;
+    }
+    const part: MultipartPart = { start, data: body.subarray(bodyStart, bodyEnd) };
+    if (partIdx < parts.length) parts[partIdx] = part;
+    else parts.push(part);
+    partIdx++;
+    i = nextBoundary;
+  }
+  if (partIdx < parts.length) parts.length = partIdx;
+  return parts;
+}
+
+// byte-level scan, no TextDecoder: hundreds of headers per multipart body.
+function parseContentRangeStart(
+  body: Uint8Array,
+  from: number,
+  to: number,
+): number {
+  // Look for case-insensitive "content-range:" then "bytes" then a digit.
+  const tag = "content-range:";
+  outer: for (let i = from; i + tag.length < to; i++) {
+    for (let j = 0; j < tag.length; j++) {
+      const c = body[i + j];
+      const lc = c >= 0x41 && c <= 0x5a ? c + 32 : c;
+      if (lc !== tag.charCodeAt(j)) continue outer;
+    }
+    let k = i + tag.length;
+    while (k < to && (body[k] === 0x20 || body[k] === 0x09)) k++;
+    // "bytes"
+    if (k + 5 > to) return -1;
+    if (
+      body[k] !== 0x62 && body[k] !== 0x42
+    ) continue;
+    k += 5;
+    while (k < to && (body[k] === 0x20 || body[k] === 0x09)) k++;
+    let n = 0;
+    let any = false;
+    while (k < to && body[k] >= 0x30 && body[k] <= 0x39) {
+      n = n * 10 + (body[k] - 0x30);
+      k++;
+      any = true;
+    }
+    return any ? n : -1;
+  }
+  return -1;
+}
+
+function findCRLFCRLF(body: Uint8Array, from: number): number {
+  const last = body.length - 4;
+  for (let i = from; i <= last; i++) {
+    if (
+      body[i] === 0x0d &&
+      body[i + 1] === 0x0a &&
+      body[i + 2] === 0x0d &&
+      body[i + 3] === 0x0a
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// native indexOf as fast filter so the byte-loop only runs on candidates.
+function indexOfBytes(
+  haystack: Uint8Array,
+  needle: Uint8Array,
+  fromIdx: number,
+): number {
+  if (needle.length === 0) return fromIdx;
+  const last = haystack.length - needle.length;
+  const first = needle[0];
+  const len = needle.length;
+  let i = fromIdx;
+  while (i <= last) {
+    const found = haystack.indexOf(first, i);
+    if (found < 0 || found > last) return -1;
+    let match = true;
+    for (let j = 1; j < len; j++) {
+      if (haystack[found + j] !== needle[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return found;
+    i = found + 1;
+  }
+  return -1;
 }
 
 export function bytesSource(bytes: Uint8Array | ArrayBuffer): ByteSource {
@@ -231,6 +479,112 @@ export function bytesSource(bytes: Uint8Array | ArrayBuffer): ByteSource {
       if (length === 0) return new Uint8Array();
       return buf.subarray(offset, offset + length);
     },
+  };
+}
+
+// merges same-microtask reads into shared range requests, sliced back per caller.
+function coalescingSource(
+  inner: ByteSource,
+  options: { maxGapBytes?: number; maxRequestBytes?: number } = {},
+): ByteSource {
+  const maxGap = options.maxGapBytes ?? 256 * 1024;
+  const maxReq = options.maxRequestBytes ?? 16 * 1024 * 1024;
+
+  type Req = {
+    off: number;
+    len: number;
+    resolve: (b: Uint8Array) => void;
+    reject: (e: unknown) => void;
+  };
+  let queue: Req[] = [];
+  let scheduled = false;
+
+  function flush(): void {
+    const batch = queue;
+    queue = [];
+    scheduled = false;
+    if (batch.length === 0) return;
+    if ((globalThis as { __WMT_COALESCE_LOG?: boolean }).__WMT_COALESCE_LOG) {
+      // eslint-disable-next-line no-console
+      console.log(`[coalesce] flush batch=${batch.length}`);
+    }
+    if (batch.length === 1) {
+      const r = batch[0];
+      inner.read(r.off, r.len).then(r.resolve, r.reject);
+      return;
+    }
+    batch.sort((a, b) => a.off - b.off || a.len - b.len);
+
+    // intentionally conservative: format is designed for small downloads,
+    // wider merge trades that for round-trips on sparse-but-large files.
+    type Run = { start: number; end: number; lo: number; hi: number };
+    const runs: Run[] = [];
+    let i = 0;
+    while (i < batch.length) {
+      let runEnd = batch[i].off + batch[i].len;
+      const runStart = batch[i].off;
+      let j = i;
+      while (j + 1 < batch.length) {
+        const nxt = batch[j + 1];
+        const newEnd = Math.max(runEnd, nxt.off + nxt.len);
+        if (newEnd - runStart > maxReq) break;
+        if (nxt.off - runEnd > maxGap) break;
+        runEnd = newEnd;
+        j++;
+      }
+      runs.push({ start: runStart, end: runEnd, lo: i, hi: j });
+      i = j + 1;
+    }
+
+    const distributeRun = (run: Run, buf: Uint8Array): void => {
+      for (let k = run.lo; k <= run.hi; k++) {
+        const r = batch[k];
+        const start = r.off - run.start;
+        // subarray clips silently if buf is short (server returned less),
+        // matching httpSource semantics for ranges past EOF.
+        r.resolve(buf.subarray(start, start + r.len));
+      }
+    };
+    const failRun = (run: Run, err: unknown): void => {
+      for (let k = run.lo; k <= run.hi; k++) batch[k].reject(err);
+    };
+
+    if (runs.length === 1 || !inner.readMulti) {
+      for (const run of runs) {
+        inner
+          .read(run.start, run.end - run.start)
+          .then((buf) => distributeRun(run, buf), (err) => failRun(run, err));
+      }
+      return;
+    }
+
+    // Multi-range path: one fetch for all disjoint runs.
+    inner
+      .readMulti(runs.map((r) => ({ offset: r.start, length: r.end - r.start })))
+      .then(
+        (bufs) => {
+          for (let k = 0; k < runs.length; k++) distributeRun(runs[k], bufs[k]);
+        },
+        (err) => {
+          for (const run of runs) failRun(run, err);
+        },
+      );
+  }
+
+  return {
+    read(offset, length) {
+      if (length === 0) return Promise.resolve(new Uint8Array());
+      return new Promise<Uint8Array>((resolve, reject) => {
+        queue.push({ off: offset, len: length, resolve, reject });
+        if (!scheduled) {
+          scheduled = true;
+          queueMicrotask(flush);
+        }
+      });
+    },
+    isMultipartCapable: inner.isMultipartCapable
+      ? () => inner.isMultipartCapable!()
+      : undefined,
   };
 }
 
@@ -251,7 +605,6 @@ function toByteSource(source: WMTSource, options?: OpenOptions): ByteSource {
   return source;
 }
 
-// ---------- Variable handle ----------
 
 type TileFetcher = (
   varId: number,
@@ -417,7 +770,6 @@ class WMTVariable implements Variable {
   }
 }
 
-// ---------- WMT reader ----------
 
 interface CachedBlock {
   header: BlockHeader;
@@ -427,6 +779,10 @@ interface CachedBlock {
   rawGrid: RawGridSection | null;
   /** Cached decoded chunk pixels (raw-grid only), keyed by chunk index. */
   chunkCache?: Map<number, Float32Array>;
+  /** Cached parsed fine-indices (raw-grid only), keyed by coarse-cell index. */
+  fineCache?: Map<number, FineIndex>;
+  /** In-flight fine-index loads to dedup parallel callers. */
+  fineFetches?: Map<number, Promise<FineIndex>>;
 }
 
 export class WMT {
@@ -448,14 +804,22 @@ export class WMT {
   private _blockCache = new Map<number, CachedBlock>();
   private _blockFetches = new Map<number, Promise<CachedBlock>>();
   private _leafCache = new Map<string, Directory>();
+  private _leafFetches = new Map<string, Promise<Directory>>();
   private _coldBuf: Uint8Array | null = null;
+  private _blockHeaderPrefetchBytes: number;
+  private _zstdOverride?: (b: Uint8Array) => Uint8Array;
 
-  private constructor(src: ByteSource) {
+  private constructor(
+    src: ByteSource,
+    prefetchBytes: number,
+    zstdOverride?: (b: Uint8Array) => Uint8Array,
+  ) {
+    const coalesced = coalescingSource(src);
     this._src = {
       async read(offset, length) {
-        if (!debugSink()) return src.read(offset, length);
+        if (!debugSink()) return coalesced.read(offset, length);
         const t0 = performance.now();
-        const buf = await src.read(offset, length);
+        const buf = await coalesced.read(offset, length);
         emitDebug({
           kind: "read",
           offset,
@@ -465,11 +829,21 @@ export class WMT {
         return buf;
       },
     };
+    this._blockHeaderPrefetchBytes = prefetchBytes;
+    this._zstdOverride = zstdOverride;
   }
 
   /** Open and parse a WMTiles file from a URL, bytes, or custom byte source. */
   static async open(source: WMTSource, options?: OpenOptions): Promise<WMT> {
-    const w = new WMT(toByteSource(source, options));
+    const prefetch =
+      options?.blockHeaderPrefetchBytes !== undefined
+        ? Math.max(BLOCK_HEADER_SIZE, options.blockHeaderPrefetchBytes)
+        : 2 * 1024;
+    const w = new WMT(
+      toByteSource(source, options),
+      prefetch,
+      options?.zstdDecompress,
+    );
     await w._open();
     return w;
   }
@@ -619,20 +993,134 @@ export class WMT {
     const values: Record<string, Float32Array> = {};
     for (const v of vars) values[v.name] = nanArray(T);
 
-    const jobs: Promise<void>[] = [];
+    // three explicit waves (headers, leaves, payloads) so the coalescer sees
+    // one batch per phase regardless of path depth per (var, t).
+    type Target = { name: string; slot: number; varId: number; t: number };
+    const targets: Target[] = [];
     for (const v of vars) {
-      const series = values[v.name];
       for (let i = 0; i < T; i++) {
-        const slot = i;
-        jobs.push(
-          this._sample(v.id, startIdx + slot, req.lat, req.lon, z).then((val) => {
-            // null = out-of-range/missing → keep the pre-filled NaN.
-            if (val !== null) series[slot] = val;
-          }),
+        targets.push({ name: v.name, slot: i, varId: v.id, t: startIdx + i });
+      }
+    }
+
+    // wave 1: block headers
+    type Resolved = { tgt: Target; blk: BlockTableEntry; cb: CachedBlock };
+    const resolvedRaw = await Promise.all(
+      targets.map(async (tgt): Promise<Resolved | null> => {
+        const blk = await this._lookupBlock(tgt.varId, tgt.t);
+        if (!blk) return null;
+        const cb = await this._loadBlockHeader(blk.blockOffset, blk.blockLength);
+        return { tgt, blk, cb };
+      }),
+    );
+    const resolved: Resolved[] = [];
+    for (const r of resolvedRaw) if (r) resolved.push(r);
+
+    // Classify and prep pixel coords / leaf descriptors.
+    type TileItem = {
+      res: Resolved;
+      tid: bigint;
+      pxRow: number;
+      pxCol: number;
+      entry: DirEntry | null;
+      needsLeaf: boolean;
+      leafOff: number;
+      leafLen: number;
+    };
+    type RawItem = { res: Resolved };
+    const tileItems: TileItem[] = [];
+    const rawItems: RawItem[] = [];
+    const zOutOfRange = z < this._header.minZoom || z > this._header.maxZoom;
+    for (const r of resolved) {
+      if (r.cb.rawGrid) {
+        rawItems.push({ res: r });
+        continue;
+      }
+      if (zOutOfRange || !r.cb.root) continue;
+      const px = latLonToTilePixel(z, req.lat, req.lon, this._tileSize);
+      if (!px) continue;
+      const tid = encode3D(z, px.x, px.y);
+      const entry = findTile(r.cb.root, tid);
+      if (!entry) continue;
+      tileItems.push({
+        res: r,
+        tid,
+        pxRow: px.row,
+        pxCol: px.col,
+        entry,
+        needsLeaf: entry.isLeaf,
+        leafOff: entry.isLeaf ? entry.offset : 0,
+        leafLen: entry.isLeaf ? entry.length : 0,
+      });
+    }
+
+    // wave 2: dedup leaves per (block, leafOff)
+    const leafJobs = new Map<string, Promise<Directory>>();
+    for (const it of tileItems) {
+      if (!it.needsLeaf) continue;
+      const k = `${it.res.blk.blockOffset}:${it.leafOff}`;
+      if (!leafJobs.has(k)) {
+        leafJobs.set(
+          k,
+          this._loadBlockLeaf(
+            it.res.blk.blockOffset,
+            it.res.cb.header,
+            it.leafOff,
+            it.leafLen,
+          ),
         );
       }
     }
-    await Promise.all(jobs);
+    if (leafJobs.size > 0) {
+      const keys = [...leafJobs.keys()];
+      const dirs = await Promise.all(keys.map((k) => leafJobs.get(k)!));
+      const dirByKey = new Map<string, Directory>();
+      for (let k = 0; k < keys.length; k++) dirByKey.set(keys[k], dirs[k]);
+      for (const it of tileItems) {
+        if (!it.needsLeaf) continue;
+        const k = `${it.res.blk.blockOffset}:${it.leafOff}`;
+        const e = findTile(dirByKey.get(k)!, it.tid);
+        it.entry = !e || e.isLeaf ? null : e;
+      }
+    }
+
+    // wave 3: tile blobs + raw chunks in one microtask
+    const ts = this._tileSize;
+    const np = this._nPixels;
+    const finalJobs: Promise<void>[] = [];
+    for (const it of tileItems) {
+      if (!it.entry || it.entry.isLeaf) continue;
+      const blk = it.res.blk;
+      const blkHdr = it.res.cb.header;
+      const entry = it.entry;
+      const series = values[it.res.tgt.name];
+      const slot = it.res.tgt.slot;
+      const pxRow = it.pxRow;
+      const pxCol = it.pxCol;
+      finalJobs.push(
+        this._src
+          .read(
+            blk.blockOffset + blkHdr.tileDataOffset + entry.offset,
+            entry.length,
+          )
+          .then((blob) => {
+            const decoded = decodeCodec(blob, blk.dtype, np);
+            const pixels = dequantize(decoded, blk, np);
+            const v = pixels[pxRow * ts + pxCol];
+            if (!Number.isNaN(v)) series[slot] = v;
+          }),
+      );
+    }
+    for (const it of rawItems) {
+      const series = values[it.res.tgt.name];
+      const slot = it.res.tgt.slot;
+      finalJobs.push(
+        this._sampleRaw(it.res.blk, it.res.cb, req.lat, req.lon).then((v) => {
+          if (!Number.isNaN(v)) series[slot] = v;
+        }),
+      );
+    }
+    await Promise.all(finalJobs);
 
     return { times, values };
   }
@@ -795,6 +1283,11 @@ export class WMT {
 
     type Need = { i: number; fileOff: number; length: number };
     const needs: Need[] = [];
+    // Pass 1: resolve root entries, collect unique leaf descriptors. Avoids
+    // serializing one HTTP round-trip per coord that lands in a leaf.
+    type Pending = { i: number; tid: bigint; leafOff: number; leafLen: number };
+    const pending: Pending[] = [];
+    const leafJobs = new Map<number, Promise<Directory>>();
     for (let i = 0; i < coords.length; i++) {
       const c = coords[i];
       const n = 1 << c.z;
@@ -807,29 +1300,51 @@ export class WMT {
         continue;
       }
       const tid = encode3D(c.z, c.x, c.y);
-      let entry = findTile(root, tid);
+      const entry = findTile(root, tid);
       if (!entry) {
         out[i] = nanArray(this._nPixels);
         continue;
       }
       if (entry.isLeaf) {
-        const leaf = await this._loadBlockLeaf(
-          blk.blockOffset,
-          blkHdr,
-          entry.offset,
-          entry.length,
-        );
-        entry = findTile(leaf, tid);
-        if (!entry || entry.isLeaf) {
-          out[i] = nanArray(this._nPixels);
-          continue;
+        if (!leafJobs.has(entry.offset)) {
+          leafJobs.set(
+            entry.offset,
+            this._loadBlockLeaf(
+              blk.blockOffset,
+              blkHdr,
+              entry.offset,
+              entry.length,
+            ),
+          );
         }
+        pending.push({ i, tid, leafOff: entry.offset, leafLen: entry.length });
+        continue;
       }
       needs.push({
         i,
         fileOff: blk.blockOffset + blkHdr.tileDataOffset + entry.offset,
         length: entry.length,
       });
+    }
+    // Pass 2: await all leaves in one wave, then resolve their entries.
+    if (leafJobs.size > 0) {
+      const leaves = new Map<number, Directory>();
+      const entries = [...leafJobs.entries()];
+      const dirs = await Promise.all(entries.map(([, p]) => p));
+      for (let k = 0; k < entries.length; k++) leaves.set(entries[k][0], dirs[k]);
+      for (const p of pending) {
+        const leaf = leaves.get(p.leafOff)!;
+        const entry = findTile(leaf, p.tid);
+        if (!entry || entry.isLeaf) {
+          out[p.i] = nanArray(this._nPixels);
+          continue;
+        }
+        needs.push({
+          i: p.i,
+          fileOff: blk.blockOffset + blkHdr.tileDataOffset + entry.offset,
+          length: entry.length,
+        });
+      }
     }
     if (needs.length === 0) {
       if (log) {
@@ -873,46 +1388,49 @@ export class WMT {
 
     let bytesFetched = 0;
     let cpuMs = 0;
-    for (const g of groups) {
-      const tFetch0 = log ? performance.now() : 0;
-      const buf = await this._src.read(g.start, g.end - g.start);
-      const fetchMs = log ? performance.now() - tFetch0 : 0;
-      bytesFetched += buf.length;
-      // attribute network time to each tile proportionally by bytes
-      let groupBytes = 0;
-      if (log) for (const m of g.members) groupBytes += m.length;
-      const tCpu0 = log ? performance.now() : 0;
-      for (const m of g.members) {
-        const localOff = m.fileOff - g.start;
-        const blob = buf.subarray(localOff, localOff + m.length);
-        const tDecode0 = log ? performance.now() : 0;
-        const decoded = decodeCodec(blob, blk.dtype, this._nPixels);
-        const tDequant0 = log ? performance.now() : 0;
-        out[m.i] = dequantize(decoded, blk, this._nPixels);
-        if (log) {
-          const tDequant1 = performance.now();
-          const c = coords[m.i];
-          emitDebug({
-            kind: "tile",
-            varId,
-            t,
-            z: c.z,
-            x: c.x,
-            y: c.y,
-            codec: blob[0],
-            dtype: blk.dtype,
-            compressedBytes: m.length,
-            networkMs: groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0,
-            decodeMs: tDequant0 - tDecode0,
-            dequantizeMs: tDequant1 - tDequant0,
-            totalMs:
-              (groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0) +
-              (tDequant1 - tDecode0),
-          });
+    // Dispatch every group concurrently. The global coalescer can then merge
+    // disjoint groups into one multipart fetch instead of serializing waves.
+    await Promise.all(
+      groups.map(async (g) => {
+        const tFetch0 = log ? performance.now() : 0;
+        const buf = await this._src.read(g.start, g.end - g.start);
+        const fetchMs = log ? performance.now() - tFetch0 : 0;
+        bytesFetched += buf.length;
+        let groupBytes = 0;
+        if (log) for (const m of g.members) groupBytes += m.length;
+        const tCpu0 = log ? performance.now() : 0;
+        for (const m of g.members) {
+          const localOff = m.fileOff - g.start;
+          const blob = buf.subarray(localOff, localOff + m.length);
+          const tDecode0 = log ? performance.now() : 0;
+          const decoded = decodeCodec(blob, blk.dtype, this._nPixels);
+          const tDequant0 = log ? performance.now() : 0;
+          out[m.i] = dequantize(decoded, blk, this._nPixels);
+          if (log) {
+            const tDequant1 = performance.now();
+            const c = coords[m.i];
+            emitDebug({
+              kind: "tile",
+              varId,
+              t,
+              z: c.z,
+              x: c.x,
+              y: c.y,
+              codec: blob[0],
+              dtype: blk.dtype,
+              compressedBytes: m.length,
+              networkMs: groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0,
+              decodeMs: tDequant0 - tDecode0,
+              dequantizeMs: tDequant1 - tDequant0,
+              totalMs:
+                (groupBytes > 0 ? (fetchMs * m.length) / groupBytes : 0) +
+                (tDequant1 - tDecode0),
+            });
+          }
         }
-      }
-      if (log) cpuMs += performance.now() - tCpu0;
-    }
+        if (log) cpuMs += performance.now() - tCpu0;
+      }),
+    );
     if (log) {
       emitDebug({
         kind: "tiles",
@@ -1069,12 +1587,14 @@ export class WMT {
       const idx = cy * g.chunkCountX + cx;
       if (seenChunks.has(idx)) continue;
       seenChunks.add(idx);
-      const length = g.chunkLengths[idx];
+      const loc = this._chunkLocationCached(cb, cx, cy);
+      const length = loc?.ln ?? 0;
+      const offset = loc?.off ?? 0;
       chunks.push({
         cx,
         cy,
         index: idx,
-        offset: g.chunkOffsets[idx],
+        offset,
         length,
         absent: length === 0,
       });
@@ -1118,7 +1638,6 @@ export class WMT {
     const wx = gx - x0;
     const wy = gy - y0;
 
-    // Decode the (at most 4) chunks needed and cache them.
     const need = new Set<number>();
     const cs = 1 << g.chunkSizeLog2;
     for (const x of [x0, x1]) {
@@ -1165,11 +1684,34 @@ export class WMT {
     if (cb.rawGrid) {
       return this._sampleManyRaw(blk, cb, points, opts);
     }
-    // Tile-pyramid path: per-point sample, no coalescing yet.
+    // map points to tile pixels, dedup tile coords, one coalesced fetch, read locally.
     const out = new Float32Array(points.length);
+    if (z < this._header.minZoom || z > this._header.maxZoom) {
+      return out.fill(NaN);
+    }
+    type Px = { tileIdx: number; col: number; row: number };
+    const pxs: (Px | null)[] = new Array(points.length);
+    const coordIdx = new Map<string, number>();
+    const coords: TileCoord[] = [];
     for (let i = 0; i < points.length; i++) {
-      const v = await this._sample(varId, t, points[i].lat, points[i].lon, z);
-      out[i] = v ?? NaN;
+      const p = latLonToTilePixel(z, points[i].lat, points[i].lon, this._tileSize);
+      if (!p) { pxs[i] = null; continue; }
+      const key = `${p.x},${p.y}`;
+      let tileIdx = coordIdx.get(key);
+      if (tileIdx === undefined) {
+        tileIdx = coords.length;
+        coordIdx.set(key, tileIdx);
+        coords.push({ z, x: p.x, y: p.y });
+      }
+      pxs[i] = { tileIdx, col: p.col, row: p.row };
+    }
+    if (coords.length === 0) return out.fill(NaN);
+    const tiles = await this._fetchTiles(varId, t, coords, opts);
+    const ts = this._tileSize;
+    for (let i = 0; i < points.length; i++) {
+      const p = pxs[i];
+      if (!p) { out[i] = NaN; continue; }
+      out[i] = tiles[p.tileIdx][p.row * ts + p.col];
     }
     return out;
   }
@@ -1211,6 +1753,70 @@ export class WMT {
     return out;
   }
 
+  // cached + inflight-deduped; reads from the block's leafDirectories slot.
+  private async _loadFineIndex(
+    blk: BlockTableEntry,
+    cb: CachedBlock,
+    coarseIdx: number,
+  ): Promise<FineIndex> {
+    if (!cb.fineCache) cb.fineCache = new Map();
+    const cached = cb.fineCache.get(coarseIdx);
+    if (cached) return cached;
+    if (!cb.fineFetches) cb.fineFetches = new Map();
+    let inflight = cb.fineFetches.get(coarseIdx);
+    if (!inflight) {
+      inflight = (async () => {
+        const g = cb.rawGrid!;
+        const cce = g.coarseTable[coarseIdx];
+        const coarseCountX = rawGridCoarseCountX(g);
+        const coarseCx = coarseIdx % coarseCountX;
+        const coarseCy = Math.floor(coarseIdx / coarseCountX);
+        const { w: cellW, h: cellH } = rawGridCoarseCellExtent(g, coarseCx, coarseCy);
+        const expected = cellW * cellH;
+        let fi: FineIndex;
+        if (cce.length === 0) {
+          fi = {
+            chunkOffsets: new Float64Array(expected),
+            chunkLengths: new Float64Array(expected),
+            cellW,
+            cellH,
+          };
+        } else {
+          const buf = await this._src.read(
+            blk.blockOffset + (cb.header.leafDirectoriesOffset as number) + cce.offset,
+            cce.length,
+          );
+          const parsed = parseFineIndex(buf, expected);
+          fi = {
+            chunkOffsets: parsed.chunkOffsets,
+            chunkLengths: parsed.chunkLengths,
+            cellW,
+            cellH,
+          };
+        }
+        cb.fineCache!.set(coarseIdx, fi);
+        return fi;
+      })();
+      cb.fineFetches.set(coarseIdx, inflight);
+      inflight.finally(() => cb.fineFetches!.delete(coarseIdx));
+    }
+    return inflight;
+  }
+
+  // callers must await _loadFineIndex for the relevant coarse cell first.
+  private _chunkLocationCached(
+    cb: CachedBlock,
+    cx: number,
+    cy: number,
+  ): { off: number; ln: number } | null {
+    const g = cb.rawGrid!;
+    const { coarseIdx, localIdx } = rawGridCoarseIndexOf(g, cx, cy);
+    const fi = cb.fineCache?.get(coarseIdx);
+    if (!fi) return null;
+    if (localIdx < 0 || localIdx >= fi.chunkOffsets.length) return null;
+    return { off: fi.chunkOffsets[localIdx], ln: fi.chunkLengths[localIdx] };
+  }
+
   private async _ensureRawChunks(
     blk: BlockTableEntry,
     cb: CachedBlock,
@@ -1226,6 +1832,20 @@ export class WMT {
     }
     if (missing.length === 0) return;
 
+    // Wave A: load fine-indices for every coarse cell touched by the missing
+    // chunks, in parallel. Without this the per-chunk lookup below would have
+    // to serialize one fine-index fetch at a time.
+    const coarseNeeded = new Set<number>();
+    for (const idx of missing) {
+      const cy = Math.floor(idx / g.chunkCountX);
+      const cx = idx - cy * g.chunkCountX;
+      const { coarseIdx } = rawGridCoarseIndexOf(g, cx, cy);
+      coarseNeeded.add(coarseIdx);
+    }
+    await Promise.all(
+      [...coarseNeeded].map((cidx) => this._loadFineIndex(blk, cb, cidx)),
+    );
+
     const maxGap = opts.maxGapBytes ?? 32 * 1024;
     const maxReq = opts.maxRequestBytes ?? 1024 * 1024;
 
@@ -1234,16 +1854,18 @@ export class WMT {
     for (const idx of missing) {
       const cy = Math.floor(idx / g.chunkCountX);
       const cx = idx - cy * g.chunkCountX;
-      ranges.push({
-        idx,
-        off: g.chunkOffsets[idx],
-        ln: g.chunkLengths[idx],
-        cx,
-        cy,
-      });
+      const loc = this._chunkLocationCached(cb, cx, cy);
+      if (!loc) {
+        // Defensive: fine-index should be cached at this point.
+        throw new FormatError(`raw-grid: missing fine-index for chunk (${cx},${cy})`);
+      }
+      ranges.push({ idx, off: loc.off, ln: loc.ln, cx, cy });
     }
     ranges.sort((a, b) => a.off - b.off);
 
+    // runs go out in parallel so the global coalescer can multipart them
+    // alongside every other block's runs in the same flush.
+    const jobs: Promise<void>[] = [];
     let i = 0;
     while (i < ranges.length) {
       let j = i;
@@ -1262,27 +1884,45 @@ export class WMT {
         j++;
       }
       if (runEnd > runStart) {
-        const buf = await this._src.read(
-          blk.blockOffset + (cb.header.tileDataOffset as number) + runStart,
-          runEnd - runStart,
+        const lo = i;
+        const hi = j;
+        const start = runStart;
+        const length = runEnd - runStart;
+        jobs.push(
+          this._src
+            .read(
+              blk.blockOffset + (cb.header.tileDataOffset as number) + start,
+              length,
+            )
+            .then((buf) => {
+              for (let k = lo; k <= hi; k++) {
+                const rg = ranges[k];
+                const w = rawGridChunkWidth(g, rg.cx);
+                const h = rawGridChunkHeight(g, rg.cy);
+                if (rg.ln === 0) {
+                  cache.set(rg.idx, new Float32Array(w * h).fill(NaN));
+                  continue;
+                }
+                const startInRun = rg.off - start;
+                const blob = buf.subarray(startInRun, startInRun + rg.ln);
+                const decoded = decodeCodec(blob, blk.dtype, w * h);
+                const pixels = dequantize(decoded, blk, w * h);
+                cache.set(rg.idx, pixels);
+              }
+            }),
         );
+      } else {
+        // All ranges in this run had ln === 0 (absent chunks). Cache NaN.
         for (let k = i; k <= j; k++) {
           const rg = ranges[k];
           const w = rawGridChunkWidth(g, rg.cx);
           const h = rawGridChunkHeight(g, rg.cy);
-          if (rg.ln === 0) {
-            cache.set(rg.idx, new Float32Array(w * h).fill(NaN));
-            continue;
-          }
-          const start = rg.off - runStart;
-          const blob = buf.subarray(start, start + rg.ln);
-          const decoded = decodeCodec(blob, blk.dtype, w * h);
-          const pixels = dequantize(decoded, blk, w * h);
-          cache.set(rg.idx, pixels);
+          cache.set(rg.idx, new Float32Array(w * h).fill(NaN));
         }
       }
       i = j + 1;
     }
+    if (jobs.length > 0) await Promise.all(jobs);
   }
 
   private async _open(): Promise<void> {
@@ -1355,7 +1995,7 @@ export class WMT {
       sh.variableCatalogOff,
       sh.variableCatalogOff + sh.variableCatalogLen,
     );
-    const varRaw = await decompressInternal(varBlob, comp);
+    const varRaw = await decompressInternal(varBlob, comp, this._zstdOverride);
     this._catalog = parseVariableCatalog(varRaw, sh.numVariables);
     this._variables = this._catalog.map(
       (v) =>
@@ -1386,7 +2026,7 @@ export class WMT {
       sh.timeCatalogOff,
       sh.timeCatalogOff + sh.timeCatalogLen,
     );
-    if (!regular) tcBlob = await decompressInternal(tcBlob, comp);
+    if (!regular) tcBlob = await decompressInternal(tcBlob, comp, this._zstdOverride);
     this._timeCatalog = parseTimeCatalog(tcBlob, regular);
     this._timeAxis = null;
 
@@ -1394,9 +2034,35 @@ export class WMT {
       sh.blockTableRootOff,
       sh.blockTableRootOff + sh.blockTableRootLen,
     );
-    const rootRaw = await decompressInternal(rootBlob, comp);
+    const rootRaw = await decompressInternal(rootBlob, comp, this._zstdOverride);
     this._blockTableRoot = parseBlockTable(rootRaw);
     this._btLeavesAbs = off + sh.blockTableLeavesOff;
+
+    // pre-parse all block-table leaves from snapBuf (zero extra I/O) so
+    // forecast() doesn't pay an extra RTT before block headers.
+    if (sh.blockTableLeavesLen > 0) {
+      const leavesAbs = sh.blockTableLeavesOff;
+      const leavesEnd = leavesAbs + sh.blockTableLeavesLen;
+      if (leavesEnd <= snapBuf.length) {
+        const leafJobs: Promise<void>[] = [];
+        for (const row of this._blockTableRoot) {
+          if (!row.isLeafPointer) continue;
+          const leafOff = row.blockOffset;
+          const leafLen = row.blockLength;
+          if (this._btLeafCache.has(leafOff)) continue;
+          const leafBlob = snapBuf.subarray(
+            leavesAbs + leafOff,
+            leavesAbs + leafOff + leafLen,
+          );
+          leafJobs.push(
+            decompressInternal(leafBlob, comp, this._zstdOverride).then((buf) => {
+              this._btLeafCache.set(leafOff, parseBlockTable(buf));
+            }),
+          );
+        }
+        if (leafJobs.length > 0) await Promise.all(leafJobs);
+      }
+    }
   }
 
   private async _lookupBlock(
@@ -1437,6 +2103,7 @@ export class WMT {
         const buf = await decompressInternal(
           raw,
           this._header.internalCompression,
+          this._zstdOverride,
         );
         const entries = parseBlockTable(buf);
         this._btLeafCache.set(leafOff, entries);
@@ -1457,22 +2124,36 @@ export class WMT {
     let inFlight = this._blockFetches.get(blockOff);
     if (!inFlight) {
       inFlight = (async () => {
-        const want = Math.min(BLOCK_HEADER_SIZE + MAX_BLOCK_ROOT, blockLen);
+        const want = Math.min(this._blockHeaderPrefetchBytes, blockLen);
         const prefix = await this._readAbs(blockOff, want);
         const header = parseBlockHeader(prefix.subarray(0, BLOCK_HEADER_SIZE));
         const rootEnd = header.rootDirectoryOffset + header.rootDirectoryLength;
         let rootRaw: Uint8Array;
         if (rootEnd <= prefix.length) {
+          // Root fits entirely in prefix; zero extra I/O.
           rootRaw = prefix.subarray(header.rootDirectoryOffset, rootEnd);
         } else {
-          rootRaw = await this._src.read(
-            blockOff + header.rootDirectoryOffset,
-            header.rootDirectoryLength,
-          );
+          const headInPrefix = prefix.length - header.rootDirectoryOffset;
+          if (headInPrefix <= 0) {
+            rootRaw = await this._src.read(
+              blockOff + header.rootDirectoryOffset,
+              header.rootDirectoryLength,
+            );
+          } else {
+            const tailLen = header.rootDirectoryLength - headInPrefix;
+            const tail = await this._src.read(blockOff + prefix.length, tailLen);
+            rootRaw = new Uint8Array(header.rootDirectoryLength);
+            rootRaw.set(
+              prefix.subarray(header.rootDirectoryOffset, prefix.length),
+              0,
+            );
+            rootRaw.set(tail, headInPrefix);
+          }
         }
         const rootBuf = await decompressInternal(
           rootRaw,
           this._header.internalCompression,
+          this._zstdOverride,
         );
         let out: CachedBlock;
         if ((header.blockFlags & BLOCK_FLAG_RAW_GRID) !== 0) {
@@ -1500,14 +2181,26 @@ export class WMT {
     const cacheKey = `${blockOff}:${leafOff}`;
     const cached = this._leafCache.get(cacheKey);
     if (cached) return cached;
-    const raw = await this._src.read(
-      blockOff + header.leafDirectoriesOffset + leafOff,
-      leafLen,
-    );
-    const buf = await decompressInternal(raw, this._header.internalCompression);
-    const dir = parseDirectory(buf);
-    this._leafCache.set(cacheKey, dir);
-    return dir;
+    let inflight = this._leafFetches.get(cacheKey);
+    if (!inflight) {
+      inflight = (async () => {
+        const raw = await this._src.read(
+          blockOff + header.leafDirectoriesOffset + leafOff,
+          leafLen,
+        );
+        const buf = await decompressInternal(
+          raw,
+          this._header.internalCompression,
+          this._zstdOverride,
+        );
+        const dir = parseDirectory(buf);
+        this._leafCache.set(cacheKey, dir);
+        return dir;
+      })();
+      this._leafFetches.set(cacheKey, inflight);
+      inflight.finally(() => this._leafFetches.delete(cacheKey));
+    }
+    return inflight;
   }
 }
 

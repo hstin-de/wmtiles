@@ -200,6 +200,7 @@ async function gunzip(buf: Uint8Array): Promise<Uint8Array> {
 export async function decompressInternal(
   buf: Uint8Array,
   comp: number,
+  zstdOverride?: (b: Uint8Array) => Uint8Array,
 ): Promise<Uint8Array> {
   switch (comp) {
     case COMP_NONE:
@@ -208,7 +209,7 @@ export async function decompressInternal(
       return await gunzip(buf);
     case COMP_ZSTD:
       try {
-        return zstdDecompress(buf);
+        return (zstdOverride ?? zstdDecompress)(buf);
       } catch (err) {
         throw new FormatError("zstd decompression failed", { cause: err });
       }
@@ -492,9 +493,18 @@ export function parseBlockHeader(buf: Uint8Array): BlockHeader {
   };
 }
 
+export interface CoarseEntry {
+  /** relative to block's leafDirectories region */
+  offset: number;
+  /** zero = empty cell (shouldn't happen in valid files) */
+  length: number;
+}
+
 export interface RawGridSection {
   schemaVersion: number;
   chunkSizeLog2: number;
+  /** side length in chunks (log2); 0 = trivial 1×1 */
+  coarseSizeLog2: number;
   nx: number;
   ny: number;
   lat0: number;
@@ -504,8 +514,16 @@ export interface RawGridSection {
   missingValue: number;
   chunkCountX: number;
   chunkCountY: number;
+  /** row-major: cy * coarseCountX + cx */
+  coarseTable: CoarseEntry[];
+}
+
+export interface FineIndex {
+  /** cell-row-major, length = cellW * cellH */
   chunkOffsets: Float64Array;
   chunkLengths: Float64Array;
+  cellW: number;
+  cellH: number;
 }
 
 export function parseRawGridSection(buf: Uint8Array): RawGridSection {
@@ -518,6 +536,10 @@ export function parseRawGridSection(buf: Uint8Array): RawGridSection {
     throw new FormatError(`raw grid: unsupported schema version ${schemaVersion}`);
   }
   const chunkSizeLog2 = dv.getUint8(1);
+  const coarseSizeLog2 = dv.getUint8(2);
+  if (coarseSizeLog2 > 8) {
+    throw new FormatError(`raw grid: coarse size log2 ${coarseSizeLog2} > 8`);
+  }
   const nx = dv.getUint32(4, true);
   const ny = dv.getUint32(8, true);
   const lat0 = dv.getFloat64(16, true);
@@ -530,23 +552,27 @@ export function parseRawGridSection(buf: Uint8Array): RawGridSection {
   if (chunkCountX === 0 || chunkCountY === 0) {
     throw new FormatError("raw grid: zero-sized chunk grid");
   }
-  const n = chunkCountX * chunkCountY;
-  const chunkOffsets = new Float64Array(n);
-  const chunkLengths = new Float64Array(n);
-  let pos = RAW_GRID_HEADER_SIZE;
-  for (let i = 0; i < n; i++) {
-    const r = readVarintNum(buf, pos);
-    pos += r.used;
-    chunkOffsets[i] = r.value;
+  const cs = 1 << coarseSizeLog2;
+  const coarseCountX = Math.ceil(chunkCountX / cs);
+  const coarseCountY = Math.ceil(chunkCountY / cs);
+  const coarseCount = coarseCountX * coarseCountY;
+  const need = RAW_GRID_HEADER_SIZE + 8 * coarseCount;
+  if (buf.length < need) {
+    throw new FormatError(`raw grid: root truncated (need ${need}, got ${buf.length})`);
   }
-  for (let i = 0; i < n; i++) {
-    const r = readVarintNum(buf, pos);
-    pos += r.used;
-    chunkLengths[i] = r.value;
+  const coarseTable: CoarseEntry[] = new Array(coarseCount);
+  let pos = RAW_GRID_HEADER_SIZE;
+  for (let i = 0; i < coarseCount; i++) {
+    coarseTable[i] = {
+      offset: dv.getUint32(pos, true),
+      length: dv.getUint32(pos + 4, true),
+    };
+    pos += 8;
   }
   return {
     schemaVersion,
     chunkSizeLog2,
+    coarseSizeLog2,
     nx,
     ny,
     lat0,
@@ -556,9 +582,59 @@ export function parseRawGridSection(buf: Uint8Array): RawGridSection {
     missingValue,
     chunkCountX,
     chunkCountY,
-    chunkOffsets,
-    chunkLengths,
+    coarseTable,
   };
+}
+
+// expectedCount = cellW * cellH for the cell.
+export function parseFineIndex(buf: Uint8Array, expectedCount: number): FineIndex {
+  const chunkOffsets = new Float64Array(expectedCount);
+  const chunkLengths = new Float64Array(expectedCount);
+  let pos = 0;
+  for (let i = 0; i < expectedCount; i++) {
+    let v = 0;
+    let shift = 0;
+    for (let k = 0; k < 10; k++) {
+      const c = buf[pos + k];
+      if (c === undefined) throw new FormatError("fine index varint: truncated");
+      if (shift < 28) {
+        v |= (c & 0x7f) << shift;
+      } else {
+        v += (c & 0x7f) * Math.pow(2, shift);
+      }
+      if ((c & 0x80) === 0) {
+        pos += k + 1;
+        chunkOffsets[i] = v;
+        v = -1;
+        break;
+      }
+      shift += 7;
+    }
+    if (v !== -1) throw new FormatError("fine index varint: overflow");
+  }
+  for (let i = 0; i < expectedCount; i++) {
+    let v = 0;
+    let shift = 0;
+    for (let k = 0; k < 10; k++) {
+      const c = buf[pos + k];
+      if (c === undefined) throw new FormatError("fine index varint: truncated");
+      if (shift < 28) {
+        v |= (c & 0x7f) << shift;
+      } else {
+        v += (c & 0x7f) * Math.pow(2, shift);
+      }
+      if ((c & 0x80) === 0) {
+        pos += k + 1;
+        chunkLengths[i] = v;
+        v = -1;
+        break;
+      }
+      shift += 7;
+    }
+    if (v !== -1) throw new FormatError("fine index varint: overflow");
+  }
+  // cellW/cellH are caller-known; this struct just holds raw flat arrays.
+  return { chunkOffsets, chunkLengths, cellW: 0, cellH: 0 };
 }
 
 export function rawGridChunkSize(s: RawGridSection): number {
@@ -573,6 +649,53 @@ export function rawGridChunkWidth(s: RawGridSection, cx: number): number {
 export function rawGridChunkHeight(s: RawGridSection, cy: number): number {
   const cs = rawGridChunkSize(s);
   return Math.min((cy + 1) * cs, s.ny) - cy * cs;
+}
+
+export function rawGridCoarseSize(s: RawGridSection): number {
+  return 1 << s.coarseSizeLog2;
+}
+
+export function rawGridCoarseCountX(s: RawGridSection): number {
+  const cs = rawGridCoarseSize(s);
+  return Math.ceil(s.chunkCountX / cs);
+}
+
+export function rawGridCoarseCountY(s: RawGridSection): number {
+  const cs = rawGridCoarseSize(s);
+  return Math.ceil(s.chunkCountY / cs);
+}
+
+// edge cells truncate.
+export function rawGridCoarseCellExtent(
+  s: RawGridSection,
+  coarseCx: number,
+  coarseCy: number,
+): { w: number; h: number } {
+  const cs = rawGridCoarseSize(s);
+  return {
+    w: Math.min(cs, s.chunkCountX - coarseCx * cs),
+    h: Math.min(cs, s.chunkCountY - coarseCy * cs),
+  };
+}
+
+export function rawGridCoarseIndexOf(
+  s: RawGridSection,
+  cx: number,
+  cy: number,
+): { coarseIdx: number; localIdx: number; cellW: number; cellH: number } {
+  const cs = rawGridCoarseSize(s);
+  const coarseCx = Math.floor(cx / cs);
+  const coarseCy = Math.floor(cy / cs);
+  const coarseCountX = rawGridCoarseCountX(s);
+  const { w: cellW, h: cellH } = rawGridCoarseCellExtent(s, coarseCx, coarseCy);
+  const localCx = cx - coarseCx * cs;
+  const localCy = cy - coarseCy * cs;
+  return {
+    coarseIdx: coarseCy * coarseCountX + coarseCx,
+    localIdx: localCy * cellW + localCx,
+    cellW,
+    cellH,
+  };
 }
 
 export interface Directory {
